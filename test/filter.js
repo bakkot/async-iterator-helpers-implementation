@@ -306,4 +306,87 @@ tests.push(['filter: predicate error closes the underlying iterator', async func
   t.expectLog('subsequent next() is done', ['r1 resolved {"done":true}']);
 }]);
 
+// A predicate error is treated exactly like resolving `true` — the value fills
+// its slot's position — except that the stream ends there, the source is closed,
+// and that position rejects instead of delivering. So the error caps the
+// sequence just like a done: trailing calls can settle done immediately, even
+// while an earlier call is still blocked.
+tests.push(['filter: a predicate error settles trailing calls done while an earlier call is blocked', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  // Only pull #1 yields (pull #0 stays pending); its predicate is invoked.
+  src.yield(1, 20);
+  await flushMicrotasks();
+  t.expectLog('predicate invoked on the second value', ['pred(20) #0']);
+
+  // The predicate errors. Slot #1 still occupies a value position (like `true`)
+  // and ends the stream: the source closes, and since values can only come from
+  // slots #0 and #1, the third call can never get one and settles done now —
+  // while r0 remains blocked on pull #0.
+  pred.reject(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('error closes the source and settles the trailing call done', [
+    'src.return() #0',
+    'r2 resolved {"done":true}',
+  ]);
+
+  // Pull #0 yields a passing value: it still reaches r0 (not lost). Only then
+  // does the error reach r1 — the call at the erroring value's position.
+  src.yield(0, 10);
+  await flushMicrotasks();
+  t.expectLog('predicate invoked on the first value', ['pred(10) #1']);
+
+  pred.resolve(1, true);
+  await flushMicrotasks();
+  t.expectLog('earlier value delivered, then the error reaches r1', [
+    'r0 resolved {"value":10,"done":false}',
+    'r1 rejected boom',
+  ]);
+}]);
+
+// Like the done case, a single predicate error can release several trailing
+// blocked calls at once: with pull #0 still pending, slots #0 and #1 are the
+// only possible value positions, so both r2 and r3 settle done together.
+tests.push(['filter: a predicate error releases all trailing blocked calls at once', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  const r3 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  track(t.log, 'r3', r3);
+  await flushMicrotasks();
+  t.expectLog('four concurrent pulls', [
+    'src.next() #0', 'src.next() #1', 'src.next() #2', 'src.next() #3',
+  ]);
+
+  src.yield(1, 20);
+  await flushMicrotasks();
+  t.expectLog('predicate invoked on the second value', ['pred(20) #0']);
+
+  pred.reject(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('error closes the source and settles both trailing calls done', [
+    'src.return() #0',
+    'r3 resolved {"done":true}',
+    'r2 resolved {"done":true}',
+  ]);
+}]);
+
 runTests(tests);

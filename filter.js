@@ -15,17 +15,17 @@ class FilterHelper {
   // Waiting consumer deferreds, each tagged with its absolute call position.
   #consumers = [];
   #made = 0;
-  // Earliest pull index that reported done, once one has. After a done the
-  // sequence holds at most as many values as there are non-dropped earlier
-  // slots, which lets trailing calls settle done while an earlier one blocks.
-  #doneIndex = null;
-  // That cap, maintained incrementally so #drainDone need not rescan: each drop
-  // before the boundary lowers it. A call whose position reaches it can never
-  // receive a value. Only meaningful once #doneIndex is set.
+  // Exclusive index past which no value-position can exist, once known. A done
+  // at index d caps it at d (the done slot yields nothing); an error at index e
+  // caps it at e + 1 (the error fills that position with a rejection, like a
+  // `true` that also ends the stream). This lets trailing calls settle done
+  // while an earlier one is still blocked.
+  #boundary = null;
+  // The value ceiling: how many value-positions exist below #boundary.
+  // Maintained incrementally so #drainDone need not rescan — each drop before
+  // the boundary lowers it. A call whose position reaches it can never receive a
+  // value. Only meaningful once #boundary is set.
   #upper = 0;
-  // Earliest slot to error; lets an in-order error (delivered by #pump) take
-  // precedence over done-draining.
-  #errorIndex = null;
 
   constructor(it, pred) {
     this.#it = it;
@@ -66,15 +66,14 @@ class FilterHelper {
         // A throwing result object is an error *from* the underlying: surface
         // it, but never close.
         this.#done = true;
-        this.#recordError(slot, k, err);
-        this.#pump();
+        this.#fail(slot, k, err);
         return;
       }
       if (done) {
         // Clean exhaustion: done, but the underlying is not closed.
         this.#done = true;
-        if (this.#doneIndex === null || k < this.#doneIndex) {
-          this.#doneIndex = k;
+        if (this.#boundary === null || k < this.#boundary) {
+          this.#boundary = k;
           this.#recomputeUpper();
         }
         this.#pump();
@@ -90,25 +89,25 @@ class FilterHelper {
           // A drop lowers the value ceiling, so it can both reissue a pull (to
           // replace the lost value) and let trailing done calls settle.
           slot.status = 'drop';
-          if (this.#doneIndex !== null && k < this.#doneIndex) this.#upper--;
+          if (this.#boundary !== null && k < this.#boundary) this.#upper--;
           if (!this.#done) this.#pull();
           this.#pump();
           this.#drainDone();
         }
       }, err => {
-        // A predicate error closes the underlying, but only if still live.
+        // A predicate error is treated like `true` (the value still fills its
+        // position) but ends the stream and closes the underlying — the latter
+        // only if still live.
         if (!this.#done) {
           this.#done = true;
           this.#close();
         }
-        this.#recordError(slot, k, err);
-        this.#pump();
+        this.#fail(slot, k, err);
       });
     }, err => {
       // Error from the underlying's .next(): surface it, but never close.
       this.#done = true;
-      this.#recordError(slot, k, err);
-      this.#pump();
+      this.#fail(slot, k, err);
     });
   }
 
@@ -133,32 +132,42 @@ class FilterHelper {
     }
   }
 
-  // After a done, settle trailing calls that can no longer receive a value.
+  // Settle trailing calls that can no longer receive a value: those whose
+  // position has reached the value ceiling. Only does anything once a boundary
+  // is known. The call at the ceiling's last position (an erroring one) stays —
+  // it is rejected in order by #pump.
   #drainDone() {
-    if (this.#doneIndex === null) return;
-    // An error before the done is delivered in order by #pump instead.
-    if (this.#errorIndex !== null && this.#errorIndex < this.#doneIndex) return;
+    if (this.#boundary === null) return;
     while (this.#consumers.length > 0 &&
            this.#consumers[this.#consumers.length - 1].position >= this.#upper) {
       this.#consumers.pop().resolve({ value: undefined, done: true });
     }
   }
 
-  // Count the values still reachable: slots before the done that haven't been
-  // dropped. Runs only when the done-boundary is first set or lowered.
+  // Count the value-positions below #boundary: every slot that is not a drop —
+  // a value, a still-pending pull, or an error (which fills its position with a
+  // rejection). A done slot never falls below the boundary. Runs only when the
+  // boundary is first set or lowered.
   #recomputeUpper() {
     let upper = 0;
-    for (let i = 0; i < this.#doneIndex; i++) {
-      const s = this.#slots[i];
-      if (s.status === 'pending' || s.status === 'value') upper++;
+    for (let i = 0; i < this.#boundary; i++) {
+      if (this.#slots[i].status !== 'drop') upper++;
     }
     this.#upper = upper;
   }
 
-  #recordError(slot, k, err) {
-    if (this.#errorIndex === null || k < this.#errorIndex) this.#errorIndex = k;
+  // Record an error at slot k and end the stream just past it. The slot keeps
+  // its value-position (rejected in order by #pump), and the boundary caps at
+  // k + 1 so trailing calls settle done.
+  #fail(slot, k, err) {
     slot.status = 'error';
     slot.error = err;
+    if (this.#boundary === null || k + 1 < this.#boundary) {
+      this.#boundary = k + 1;
+      this.#recomputeUpper();
+    }
+    this.#pump();
+    this.#drainDone();
   }
 
   #close() {

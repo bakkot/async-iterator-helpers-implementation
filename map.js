@@ -15,16 +15,7 @@ class MapHelper {
     if (this.#done) {
       return Promise.resolve({ done: true, value: undefined });
     }
-    let pull;
-    try {
-      pull = this.#it.next();
-    } catch (err) {
-      // a synchronous throw from the underlying .next() is an error *from* the
-      // underlying iterator: surface it as a rejection without closing it
-      this.#done = true;
-      return Promise.reject(err);
-    }
-    return Promise.resolve(pull).then(({ value, done }) => {
+    return (new Promise(resolve => resolve(this.#it.next()))).then(({ value, done }) => {
       if (done) {
         this.#done = true;
         return { value, done }; // TODO think about `value: undefined`` here
@@ -32,8 +23,8 @@ class MapHelper {
       return (new Promise(res => res(this.#fn(value)))).then(mapped => {
         return { value: mapped, done: false,  };
       }, (err) => {
-        // errors from the predicate function close the underlying iterator
         this.#done = true;
+        // errors from the predicate function close the underlying iterator
         // errors from calling .return() are swallowed, as in IteratorClose,
         // whether .return() throws synchronously or returns a rejected promise
         try {
@@ -43,7 +34,7 @@ class MapHelper {
         }
       })
     }).catch((err) => {
-      // we use .catch rather than the second argument to .then so that errors from destructuring the result object are still handled
+      // this handles sync and async errors from `.next()` as well as errors from destructuring the result object
       this.#done = true;
       throw err;
     });

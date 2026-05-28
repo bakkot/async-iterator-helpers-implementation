@@ -163,6 +163,120 @@ tests.push(['filter: done lets trailing calls settle while an earlier one is blo
   t.expectLog('the surviving value feeds the first call', ['r0 resolved {"value":2,"done":false}']);
 }]);
 
+// A done observed while an earlier pull is still pending releases *all* the
+// trailing blocked calls at once (not one per event). Here pull #1 is done with
+// pull #0 still pending, so at most one value is possible: both r1 and r2 settle
+// done together, while r0 stays blocked on its predicate.
+tests.push(['filter: a done releases all trailing blocked calls at once', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  // Pull #0 yields a value; its predicate is invoked and left pending.
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('first predicate in flight', ['pred(1) #0']);
+
+  // Pull #1 is done. Values can come only from pull #0, so at most one value:
+  // the second and third calls both settle done in this one step.
+  src.finish(1);
+  await flushMicrotasks();
+  t.expectLog('done settles both trailing calls together', [
+    'r2 resolved {"done":true}',
+    'r1 resolved {"done":true}',
+  ]);
+
+  // The first call was never affected; its value still arrives.
+  pred.resolve(0, true);
+  await flushMicrotasks();
+  t.expectLog('the first call still delivers its value', ['r0 resolved {"value":1,"done":false}']);
+}]);
+
+// Two concurrent calls where the first value is dropped. The drop must reissue
+// a pull to replace the lost value, and the surviving values are handed to the
+// calls in call order: the first survivor to r0, the second to r1 — regardless
+// of which pull they came from.
+tests.push(['filter: a dropped value reissues a pull; survivors go to calls in order', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  src.yield(0, 10);
+  src.yield(1, 20);
+  await flushMicrotasks();
+  t.expectLog('both predicates in flight', ['pred(10) #0', 'pred(20) #1']);
+
+  // Pull #0 drops, so a replacement pull #2 is issued. Pull #1 passes, but as
+  // the first surviving value it belongs to r0 — not r1.
+  pred.resolve(0, false);
+  pred.resolve(1, true);
+  await flushMicrotasks();
+  t.expectLog('drop reissues a pull; the first survivor goes to r0', [
+    'src.next() #2',
+    'r0 resolved {"value":20,"done":false}',
+  ]);
+
+  src.yield(2, 30);
+  await flushMicrotasks();
+  t.expectLog('predicate runs on the replacement value', ['pred(30) #2']);
+
+  pred.resolve(2, true);
+  await flushMicrotasks();
+  t.expectLog('the second survivor goes to r1', ['r1 resolved {"value":30,"done":false}']);
+}]);
+
+// Values are not lost: a later predicate error closes the source and ends the
+// helper, but an earlier in-flight value still reaches its call. The error then
+// reaches the call that was scanning into it.
+tests.push(['filter: a later error does not lose an earlier in-flight value', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  src.yield(0, 10);
+  src.yield(1, 20);
+  await flushMicrotasks();
+  t.expectLog('both predicates in flight', ['pred(10) #0', 'pred(20) #1']);
+
+  // The later predicate errors first, closing the source. r0 is still pending on
+  // pull #0, so nothing is delivered to it yet.
+  pred.reject(1, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('later predicate error closes the source', ['src.return() #0']);
+
+  // Pull #0 passes: its value is not lost and still reaches r0; only then does
+  // the error reach r1.
+  pred.resolve(0, true);
+  await flushMicrotasks();
+  t.expectLog('earlier value delivered, then the error reaches r1', [
+    'r0 resolved {"value":10,"done":false}',
+    'r1 rejected boom',
+  ]);
+}]);
+
 // Error handling mirrors map: an error from the predicate closes the underlying
 // iterator (.return()), the result rejects, and the helper is done thereafter.
 tests.push(['filter: predicate error closes the underlying iterator', async function (t) {

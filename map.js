@@ -13,9 +13,18 @@ class MapHelper {
 
   next() {
     if (this.#done) {
-      return { done: true, value: undefined };
+      return Promise.resolve({ done: true, value: undefined });
     }
-    return Promise.resolve(this.#it.next()).then(({ value, done }) => {
+    let pull;
+    try {
+      pull = this.#it.next();
+    } catch (err) {
+      // a synchronous throw from the underlying .next() is an error *from* the
+      // underlying iterator: surface it as a rejection without closing it
+      this.#done = true;
+      return Promise.reject(err);
+    }
+    return Promise.resolve(pull).then(({ value, done }) => {
       if (done) {
         this.#done = true;
         return { value, done }; // TODO think about `value: undefined`` here
@@ -25,11 +34,16 @@ class MapHelper {
       }, (err) => {
         // errors from the predicate function close the underlying iterator
         this.#done = true;
-        // errors from calling .return() are swallowed, as in IteratorClose
-        return Promise.resolve(this.#it?.return()).finally(() => Promise.reject(err));
+        // errors from calling .return() are swallowed, as in IteratorClose,
+        // whether .return() throws synchronously or returns a rejected promise
+        try {
+          return Promise.resolve(this.#it?.return()).finally(() => Promise.reject(err));
+        } catch {
+          return Promise.reject(err);
+        }
       })
     }).catch((err) => {
-      // we use .catch rather than the second argument to .then so that errors from the mapper and from destructuring the result object are still handled
+      // we use .catch rather than the second argument to .then so that errors from destructuring the result object are still handled
       this.#done = true;
       throw err;
     });
@@ -37,10 +51,10 @@ class MapHelper {
 
   async return() {
     if (this.#done) {
-      return {};
+      return { value: undefined, done: true };
     }
     this.#done = true;
     await this.#it?.return();
-    return {};
+    return { value: undefined, done: true };
   }
 }

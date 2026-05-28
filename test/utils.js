@@ -95,18 +95,15 @@ function makeTestContext(name) {
   return ctx;
 }
 
-// Attach settlement logging to a consumer result *without* awaiting it, so
-// several `.next()` calls can be in flight at once and we can see the order in
-// which they settle. Wrapped in `Promise.resolve` so it also works when a
-// settled iterator returns a plain `{ done: true }` synchronously rather than a
-// promise. (For native promises `Promise.resolve(p) === p`, so a rejection is
-// still handled here and won't surface as an unhandled rejection.)
-export function track(log, label, result) {
-  Promise.resolve(result).then(
+// Attach settlement logging to a consumer promise *without* awaiting it, so
+// several `.next()` calls can be in flight at once and we can see the order
+// in which they settle.
+export function track(log, label, promise) {
+  promise.then(
     (v) => log(`${label} resolved`, v),
     (e) => log(`${label} rejected`, errMsg(e)),
   );
-  return result;
+  return promise;
 }
 
 function errMsg(e) {
@@ -127,13 +124,23 @@ function errMsg(e) {
 //   throw(i, err)    -> reject pull #i (an error *from* the underlying iterator)
 //   yieldResult(i, r)-> settle pull #i with an arbitrary result object (e.g. one
 //                       with a throwing `value` getter, to test protocol violations)
+//   throwNext(err)   -> make the next `.next()` call throw `err` *synchronously*
+//   throwReturn(err) -> make the next `.return()` call throw `err` *synchronously*
 export function controlledSource(log, name = 'src') {
   const pulls = [];
   let returnCount = 0;
+  let nextThrow = null; // { err } armed for the next .next() call
+  let returnThrow = null; // { err } armed for the next .return() call
 
   const iterator = {
     next() {
       const i = pulls.length;
+      if (nextThrow) {
+        const { err } = nextThrow;
+        nextThrow = null;
+        log(`${name}.next() #${i} (throws)`);
+        throw err;
+      }
       const d = Promise.withResolvers();
       pulls.push(d);
       log(`${name}.next() #${i}`);
@@ -141,6 +148,12 @@ export function controlledSource(log, name = 'src') {
     },
     return(value) {
       const i = returnCount++;
+      if (returnThrow) {
+        const { err } = returnThrow;
+        returnThrow = null;
+        log(`${name}.return() #${i} (throws)`);
+        throw err;
+      }
       log(`${name}.return() #${i}`);
       return Promise.resolve({ value, done: true });
     },
@@ -155,6 +168,8 @@ export function controlledSource(log, name = 'src') {
     finish: (i) => pulls[i].resolve({ value: undefined, done: true }),
     throw: (i, err) => pulls[i].reject(err),
     yieldResult: (i, result) => pulls[i].resolve(result),
+    throwNext: (err) => { nextThrow = { err }; },
+    throwReturn: (err) => { returnThrow = { err }; },
   };
 }
 

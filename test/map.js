@@ -197,6 +197,88 @@ tests.push(['map: throwing value getter does not close the underlying iterator',
   t.expectLog('subsequent next() is done', ['r1 resolved {"done":true}']);
 }]);
 
+// --- Synchronous throws ---------------------------------------------------
+
+// A mapper that throws synchronously is treated like a rejected mapper: it
+// closes the underlying iterator and the result rejects.
+tests.push(['map: synchronous throw from the mapper closes the underlying iterator', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const mapped = map(src.iterator, () => { throw new Error('boom'); });
+
+  const r0 = mapped.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('sync mapper throw -> close source, reject', [
+    'src.return() #0',
+    'r0 rejected boom',
+  ]);
+
+  const r1 = mapped.next();
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('subsequent next() is done', ['r1 resolved {"done":true}']);
+}]);
+
+// A synchronous throw from the underlying .next() must be surfaced as a
+// rejected promise (next() must not itself throw), and must NOT close the
+// underlying iterator.
+tests.push(['map: synchronous throw from underlying .next() rejects without closing', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const mapped = map(src.iterator, (x) => x * 10);
+
+  src.throwNext(new Error('boom'));
+
+  let r0;
+  let threwSync = false;
+  try {
+    r0 = mapped.next();
+  } catch {
+    threwSync = true;
+  }
+  t.check('next() returns a promise rather than throwing synchronously', threwSync, false);
+  if (threwSync) return;
+
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  // Surfaced as a rejection; no `src.return()`, so the source is left open.
+  t.expectLog('sync underlying throw -> reject, source left open', [
+    'src.next() #0 (throws)',
+    'r0 rejected boom',
+  ]);
+
+  const r1 = mapped.next();
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('subsequent next() is done', ['r1 resolved {"done":true}']);
+}]);
+
+// When the predicate errors, the underlying iterator is closed via .return().
+// If that .return() throws synchronously, the error is swallowed (IteratorClose
+// semantics) and the ORIGINAL predicate error is what reaches the caller.
+tests.push(['map: synchronous throw from underlying .return() is swallowed', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const mapped = map(src.iterator, () => { throw new Error('predicate boom'); });
+
+  src.throwReturn(new Error('return boom'));
+
+  const r0 = mapped.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  // The source's .return() throws, but the predicate error is what propagates.
+  t.expectLog('predicate error wins; return() throw swallowed', [
+    'src.return() #0 (throws)',
+    'r0 rejected predicate boom',
+  ]);
+}]);
+
 // --- return() -------------------------------------------------------------
 
 // An explicit return() on the result closes the underlying iterator and makes
@@ -246,6 +328,38 @@ tests.push(['map: return() is idempotent (closes the source at most once)', asyn
   track(t.log, 'r0', r0);
   await flushMicrotasks();
   t.expectLog('next() after return() is done', ['r0 resolved {"done":true}']);
+}]);
+
+// next() and return() always return promises (never a bare result object),
+// and return() resolves to a proper { value: undefined, done: true } result.
+tests.push(['map: next()/return() return promises; return() resolves to a done result', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const mapped = map(src.iterator, (x) => x * 10);
+
+  // Active next() is a promise.
+  const r0 = mapped.next();
+  t.check('active next() returns a promise', r0 instanceof Promise, true);
+  track(t.log, 'r0', r0);
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('r0 resolves', ['src.next() #0', 'r0 resolved {"value":10,"done":false}']);
+
+  // return() is a promise that resolves to a done result (not `{}`).
+  const ret = mapped.return();
+  t.check('return() returns a promise', ret instanceof Promise, true);
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes source and resolves to a done result', [
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+
+  // A settled next() is still a promise, not a synchronous result object.
+  const rDone = mapped.next();
+  t.check('settled next() returns a promise', rDone instanceof Promise, true);
+  track(t.log, 'rDone', rDone);
+  await flushMicrotasks();
+  t.expectLog('settled next() resolves done', ['rDone resolved {"done":true}']);
 }]);
 
 // --- Concurrency + errors (the two anomalies called out in the spec) ------

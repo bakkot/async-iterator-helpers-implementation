@@ -95,15 +95,18 @@ function makeTestContext(name) {
   return ctx;
 }
 
-// Attach settlement logging to a consumer promise *without* awaiting it, so
-// several `.next()` calls can be in flight at once and we can see the order
-// in which they settle.
-export function track(log, label, promise) {
-  promise.then(
+// Attach settlement logging to a consumer result *without* awaiting it, so
+// several `.next()` calls can be in flight at once and we can see the order in
+// which they settle. Wrapped in `Promise.resolve` so it also works when a
+// settled iterator returns a plain `{ done: true }` synchronously rather than a
+// promise. (For native promises `Promise.resolve(p) === p`, so a rejection is
+// still handled here and won't surface as an unhandled rejection.)
+export function track(log, label, result) {
+  Promise.resolve(result).then(
     (v) => log(`${label} resolved`, v),
     (e) => log(`${label} rejected`, errMsg(e)),
   );
-  return promise;
+  return result;
 }
 
 function errMsg(e) {

@@ -84,7 +84,6 @@ class Chooser {
 
 function runModel(N, chooser) {
   let done = false;
-  let closed = false; // underlying .return() has been invoked
   let budget = N;
   let callCount = 0;
   let nextPullId = 0, nextMapperId = 0, nextReturnId = 0;
@@ -112,20 +111,21 @@ function runModel(N, chooser) {
     ev.push(evReturn(callId, `{done:true}`));
   };
 
-  // predicate error: close the underlying iterator (once) then reject the call
+  // predicate error: close the underlying iterator then reject the call — but
+  // only if the machinery is still live. If we're already done (closed,
+  // returned, or the underlying errored or finished), don't touch it.
   const predicateError = (callId, msg) => {
-    done = true;
-    if (!closed) {
-      closed = true;
-      const id = nextReturnId++;
-      const shape = RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
-      schedule.returnShapes[id] = shape;
-      ev.push(evUReturn(id));
-      if (shape === 'sync') rejectNext(callId, msg);
-      else pendingReturns.push({ id, kind: 'closeReject', callId, err: msg });
-    } else {
+    if (done) {
       rejectNext(callId, msg);
+      return;
     }
+    done = true;
+    const id = nextReturnId++;
+    const shape = RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
+    schedule.returnShapes[id] = shape;
+    ev.push(evUReturn(id));
+    if (shape === 'sync') rejectNext(callId, msg);
+    else pendingReturns.push({ id, kind: 'closeReject', callId, err: msg });
   };
 
   const invokeMapper = (callId, arg) => {
@@ -182,17 +182,12 @@ function runModel(N, chooser) {
         settleReturn(callId);
       } else {
         done = true;
-        if (!closed) {
-          closed = true;
-          const id = nextReturnId++;
-          const shape = RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
-          schedule.returnShapes[id] = shape;
-          ev.push(evUReturn(id));
-          if (shape === 'sync') settleReturn(callId);
-          else pendingReturns.push({ id, kind: 'explicit', callId });
-        } else {
-          settleReturn(callId);
-        }
+        const id = nextReturnId++;
+        const shape = RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
+        schedule.returnShapes[id] = shape;
+        ev.push(evUReturn(id));
+        if (shape === 'sync') settleReturn(callId);
+        else pendingReturns.push({ id, kind: 'explicit', callId });
       }
     } else if (act.t === 'settlePull') {
       const idx = pendingPulls.findIndex((p) => p.id === act.id);
@@ -252,6 +247,12 @@ function runReal(schedule) {
   const pendingReturns = new Map(); // id -> resolvers
   let nextPullId = 0, nextMapperId = 0, nextReturnId = 0;
 
+  // Invariant: once the machinery has observed an error from the underlying
+  // iterator (a rejected / synchronously-throwing .next()), it must never call
+  // the underlying .return(). Tracked independently of the oracle.
+  let underlyingErrored = false;
+  let invariantViolation = null;
+
   const source = {
     next() {
       const id = nextPullId++;
@@ -260,7 +261,7 @@ function runReal(schedule) {
       if (shape === undefined) { log(`!! unexpected ${evUNext(id)}`); return Promise.resolve({ value: undefined, done: true }); }
       if (shape === 'syncValue') return { value: pullValue(id), done: false };
       if (shape === 'syncDone') return { value: undefined, done: true };
-      if (shape === 'syncThrow') throw new Error(pullError(id));
+      if (shape === 'syncThrow') { underlyingErrored = true; throw new Error(pullError(id)); }
       const d = Promise.withResolvers();
       pendingPulls.set(id, d);
       return d.promise;
@@ -268,6 +269,9 @@ function runReal(schedule) {
     return() {
       const id = nextReturnId++;
       log(evUReturn(id));
+      if (underlyingErrored && !invariantViolation) {
+        invariantViolation = `called underlying .return()#${id} after observing an underlying error`;
+      }
       const shape = schedule.returnShapes[id];
       if (shape === undefined) { log(`!! unexpected ${evUReturn(id)}`); return Promise.resolve({ value: undefined, done: true }); }
       if (shape === 'sync') return { value: undefined, done: true };
@@ -322,7 +326,7 @@ function runReal(schedule) {
           pendingPulls.delete(act.id);
           if (act.o === 'value') d.resolve({ value: pullValue(act.id), done: false });
           else if (act.o === 'done') d.resolve({ value: undefined, done: true });
-          else d.reject(new Error(pullError(act.id)));
+          else { underlyingErrored = true; d.reject(new Error(pullError(act.id))); }
         }
       } else if (act.t === 'settleMapper') {
         const m = pendingMappers.get(act.id);
@@ -340,7 +344,7 @@ function runReal(schedule) {
       await flushMicrotasks();
       realTrace.push(cur.slice().sort());
     }
-    return realTrace;
+    return { realTrace, invariantViolation };
   })();
 }
 
@@ -433,14 +437,19 @@ async function main() {
 
   let traceFailures = 0;
   let propertyFailures = 0;
+  let invariantFailures = 0;
   const MAX_REPORT = 10;
 
   for (const s of schedules) {
-    const realTrace = await runReal(s.schedule);
+    const { realTrace, invariantViolation } = await runReal(s.schedule);
     const diff = compareTraces(s.modelTrace, realTrace);
     if (diff) {
       traceFailures++;
       if (traceFailures <= MAX_REPORT) reportTraceFailure(s, realTrace, diff);
+    }
+    if (invariantViolation) {
+      invariantFailures++;
+      if (invariantFailures <= MAX_REPORT) reportInvariantFailure(s, invariantViolation);
     }
     const prop = checkSequentialProperty(s.schedule, s.callResults);
     if (prop) {
@@ -453,8 +462,9 @@ async function main() {
   console.log(`N = ${N}`);
   console.log(`schedules explored: ${schedules.length}`);
   console.log(`trace mismatches (real vs oracle): ${traceFailures}`);
+  console.log(`invariant violations (.return() after underlying error): ${invariantFailures}`);
   console.log(`property violations (oracle vs sequential spec): ${propertyFailures}`);
-  if (traceFailures === 0 && propertyFailures === 0) {
+  if (traceFailures === 0 && propertyFailures === 0 && invariantFailures === 0) {
     console.log('all schedules passed');
   } else {
     process.exitCode = 1;
@@ -478,6 +488,13 @@ function reportTraceFailure(s, realTrace, diff) {
     console.log('    oracle: ' + JSON.stringify(diff.model));
     console.log('    real:   ' + JSON.stringify(diff.real));
   }
+  console.log('');
+}
+
+function reportInvariantFailure(s, violation) {
+  console.log('INVARIANT VIOLATION');
+  console.log('  schedule: ' + describeSchedule(s));
+  console.log('  ' + violation);
   console.log('');
 }
 

@@ -436,4 +436,92 @@ tests.push(['map: an in-flight call may resolve done:false after an earlier erro
   ]);
 }]);
 
+// --- The underlying iterator is closed at most once, and never after an error -
+
+// After an explicit return() has closed the source, an in-flight call whose
+// predicate then errors must NOT close the source a second time.
+tests.push(['map: predicate error after return() does not close the source again', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const fn = controlledFn(t.log, 'fn');
+  const mapped = map(src.iterator, fn.fn);
+
+  const r0 = mapped.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('a pull is in flight', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('mapper invoked, still pending', ['fn(1) #0']);
+
+  mapped.return();
+  await flushMicrotasks();
+  t.expectLog('return() closes the source', ['src.return() #0']);
+
+  // The in-flight mapper now errors: r0 rejects, but the source is NOT closed again.
+  fn.reject(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('predicate error rejects r0 with no second close', ['r0 rejected boom']);
+}]);
+
+// Two concurrent in-flight calls whose predicates both error: the first closes
+// the source, the second must not close it again.
+tests.push(['map: a second concurrent predicate error does not close the source again', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const fn = controlledFn(t.log, 'fn');
+  const mapped = map(src.iterator, fn.fn);
+
+  const r0 = mapped.next();
+  const r1 = mapped.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  src.yield(0, 1);
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('both mappers in flight', ['fn(1) #0', 'fn(2) #1']);
+
+  fn.reject(0, new Error('boom0'));
+  await flushMicrotasks();
+  t.expectLog('first predicate error closes the source', ['src.return() #0', 'r0 rejected boom0']);
+
+  fn.reject(1, new Error('boom1'));
+  await flushMicrotasks();
+  t.expectLog('second predicate error rejects with no second close', ['r1 rejected boom1']);
+}]);
+
+// The invariant: once an error from the underlying iterator has been observed,
+// the source is never closed — even if a concurrent in-flight call's predicate
+// later errors (which on its own would close the source).
+tests.push(['map: predicate error does not close the source after an underlying error', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const fn = controlledFn(t.log, 'fn');
+  const mapped = map(src.iterator, fn.fn);
+
+  const r0 = mapped.next();
+  const r1 = mapped.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  // r1's pull yields a value; its mapper is invoked and left pending.
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('second pull yields, mapper in flight', ['fn(2) #0']);
+
+  // r0's pull errors: r0 rejects and the source is left open (no close).
+  src.throw(0, new Error('underlying'));
+  await flushMicrotasks();
+  t.expectLog('underlying error rejects r0 without closing', ['r0 rejected underlying']);
+
+  // r1's in-flight mapper now errors. Normally that would close the source, but
+  // an underlying error has already been observed, so it must NOT.
+  fn.reject(0, new Error('predicate'));
+  await flushMicrotasks();
+  t.expectLog('predicate error rejects r1 with no close', ['r1 rejected predicate']);
+}]);
+
 runTests(tests);

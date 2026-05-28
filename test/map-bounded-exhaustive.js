@@ -21,7 +21,19 @@
 // Usage: `node test/map-bounded-exhaustive.js [N]`   (default N = 2)
 
 import { map } from '../map.js';
-import { flushMicrotasks } from './utils.js';
+
+// Flush to microtask quiescence between driving actions. A single driving
+// action's consequences propagate through a promise chain of bounded depth (the
+// map machinery's chain is short and does not grow with N), so a small fixed
+// number of microtask turns suffices. If this were ever too small the per-step
+// trace comparison would fail (an event would land in a later step), so the
+// suite is self-checking on this constant. Not time-based: no delay, and every
+// settlement is still manual.
+// 16 leaves comfortable margin over the empirically-observed max chain depth of
+// ~10 (the map machinery's longest reaction: pull -> mapper -> error -> close ->
+// finally -> catch -> consumer).
+const FLUSH_ROUNDS = 16;
+const flush = async () => { for (let i = 0; i < FLUSH_ROUNDS; i++) await Promise.resolve(); };
 
 // --- response-shape alphabets (chosen when an obligation is created) --------
 
@@ -339,7 +351,7 @@ function runReal(schedule) {
         if (!d) log(`!! settleReturn#${act.id} not pending`);
         else { pendingReturns.delete(act.id); d.resolve({ value: undefined, done: true }); }
       }
-      await flushMicrotasks();
+      await flush();
       realTrace.push(cur.slice().sort());
     }
     return { realTrace, invariantViolation };

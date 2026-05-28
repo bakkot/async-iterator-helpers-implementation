@@ -19,6 +19,13 @@ class FilterHelper {
   // sequence holds at most as many values as there are non-dropped earlier
   // slots, which lets trailing calls settle done while an earlier one blocks.
   #doneIndex = null;
+  // That cap, maintained incrementally so #drainDone need not rescan: each drop
+  // before the boundary lowers it. A call whose position reaches it can never
+  // receive a value. Only meaningful once #doneIndex is set.
+  #upper = 0;
+  // Earliest slot to error; lets an in-order error (delivered by #pump) take
+  // precedence over done-draining.
+  #errorIndex = null;
 
   constructor(it, pred) {
     this.#it = it;
@@ -59,15 +66,17 @@ class FilterHelper {
         // A throwing result object is an error *from* the underlying: surface
         // it, but never close.
         this.#done = true;
-        slot.status = 'error';
-        slot.error = err;
+        this.#recordError(slot, k, err);
         this.#pump();
         return;
       }
       if (done) {
         // Clean exhaustion: done, but the underlying is not closed.
         this.#done = true;
-        if (this.#doneIndex === null || k < this.#doneIndex) this.#doneIndex = k;
+        if (this.#doneIndex === null || k < this.#doneIndex) {
+          this.#doneIndex = k;
+          this.#recomputeUpper();
+        }
         this.#pump();
         this.#drainDone();
         return;
@@ -81,6 +90,7 @@ class FilterHelper {
           // A drop lowers the value ceiling, so it can both reissue a pull (to
           // replace the lost value) and let trailing done calls settle.
           slot.status = 'drop';
+          if (this.#doneIndex !== null && k < this.#doneIndex) this.#upper--;
           if (!this.#done) this.#pull();
           this.#pump();
           this.#drainDone();
@@ -91,15 +101,13 @@ class FilterHelper {
           this.#done = true;
           this.#close();
         }
-        slot.status = 'error';
-        slot.error = err;
+        this.#recordError(slot, k, err);
         this.#pump();
       });
     }, err => {
       // Error from the underlying's .next(): surface it, but never close.
       this.#done = true;
-      slot.status = 'error';
-      slot.error = err;
+      this.#recordError(slot, k, err);
       this.#pump();
     });
   }
@@ -128,16 +136,29 @@ class FilterHelper {
   // After a done, settle trailing calls that can no longer receive a value.
   #drainDone() {
     if (this.#doneIndex === null) return;
+    // An error before the done is delivered in order by #pump instead.
+    if (this.#errorIndex !== null && this.#errorIndex < this.#doneIndex) return;
+    while (this.#consumers.length > 0 &&
+           this.#consumers[this.#consumers.length - 1].position >= this.#upper) {
+      this.#consumers.pop().resolve({ value: undefined, done: true });
+    }
+  }
+
+  // Count the values still reachable: slots before the done that haven't been
+  // dropped. Runs only when the done-boundary is first set or lowered.
+  #recomputeUpper() {
     let upper = 0;
     for (let i = 0; i < this.#doneIndex; i++) {
       const s = this.#slots[i];
-      if (s.status === 'error') return; // an in-order error settles these instead
       if (s.status === 'pending' || s.status === 'value') upper++;
     }
-    while (this.#consumers.length > 0 &&
-           this.#consumers[this.#consumers.length - 1].position >= upper) {
-      this.#consumers.pop().resolve({ value: undefined, done: true });
-    }
+    this.#upper = upper;
+  }
+
+  #recordError(slot, k, err) {
+    if (this.#errorIndex === null || k < this.#errorIndex) this.#errorIndex = k;
+    slot.status = 'error';
+    slot.error = err;
   }
 
   #close() {

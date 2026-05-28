@@ -221,19 +221,17 @@ function runModel(N, chooser) {
 
 // --- enumerate every complete schedule via decision-vector DFS --------------
 
-function enumerate(N) {
-  const out = [];
-  const worklist = [[]];
+function* enumerate(N) {
+  const worklist = [[]]; // a LIFO stack -> depth-first, so it stays small
   while (worklist.length) {
     const V = worklist.pop();
     const r = runModel(N, new Chooser(V));
     if (r.numDecisions === V.length) {
-      out.push(r); // V pinned every decision -> one complete schedule
+      yield r; // V pinned every decision -> one complete schedule
     } else {
       for (let a = 0; a < r.frontierOptionCount; a++) worklist.push([...V, a]);
     }
   }
-  return out;
 }
 
 // --- run the real `map` under a structured schedule -------------------------
@@ -433,14 +431,15 @@ function compareTraces(model, real) {
 
 async function main() {
   const N = Number(process.argv[2] ?? 2);
-  const schedules = enumerate(N);
 
+  let scheduleCount = 0;
   let traceFailures = 0;
   let propertyFailures = 0;
   let invariantFailures = 0;
   const MAX_REPORT = 10;
 
-  for (const s of schedules) {
+  for (const s of enumerate(N)) {
+    scheduleCount++;
     const { realTrace, invariantViolation } = await runReal(s.schedule);
     const diff = compareTraces(s.modelTrace, realTrace);
     if (diff) {
@@ -460,7 +459,7 @@ async function main() {
 
   console.log('');
   console.log(`N = ${N}`);
-  console.log(`schedules explored: ${schedules.length}`);
+  console.log(`schedules explored: ${scheduleCount}`);
   console.log(`trace mismatches (real vs oracle): ${traceFailures}`);
   console.log(`invariant violations (.return() after underlying error): ${invariantFailures}`);
   console.log(`property violations (oracle vs sequential spec): ${propertyFailures}`);

@@ -31,7 +31,8 @@ export function makeLog() {
   return { log, entries };
 }
 
-// Run a list of [name, fn] tests, passing each a context `t` carrying the
+// Run a list of [name, fn] tests, passing each a context `t`. The context owns
+// an event log (`t.log`, fed to the controlled iterators/mappers) and the
 // assertions. Quiet on success: nothing is printed for a passing test. The
 // first failure within a test prints the test name; every failure prints its
 // own detail. Exits 1 if anything failed, otherwise prints "all tests passed"
@@ -52,27 +53,34 @@ export async function runTests(tests) {
 
 function makeTestContext(name) {
   let printedName = false;
+  const { log, entries } = makeLog();
   const ctx = {
     failures: 0,
-    // Compare two values via JSON; report only on mismatch.
-    check(label, actual, expected) {
-      const a = JSON.stringify(actual);
-      const e = JSON.stringify(expected);
-      if (a !== e) ctx._fail(label, [`expected ${e}, got ${a}`]);
-    },
-    // Element-wise array comparison (deep-compared via JSON); on mismatch,
-    // print both arrays so the difference is easy to spot.
-    compareArray(label, actual, expected) {
-      let ok = Array.isArray(actual) && actual.length === expected.length;
+    log,
+    // Assert that the events logged *since the last expectLog* are exactly
+    // `expected`, then clear the log so the next assertion only concerns newly
+    // logged events. Because the comparison is exact, anything unexpected (a
+    // stray source `.return()`, an early settlement, a missing pull) shows up
+    // as a mismatch — so this doubles as the check that nothing else happened.
+    expectLog(label, expected) {
+      let ok = entries.length === expected.length;
       for (let i = 0; ok && i < expected.length; i++) {
-        if (JSON.stringify(actual[i]) !== JSON.stringify(expected[i])) ok = false;
+        if (entries[i] !== expected[i]) ok = false;
       }
       if (!ok) {
         ctx._fail(label, [
           `expected: ${JSON.stringify(expected)}`,
-          `actual:   ${JSON.stringify(actual)}`,
+          `actual:   ${JSON.stringify(entries)}`,
         ]);
       }
+      entries.length = 0;
+    },
+    // Compare two values via JSON; report only on mismatch. For assertions
+    // about things not visible in the event log.
+    check(label, actual, expected) {
+      const a = JSON.stringify(actual);
+      const e = JSON.stringify(expected);
+      if (a !== e) ctx._fail(label, [`expected ${e}, got ${a}`]);
     },
     _fail(label, detailLines) {
       if (!printedName) {
@@ -106,8 +114,9 @@ function errMsg(e) {
 //
 // Every `.next()` returns a pending promise the test settles later, so we can
 // observe how many concurrent pulls the combinator issued and settle them in
-// whatever order we like. `.return()` settlement is also test-controlled and
-// recorded, which is how we check whether the underlying iterator was closed.
+// whatever order we like. `.next()` and `.return()` are logged, so whether the
+// underlying iterator was closed is visible in the event log rather than via a
+// separate flag.
 //
 // Methods to drive it:
 //   yield(i, value)  -> settle pull #i with { value, done: false }
@@ -117,7 +126,6 @@ function errMsg(e) {
 //                       with a throwing `value` getter, to test protocol violations)
 export function controlledSource(log, name = 'src') {
   const pulls = [];
-  const returnDeferreds = [];
   let returnCount = 0;
 
   const iterator = {
@@ -130,13 +138,8 @@ export function controlledSource(log, name = 'src') {
     },
     return(value) {
       const i = returnCount++;
-      const d = Promise.withResolvers();
-      returnDeferreds.push(d);
       log(`${name}.return() #${i}`);
-      // Default to resolving immediately; tests that need to control return
-      // timing can use `settleReturn`.
-      d.resolve({ value, done: true });
-      return d.promise;
+      return Promise.resolve({ value, done: true });
     },
     [Symbol.asyncIterator]() {
       return this;
@@ -145,15 +148,6 @@ export function controlledSource(log, name = 'src') {
 
   return {
     iterator,
-    get returned() {
-      return returnCount > 0;
-    },
-    get returnCount() {
-      return returnCount;
-    },
-    pullCount() {
-      return pulls.length;
-    },
     yield: (i, value) => pulls[i].resolve({ value, done: false }),
     finish: (i) => pulls[i].resolve({ value: undefined, done: true }),
     throw: (i, err) => pulls[i].reject(err),
@@ -180,8 +174,6 @@ export function controlledFn(log, name = 'fn') {
 
   return {
     fn,
-    callCount: () => calls.length,
-    argOf: (i) => calls[i].value,
     resolve: (i, mapped) => calls[i].deferred.resolve(mapped),
     reject: (i, err) => calls[i].deferred.reject(err),
   };

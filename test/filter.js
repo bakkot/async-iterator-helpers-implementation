@@ -201,6 +201,39 @@ tests.push(['filter: a done releases all trailing blocked calls at once', async 
   t.expectLog('the first call still delivers its value', ['r0 resolved {"value":1,"done":false}']);
 }]);
 
+// The done slot may arrive after earlier head slots have already been compacted
+// away. The done position must still be interpreted relative to the current
+// slot window, not the original pull history.
+tests.push(['filter: done after head compaction still drains trailing calls', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  src.yield(0, 10);
+  await flushMicrotasks();
+  t.expectLog('first predicate in flight', ['pred(10) #0']);
+
+  pred.resolve(0, true);
+  await flushMicrotasks();
+  t.expectLog('head value settles and compacts away', ['r0 resolved {"value":10,"done":false}']);
+
+  src.finish(1);
+  await flushMicrotasks();
+  t.expectLog('done is relative to the compacted window', [
+    'r2 resolved {"done":true}',
+    'r1 resolved {"done":true}',
+  ]);
+}]);
+
 // Once a clean done has settled every outstanding consumer, later completions
 // from pulls that were already issued must be harmless. They may update their
 // own slot bookkeeping, but there is no consumer left to resolve or reject.
@@ -230,6 +263,37 @@ tests.push(['filter: in-flight pull completion after all calls are done is harml
   src.finish(1);
   await flushMicrotasks();
   t.expectLog('late completion is ignored', []);
+}]);
+
+// If an already-issued pull produces a value after a clean done has drained all
+// consumers, its predicate may still run, but the result must not become
+// observable or issue replacement pulls.
+tests.push(['filter: late value after terminal done has no consumer effect', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  src.finish(0);
+  await flushMicrotasks();
+  t.expectLog('done drains all consumers', [
+    'r1 resolved {"done":true}',
+    'r0 resolved {"done":true}',
+  ]);
+
+  src.yield(1, 99);
+  await flushMicrotasks();
+  t.expectLog('late value still reaches the predicate', ['pred(99) #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('late predicate result is ignored', []);
 }]);
 
 // Two concurrent calls where the first value is dropped. The drop must reissue
@@ -270,6 +334,48 @@ tests.push(['filter: a dropped value reissues a pull; survivors go to calls in o
   pred.resolve(2, true);
   await flushMicrotasks();
   t.expectLog('the second survivor goes to r1', ['r1 resolved {"value":30,"done":false}']);
+}]);
+
+// A drop lowers the possible value count, but before a terminal event the
+// helper must not use that finite-looking count to settle trailing calls done:
+// another replacement pull can still produce more values.
+tests.push(['filter: non-terminal drops do not drain trailing calls', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('first predicate in flight', ['pred(1) #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('drop reissues a pull but does not settle anyone done', ['src.next() #3']);
+
+  src.yield(1, 2);
+  src.yield(2, 3);
+  src.yield(3, 4);
+  await flushMicrotasks();
+  t.expectLog('remaining predicates run', ['pred(2) #1', 'pred(3) #2', 'pred(4) #3']);
+
+  pred.resolve(1, true);
+  pred.resolve(2, true);
+  pred.resolve(3, true);
+  await flushMicrotasks();
+  t.expectLog('all waiting calls still receive values', [
+    'r0 resolved {"value":2,"done":false}',
+    'r1 resolved {"value":3,"done":false}',
+    'r2 resolved {"value":4,"done":false}',
+  ]);
 }]);
 
 // Values are not lost: a later predicate error closes the source and ends the
@@ -470,6 +576,40 @@ tests.push(['filter: after an error, a vended call that would need a new pull se
   pred.resolve(1, false);
   await flushMicrotasks();
   t.expectLog('the un-serviceable vended call settles done', ['r1 resolved {"done":true}']);
+}]);
+
+// Same return()-then-drop shape as above, but after a head value has already
+// compacted out of the slot window. This exercises the value ceiling without
+// absolute consumer positions.
+tests.push(['filter: return after head compaction still drains an unserviceable call', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  src.yield(0, 1);
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('both predicates in flight', ['pred(1) #0', 'pred(2) #1']);
+
+  pred.resolve(0, true);
+  await flushMicrotasks();
+  t.expectLog('head value settles before return', ['r0 resolved {"value":1,"done":false}']);
+
+  const ret = f.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return closes after compaction', ['src.return() #0', 'ret resolved {"done":true}']);
+
+  pred.resolve(1, false);
+  await flushMicrotasks();
+  t.expectLog('remaining call settles done without a replacement pull', ['r1 resolved {"done":true}']);
 }]);
 
 // return() closes the source the same way, so it too must not strand a vended

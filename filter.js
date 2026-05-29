@@ -6,6 +6,16 @@ class FilterHelper {
   #done = false;
   #it;
   #pred;
+
+  // The helper keeps a compact window of issued underlying pulls. Each consumer
+  // receives the next slot in that window whose predicate passes; dropped slots
+  // are skipped and replaced with another pull while the source is still live.
+  //
+  // Once #done is set, no replacement pulls will be issued. At that point
+  // #valueLimit is a ceiling on how many waiting consumers can still receive
+  // values/errors from the remaining window, so consumers beyond it can resolve
+  // done immediately even if earlier slots are still pending.
+  //
   // Slot[] where Slot =
   //   | { status: 'pending' | 'drop' | 'done', index: number }
   //   | { status: 'value', value: unknown, index: number }
@@ -17,10 +27,9 @@ class FilterHelper {
   #slotBase = 0;
   // Waiting consumer deferreds, in call order.
   #consumers = [];
-  // The value ceiling: the number of non-dropped slots that can still produce
-  // values in the current slot window. Kept current as we go (a pull adds one;
-  // a drop or settled head value removes one) so #drainDone never rescans.
-  #upper = 0;
+  // Number of non-dropped slots that can still produce a consumer result in the
+  // current slot window.
+  #valueLimit = 0;
 
   constructor(it, pred) {
     this.#it = it;
@@ -57,7 +66,7 @@ class FilterHelper {
       index: this.#slotBase + this.#slots.length,
     };
     this.#slots.push(slot);
-    this.#upper++; // a new non-dropped slot in the current window
+    this.#valueLimit++;
     new Promise(resolve => resolve(this.#it.next())).then(settled => {
       let value, done;
       try {
@@ -73,14 +82,14 @@ class FilterHelper {
         // Clean exhaustion: done, but the underlying is not closed.
         this.#done = true;
         slot.status = 'done';
-        const k = this.#currentSlotIndex(slot);
-        if (k !== null) {
+        const slotIndex = this.#currentSlotIndex(slot);
+        if (slotIndex !== null) {
           // The done slot and every later slot cannot produce values. Discount
           // that suffix and stop retaining later in-flight slots.
-          for (let i = k; i < this.#slots.length; i++) {
-            if (this.#slots[i].status !== 'drop') this.#upper--;
+          for (let i = slotIndex; i < this.#slots.length; i++) {
+            if (this.#slots[i].status !== 'drop') this.#valueLimit--;
           }
-          this.#slots.length = k + 1;
+          this.#slots.length = slotIndex + 1;
         }
         this.#pump();
         return;
@@ -91,11 +100,11 @@ class FilterHelper {
           slot.value = value;
           this.#pump();
         } else {
-          // A drop lowers the value ceiling, so it can both reissue a pull (to
-          // replace the lost value) and let trailing done calls settle.
+          // A drop lowers the value ceiling. While live, replace the lost value
+          // with another pull; after done, the lower ceiling may drain callers.
           slot.status = 'drop';
-          const k = this.#currentSlotIndex(slot);
-          if (k !== null) this.#upper--;
+          const slotIndex = this.#currentSlotIndex(slot);
+          if (slotIndex !== null) this.#valueLimit--;
           if (!this.#done) this.#pull();
           this.#pump();
         }
@@ -145,7 +154,7 @@ class FilterHelper {
       this.#slots.shift();
       this.#slotBase++;
       if (consumesConsumer) {
-        this.#upper--;
+        this.#valueLimit--;
       }
     }
     if (this.#done) this.#drainDone();
@@ -155,7 +164,7 @@ class FilterHelper {
   // position has reached the terminal value ceiling. The call at the ceiling's
   // last position (an erroring one) stays — it is rejected in order by #pump.
   #drainDone() {
-    while (this.#consumers.length > this.#upper) {
+    while (this.#consumers.length > this.#valueLimit) {
       this.#consumers.pop().resolve({ value: undefined, done: true });
     }
     if (this.#consumers.length === 0) {
@@ -163,7 +172,7 @@ class FilterHelper {
       // eagerly while allowing already-issued pulls to finish harmlessly.
       this.#slotBase += this.#slots.length;
       this.#slots.length = 0;
-      this.#upper = 0;
+      this.#valueLimit = 0;
     }
   }
 

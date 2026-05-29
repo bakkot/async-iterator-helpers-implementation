@@ -10,6 +10,16 @@ import { filter } from '../filter.js';
 const FLUSH_ROUNDS = 20;
 const flush = async () => { for (let i = 0; i < FLUSH_ROUNDS; i++) await Promise.resolve(); };
 
+// The driver settles exactly one underlying promise per action and flushes to
+// quiescence before the next, so cascades never interleave. Within one cascade
+// `filter` performs all its synchronous underlying calls (source.next/return,
+// predicate) at or before the hop that resolves any consumer, so the observable
+// order is always [sync calls in call order] ++ [settlements in resolution
+// order]. The oracle reproduces that by partitioning, rather than predicting
+// exact microtask hops. checkPartialOrder() guards that premise (see below);
+// set NO_PARTIAL_ORDER=1 to skip it for speed once it's established.
+const CHECK_PARTIAL_ORDER = process.env.NO_PARTIAL_ORDER !== '1';
+
 const PULL_SHAPES = ['syncValue', 'syncDone', 'syncThrow', 'pending'];
 const PRED_SHAPES = ['syncTrue', 'syncFalse', 'syncThrow', 'pending'];
 const RETURN_SHAPES = ['sync', 'pending'];
@@ -83,18 +93,23 @@ function runModel(N, chooser) {
   const modelTrace = [];
   const callResults = [];
   let ev;
+  // Synchronously-observed underlying calls vs. consumer-promise settlements
+  // (observed one microtask hop later). Tagged so the trace for each action can
+  // be emitted as [sync...] ++ [settle...] without simulating hop counts.
+  const emitSync = (s) => ev.push({ k: 'sync', s });
+  const emitSettle = (s) => ev.push({ k: 'settle', s });
 
   const settleNext = (callId, result) => {
     callResults[callId] = { type: 'next', rhs: fmtResult(result) };
-    ev.push(evNext(callId, fmtResult(result)));
+    emitSettle(evNext(callId, fmtResult(result)));
   };
   const rejectNext = (callId, msg) => {
     callResults[callId] = { type: 'next', rhs: `throw ${msg}` };
-    ev.push(evNextThrow(callId, msg));
+    emitSettle(evNextThrow(callId, msg));
   };
   const settleReturn = (callId) => {
     callResults[callId] = { type: 'return', rhs: `{done:true}` };
-    ev.push(evReturn(callId, `{done:true}`));
+    emitSettle(evReturn(callId, `{done:true}`));
   };
 
   const clearTerminalState = () => {
@@ -133,6 +148,20 @@ function runModel(N, chooser) {
     }
   };
 
+  // One-shot delivery interleaving. When a false predicate frees the head slot
+  // it both issues a replacement pull *and* unblocks a buffered value. The real
+  // implementation observes that unblocked delivery one hop after resolving it,
+  // which lands *after* the replacement pull's first predicate call but *before*
+  // that predicate's result is processed (a close, a nested pull, or its own
+  // delivery). invokePred fires this at exactly that point; the false path fires
+  // it afterward if the replacement never reached a synchronous predicate call.
+  let pendingDelivery = false;
+  const firePendingDelivery = () => {
+    if (!pendingDelivery) return;
+    pendingDelivery = false;
+    if (nodes.length > 0 && consumers.length > 0) pump();
+  };
+
   const canIssueReplacement = () => !done && nextPullId < maxPulls;
 
   const closeForPredicateError = () => {
@@ -141,7 +170,7 @@ function runModel(N, chooser) {
     const id = nextReturnId++;
     const shape = RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
     schedule.returnShapes[id] = shape;
-    ev.push(evUReturn(id));
+    emitSync(evUReturn(id));
     // filter's close is fire-and-forget; predicate rejection is not delayed by
     // a pending underlying return().
   };
@@ -159,7 +188,7 @@ function runModel(N, chooser) {
     valueLimit++;
     const shape = PULL_SHAPES[chooser.choose(PULL_SHAPES.length)];
     schedule.pullShapes[pullId] = shape;
-    ev.push(evUNext(pullId));
+    emitSync(evUNext(pullId));
     if (shape === 'syncValue') resolvePull(node, 'value');
     else if (shape === 'syncDone') resolvePull(node, 'done');
     else if (shape === 'syncThrow') resolvePull(node, 'reject');
@@ -180,7 +209,8 @@ function runModel(N, chooser) {
     const shape = choosePredShape();
     schedule.predShapes[id] = shape;
     schedule.predByPull[node.pullId] = id;
-    ev.push(evPred(arg));
+    emitSync(evPred(arg));
+    firePendingDelivery();
     if (shape === 'syncTrue') resolvePred(node, arg, 'true');
     else if (shape === 'syncFalse') resolvePred(node, arg, 'false');
     else if (shape === 'syncThrow') resolvePred(node, arg, 'reject');
@@ -220,8 +250,13 @@ function runModel(N, chooser) {
       valueLimit--;
       const idx = nodes.indexOf(node);
       if (idx !== -1) nodes.splice(idx, 1);
-      if (!done) issuePull();
-      if (nodes.length > 0 && consumers.length > 0) pump();
+      if (!done) {
+        pendingDelivery = true;
+        issuePull();
+        firePendingDelivery();
+      } else if (nodes.length > 0 && consumers.length > 0) {
+        pump();
+      }
       if (done && consumers.length > valueLimit) settleDoneFrom(valueLimit);
     } else {
       if (!done) closeForPredicateError();
@@ -268,7 +303,7 @@ function runModel(N, chooser) {
         const id = nextReturnId++;
         const shape = RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
         schedule.returnShapes[id] = shape;
-        ev.push(evUReturn(id));
+        emitSync(evUReturn(id));
         if (shape === 'sync') settleReturn(callId);
         else pendingReturns.push({ id, callId });
       }
@@ -288,7 +323,7 @@ function runModel(N, chooser) {
       pendingReturns.splice(idx, 1);
       settleReturn(r.callId);
     }
-    modelTrace.push(ev.slice().sort());
+    modelTrace.push(ev.map((e) => e.s));
   }
 
   return { schedule, modelTrace, callResults, numDecisions: chooser.i, frontierOptionCount: chooser.frontierOptionCount };
@@ -406,7 +441,7 @@ function runReal(schedule) {
         else { pendingReturns.delete(act.id); d.resolve({ value: undefined, done: true }); }
       }
       await flush();
-      realTrace.push(cur.slice().sort());
+      realTrace.push(cur.slice());
     }
     return { realTrace, invariantViolation };
   })();
@@ -507,8 +542,82 @@ function compareTraces(model, real) {
   return null;
 }
 
+function eventKind(label) {
+  if (label.startsWith('U.next#') || label.startsWith('U.return#') || label.startsWith('pred(')) return 'sync';
+  if (label.startsWith('next#') || label.startsWith('return#')) return 'settle';
+  return 'other';
+}
+
+// Oracle-independent sanity check over the *real* trace: assert the necessary
+// happens-before edges that any correct run must satisfy, without trusting the
+// oracle's predicted ordering. A predicate can't be called on a value before
+// that value is pulled, and a value can't be delivered before its predicate
+// accepts it. Cheap, but it catches gross ordering errors the oracle and impl
+// might agree on; set NO_PARTIAL_ORDER=1 to skip it for speed.
+function checkPartialOrder(realTrace) {
+  const flat = [];
+  for (const step of realTrace) for (const label of step) flat.push(label);
+  for (let i = 0; i < flat.length; i++) {
+    const label = flat[i];
+    const mPred = /^pred\(P(\d+)\)$/.exec(label);
+    if (mPred) {
+      const callIdx = flat.indexOf(`U.next#${mPred[1]}`);
+      if (callIdx === -1 || callIdx > i) {
+        return { kind: 'pred-before-pull', label, at: i, dep: `U.next#${mPred[1]}`, depAt: callIdx };
+      }
+    }
+    const mVal = /^next#\d+ -> \{value:P(\d+),done:false\}$/.exec(label);
+    if (mVal) {
+      const predIdx = flat.indexOf(`pred(P${mVal[1]})`);
+      if (predIdx === -1 || predIdx > i) {
+        return { kind: 'value-before-pred', label, at: i, dep: `pred(P${mVal[1]})`, depAt: predIdx };
+      }
+    }
+  }
+  return null;
+}
+
+// Temporary diagnostic: enumerate every schedule, and for each step of the real
+// trace where a synchronous call is observed after a settlement (the premise
+// violation), tally a generalized signature so we can see how many distinct
+// interleaving shapes actually arise. Run with `SCAN=1 node ... [N]`.
+async function scan(N) {
+  const patterns = new Map(); // signature -> { count, example }
+  let scheduleCount = 0;
+  for (const s of enumerate(N)) {
+    scheduleCount++;
+    const { realTrace } = await runReal(s.schedule);
+    for (let step = 0; step < realTrace.length; step++) {
+      const kinds = realTrace[step].map(eventKind);
+      let seenSettle = false, violates = false;
+      for (const k of kinds) {
+        if (k === 'settle') seenSettle = true;
+        else if (k === 'sync' && seenSettle) violates = true;
+      }
+      if (!violates) continue;
+      const action = s.schedule.actions[step];
+      const sig = `${action.t}:${action.o ?? ''} :: ${kinds.join(' ')}`;
+      if (!patterns.has(sig)) {
+        patterns.set(sig, {
+          count: 0,
+          example: { schedule: describeSchedule(s), step, trace: realTrace[step] },
+        });
+      }
+      patterns.get(sig).count++;
+    }
+  }
+  console.log(`\nN = ${N}; schedules explored: ${scheduleCount}`);
+  console.log(`distinct sync-after-settle patterns: ${patterns.size}\n`);
+  for (const [sig, info] of [...patterns].sort((a, b) => b[1].count - a[1].count)) {
+    console.log(`  [${info.count}×] ${sig}`);
+    console.log(`        e.g. step ${info.example.step} of: ${info.example.schedule}`);
+    console.log(`        trace: ${JSON.stringify(info.example.trace)}`);
+  }
+}
+
 async function main() {
   const N = Number(process.argv[2] ?? 2);
+  if (process.env.SCAN) return scan(N);
   let scheduleCount = 0;
 
   for (const s of enumerate(N)) {
@@ -530,6 +639,14 @@ async function main() {
       reportPropertyFailure(s, prop, scheduleCount);
       process.exitCode = 1;
       return;
+    }
+    if (CHECK_PARTIAL_ORDER) {
+      const po = checkPartialOrder(realTrace);
+      if (po) {
+        reportPartialOrderFailure(s, po, scheduleCount);
+        process.exitCode = 1;
+        return;
+      }
     }
   }
 
@@ -573,6 +690,22 @@ function reportPropertyFailure(s, prop, scheduleCount) {
   console.log(`  after schedules explored: ${scheduleCount}`);
   console.log('  schedule: ' + describeSchedule(s));
   console.log(`  call #${prop.callId}: expected ${prop.expectedRhs}, oracle gave ${prop.actualRhs}`);
+  console.log('');
+}
+
+function reportPartialOrderFailure(s, po, scheduleCount) {
+  console.log('PARTIAL-ORDER VIOLATION (real trace breaks a happens-before premise)');
+  console.log(`  after schedules explored: ${scheduleCount}`);
+  console.log('  schedule: ' + describeSchedule(s));
+  if (po.kind === 'sync-after-settle') {
+    console.log(`  step ${po.step}: synchronous "${po.label}" observed after a settlement`);
+    console.log('    (breaks the [sync] ++ [settle] partition the oracle relies on)');
+    console.log('    step trace: ' + JSON.stringify(po.trace));
+  } else if (po.kind === 'pred-before-pull') {
+    console.log(`  "${po.label}" (index ${po.at}) precedes its pull "${po.dep}" (index ${po.depAt})`);
+  } else if (po.kind === 'value-before-pred') {
+    console.log(`  "${po.label}" (index ${po.at}) precedes its predicate "${po.dep}" (index ${po.depAt})`);
+  }
   console.log('');
 }
 

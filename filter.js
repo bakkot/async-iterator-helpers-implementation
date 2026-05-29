@@ -18,9 +18,10 @@ class FilterHelper {
   // done immediately even if earlier nodes are still pending.
   //
   // Core invariants:
-  // - #terminalIndex is null while live. Once terminal, completions with a
-  //   higher index are ignored. -Infinity means all remaining completions are
-  //   ignored after no consumer can observe them.
+  // - #terminalIndex is the highest pull index whose completion can still
+  //   matter. It starts at Infinity. A terminal transition (clean done,
+  //   underlying error, predicate error, or return()) lowers it. -Infinity
+  //   means no remaining completion can be observed by a consumer.
   // - #valueLimit counts retained nodes that can still consume one caller:
   //   'pending', 'value', and 'error'. It excludes the terminal 'done' wall.
   // - 0 <= #valueLimit <= retained node count.
@@ -32,7 +33,7 @@ class FilterHelper {
   #head = null;
   #tail = null;
   #nextIndex = 0;
-  #terminalIndex = null;
+  #terminalIndex = Infinity;
   // Waiting consumer deferreds, in call order.
   #consumers = [];
   // Kept current so terminal done-settlement never scans the retained list.
@@ -235,7 +236,7 @@ class FilterHelper {
   }
 
   #isIgnored(node) {
-    return this.#terminalIndex !== null && node.index > this.#terminalIndex;
+    return node.index > this.#terminalIndex;
   }
 
   #close() {

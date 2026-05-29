@@ -132,7 +132,7 @@ class FilterHelper {
           this.#valueLimit--;
           if (!this.#done) this.#pull();
           this.#pump();
-          if (this.#done) this.#drainDone();
+          if (this.#done) this.#settleOneDone();
         }
       }, err => {
         if (this.#isIgnored(node)) return;
@@ -205,13 +205,29 @@ class FilterHelper {
     }
     this.#consumers.length = this.#valueLimit;
     if (this.#consumers.length === 0) {
-      // No node can become observable after terminal drain; drop references
-      // eagerly while allowing already-issued pulls to finish harmlessly.
-      this.#head = null;
-      this.#tail = null;
-      this.#valueLimit = 0;
-      this.#terminalIndex = -1;
+      this.#clearTerminalState();
     }
+  }
+
+  // A post-terminal drop lowers #valueLimit by exactly one. Since #pump()
+  // consumes matching nodes and consumers together, at most one trailing
+  // consumer can newly become done.
+  #settleOneDone() {
+    if (this.#consumers.length <= this.#valueLimit) return;
+    this.#consumers[this.#valueLimit].resolve({ value: undefined, done: true });
+    this.#consumers.length = this.#valueLimit;
+    if (this.#consumers.length === 0) {
+      this.#clearTerminalState();
+    }
+  }
+
+  #clearTerminalState() {
+    // No node can become observable after terminal drain; drop references
+    // eagerly while allowing already-issued pulls to finish harmlessly.
+    this.#head = null;
+    this.#tail = null;
+    this.#valueLimit = 0;
+    this.#terminalIndex = -1;
   }
 
   // Record an error at a node: it keeps its value-position and is rejected in

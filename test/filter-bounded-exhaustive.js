@@ -11,13 +11,23 @@
 
 import { filter } from '../filter.js';
 
-// A single action can trigger a synchronous cascade of sync-false replacement
-// pulls up to maxPulls deep, each adding ~2 microtask hops before the final
-// consumer settlement; the flush has to outrun that or it truncates the real
-// trace one hop short. So rounds scale with maxPulls (set per-run in main).
-let FLUSH_ROUNDS = 20;
-const setFlushRounds = (n) => { FLUSH_ROUNDS = n; };
-const flush = async () => { for (let i = 0; i < FLUSH_ROUNDS; i++) await Promise.resolve(); };
+// Adaptive microtask drain. A single action can trigger a synchronous cascade
+// of sync-false replacement pulls (each ~2 hops) before the final settlement,
+// and the flush must reach quiescence or it truncates the real trace. Rather
+// than guess a fixed worst-case count, drain in chunks until a whole chunk adds
+// nothing new to the log. The chunk only has to exceed the largest gap between
+// consecutively-logged events (a couple of promise-adoption hops), which
+// 2*maxEvents comfortably clears; the common shallow schedules then settle in
+// one or two chunks instead of paying the deep-cascade worst case every time.
+let FLUSH_CHUNK = 16;
+const setFlushChunk = (n) => { FLUSH_CHUNK = n; };
+const flush = async (logLength) => {
+  for (;;) {
+    const before = logLength();
+    for (let i = 0; i < FLUSH_CHUNK; i++) await Promise.resolve();
+    if (logLength() === before) return;
+  }
+};
 
 // The driver settles exactly one underlying promise per action and flushes to
 // quiescence before the next, so cascades never interleave. Within one cascade
@@ -101,11 +111,13 @@ function runModel(maxEvents, chooser) {
   const modelTrace = [];
   const callResults = [];
   let ev;
-  // Synchronously-observed underlying calls vs. consumer-promise settlements
-  // (observed one microtask hop later). Tagged so the trace for each action can
-  // be emitted as [sync...] ++ [settle...] without simulating hop counts.
-  const emitSync = (s) => ev.push({ k: 'sync', s });
-  const emitSettle = (s) => ev.push({ k: 'settle', s });
+  // Two names, one behaviour: both append to the action's trace in emission
+  // order. The distinction documents intent -- emitSync marks an underlying
+  // call observed synchronously, emitSettle a consumer-promise settlement
+  // observed one microtask hop later -- which is what makes the emission order
+  // faithful (see resolvePred's false branch for the one place it matters).
+  const emitSync = (s) => ev.push(s);
+  const emitSettle = (s) => ev.push(s);
 
   const settleNext = (callId, result) => {
     callResults[callId] = { type: 'next', rhs: fmtResult(result) };
@@ -336,7 +348,7 @@ function runModel(maxEvents, chooser) {
       pendingReturns.splice(idx, 1);
       settleReturn(r.callId);
     }
-    modelTrace.push(ev.map((e) => e.s));
+    modelTrace.push(ev.slice());
   }
 
   return { schedule, modelTrace, callResults, truncated, numDecisions: chooser.i, frontierOptionCount: chooser.frontierOptionCount };
@@ -453,7 +465,7 @@ function runReal(schedule) {
         if (!d) log(`!! settleReturn#${act.id} not pending`);
         else { pendingReturns.delete(act.id); d.resolve({ value: undefined, done: true }); }
       }
-      await flush();
+      await flush(() => cur.length);
       realTrace.push(cur.slice());
     }
     return { realTrace, invariantViolation };
@@ -548,9 +560,10 @@ function checkSequentialProperty(schedule, callResults) {
 function compareTraces(model, real) {
   if (model.length !== real.length) return { kind: 'length', model: model.length, real: real.length };
   for (let i = 0; i < model.length; i++) {
-    if (model[i].join(' | ') !== real[i].join(' | ')) {
-      return { kind: 'step', step: i, model: model[i], real: real[i] };
-    }
+    const m = model[i], r = real[i];
+    let same = m.length === r.length;
+    for (let j = 0; same && j < m.length; j++) if (m[j] !== r[j]) same = false;
+    if (!same) return { kind: 'step', step: i, model: m, real: r };
   }
   return null;
 }
@@ -602,9 +615,7 @@ function countSchedules(maxEvents) {
 
 async function main() {
   const maxEvents = Number(process.argv[2] ?? 5);
-  // Outrun the deepest possible sync-false replacement cascade (~2 hops per
-  // pull, maxPulls = 2*maxEvents) plus the trailing settlement, with margin.
-  setFlushRounds(8 * maxEvents + 40);
+  setFlushChunk(Math.max(8, 2 * maxEvents));
   if (process.env.COUNT) return countSchedules(maxEvents);
   let scheduleCount = 0;
 

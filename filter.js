@@ -23,10 +23,11 @@ class FilterHelper {
   // Either way, trailing calls settle done ASAP, even while an earlier one is
   // still blocked.
   #boundary = null;
-  // The value ceiling: how many value-positions exist below #boundary.
-  // Maintained incrementally so #drainDone need not rescan — each drop before
-  // the boundary lowers it. A call whose position reaches it can never receive a
-  // value. Only meaningful once #boundary is set.
+  // The value ceiling: the number of non-dropped slots below #boundary. Kept
+  // current as we go (a pull adds one, a drop removes one) so #drainDone never
+  // rescans; setting #boundary then only has to discount the slots it excludes.
+  // While #boundary is null it counts every issued slot, which is exactly the
+  // count #seal wants. A call whose position reaches it can never get a value.
   #upper = 0;
 
   constructor(it, pred) {
@@ -62,6 +63,7 @@ class FilterHelper {
     const slot = { status: 'pending', value: undefined, error: undefined };
     const k = this.#slots.length;
     this.#slots.push(slot);
+    this.#upper++; // a new non-dropped slot below the (not-yet-set) boundary
     new Promise(resolve => resolve(this.#it.next())).then(settled => {
       let value, done;
       try {
@@ -77,8 +79,14 @@ class FilterHelper {
         // Clean exhaustion: done, but the underlying is not closed.
         this.#done = true;
         if (this.#boundary === null || k < this.#boundary) {
+          // The boundary moves down to k; discount the slots it now excludes,
+          // [k, oldEnd), that #upper was still counting (oldEnd = the previous
+          // boundary, or every issued slot if none was set).
+          const oldEnd = this.#boundary ?? this.#slots.length;
+          for (let i = k; i < oldEnd; i++) {
+            if (this.#slots[i].status !== 'drop') this.#upper--;
+          }
           this.#boundary = k;
-          this.#recomputeUpper();
         }
         this.#pump();
         this.#drainDone();
@@ -93,7 +101,7 @@ class FilterHelper {
           // A drop lowers the value ceiling, so it can both reissue a pull (to
           // replace the lost value) and let trailing done calls settle.
           slot.status = 'drop';
-          if (this.#boundary !== null && k < this.#boundary) this.#upper--;
+          if (this.#boundary === null || k < this.#boundary) this.#upper--;
           if (!this.#done) this.#pull();
           this.#pump();
           this.#drainDone();
@@ -149,18 +157,6 @@ class FilterHelper {
     }
   }
 
-  // Count the value-positions below #boundary: every slot that is not a drop —
-  // a value, a still-pending pull, or an error (which fills its position with a
-  // rejection). A done slot never falls below the boundary. Runs only when the
-  // boundary is first set or lowered.
-  #recomputeUpper() {
-    let upper = 0;
-    for (let i = 0; i < this.#boundary; i++) {
-      if (this.#slots[i].status !== 'drop') upper++;
-    }
-    this.#upper = upper;
-  }
-
   // Record an error at a slot: it keeps its value-position and is rejected in
   // order by #pump. An error does not exhaust the source the way a done does, so
   // the pulls already in flight still serve their calls (values are not lost);
@@ -176,12 +172,12 @@ class FilterHelper {
 
   // Once we will pull no more (an error or return()), no value can exist past
   // the pulls already issued: freeze the boundary there so calls that would need
-  // a new pull settle done. A clean done sets a tighter boundary itself, so only
+  // a new pull settle done. #upper already counts exactly those slots, so no
+  // adjustment is needed. A clean done sets a tighter boundary itself, so only
   // seal when none is set yet.
   #seal() {
     if (this.#boundary === null) {
       this.#boundary = this.#slots.length;
-      this.#recomputeUpper();
     }
   }
 

@@ -14,7 +14,7 @@ class FilterHelper {
   //
   // Once #done is set, no replacement pulls will be issued. At that point
   // #valueLimit is a ceiling on how many waiting consumers can still receive
-  // values/errors from the remaining list, so consumers beyond it can resolve
+  // values/errors from the retained set, so consumers beyond it can resolve
   // done immediately even if earlier nodes are still pending.
   //
   // Core invariants:
@@ -27,16 +27,15 @@ class FilterHelper {
   // - 0 <= #valueLimit <= retained node count.
   //
   // Node =
-  //   | { status: 'pending' | 'done', index: number, prev: Node?, next: Node? }
-  //   | { status: 'value', value: unknown, index: number, prev: Node?, next: Node? }
-  //   | { status: 'error', error: unknown, index: number, prev: Node?, next: Node? }
-  #head = null;
-  #tail = null;
+  //   | { status: 'pending' | 'done', index: number }
+  //   | { status: 'value', value: unknown, index: number }
+  //   | { status: 'error', error: unknown, index: number }
+  #nodes = new Set();
   #nextIndex = 0;
   #terminalIndex = Infinity;
   // Waiting consumer deferreds, in call order.
   #consumers = [];
-  // Kept current so terminal done-settlement never scans the retained list.
+  // Kept current so terminal done-settlement never scans the retained set.
   #valueLimit = 0;
 
   constructor(it, pred) {
@@ -69,16 +68,8 @@ class FilterHelper {
     const node = {
       status: 'pending',
       index: this.#nextIndex++,
-      prev: null,
-      next: null,
     };
-    if (this.#tail) {
-      node.prev = this.#tail;
-      this.#tail.next = node;
-    } else {
-      this.#head = node;
-    }
-    this.#tail = node;
+    this.#nodes.add(node);
     this.#valueLimit++;
     new Promise(resolve => resolve(this.#it.next())).then(settled => {
       if (this.#isIgnored(node)) return;
@@ -99,17 +90,15 @@ class FilterHelper {
         this.#terminalIndex = node.index;
         node.status = 'done';
         this.#valueLimit--;
-        for (let n = node.next; n;) {
-          const next = n.next;
-          this.#valueLimit--;
-          // Truncated nodes may still be held by pending pull completions; cut
-          // their list links so ignored work does not retain live values.
-          n.prev = null;
-          n.next = null;
-          n = next;
+        let truncate = false;
+        for (const n of this.#nodes) {
+          if (truncate) {
+            this.#nodes.delete(n);
+            this.#valueLimit--;
+          } else if (n === node) {
+            truncate = true;
+          }
         }
-        this.#tail = node;
-        node.next = null;
         this.#pump();
         if (this.#consumers.length > this.#valueLimit) {
           this.#settleDoneFrom(this.#valueLimit);
@@ -124,23 +113,10 @@ class FilterHelper {
           this.#pump();
         } else {
           // A dropped value is deleted from the retained sequence.
-          let wasHead = false;
-          const predecessor = node.prev;
-          const successor = node.next;
-          if (predecessor) {
-            predecessor.next = successor;
-          } else {
-            wasHead = true;
-            this.#head = successor;
-          }
-          if (successor) {
-            successor.prev = predecessor;
-          } else {
-            this.#tail = predecessor;
-          }
           this.#valueLimit--;
+          this.#nodes.delete(node);
           if (!this.#done) this.#pull();
-          if (wasHead && successor) this.#pump();
+          if (this.#nodes.size > 0 && this.#consumers.length > 0) this.#pump();
           if (this.#done && this.#consumers.length > this.#valueLimit) {
             // This drop lowered #valueLimit by one, so at most one consumer
             // newly falls past the terminal ceiling.
@@ -171,7 +147,7 @@ class FilterHelper {
   // Deliver settled nodes to waiting consumers in order.
   #pump() {
     while (this.#consumers.length > 0) {
-      const node = this.#head;
+      const node = this.#head();
       if (node.status === 'pending') break;
 
       switch (node.status) {
@@ -195,12 +171,7 @@ class FilterHelper {
           break;
       }
 
-      this.#head = node.next;
-      if (this.#head) {
-        this.#head.prev = null;
-      } else {
-        this.#tail = null;
-      }
+      this.#nodes.delete(node);
       this.#valueLimit--;
     }
   }
@@ -218,8 +189,7 @@ class FilterHelper {
   #clearTerminalState() {
     // No node can become observable after terminal drain; drop references
     // eagerly while allowing already-issued pulls to finish harmlessly.
-    this.#head = null;
-    this.#tail = null;
+    this.#nodes.clear();
     this.#valueLimit = 0;
     this.#terminalIndex = -Infinity;
   }
@@ -237,6 +207,10 @@ class FilterHelper {
 
   #isIgnored(node) {
     return node.index > this.#terminalIndex;
+  }
+
+  #head() {
+    return this.#nodes.values().next().value;
   }
 
   #close() {

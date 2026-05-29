@@ -1154,4 +1154,246 @@ tests.push(['filter: predicate error behind an earlier drop drains trailing call
   ]);
 }]);
 
+// --- Source done / error caps interacting with filtered-out values ---
+
+// A done is terminal for every later source position, even one that was
+// eagerly pulled and already errored before the done arrived. The speculative
+// error at slot #2 must be discarded — not resurrected to satisfy the earlier
+// pending call when its own value is dropped.
+tests.push(['filter: a source done retroactively caps a later already-observed error', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('first two pulls are in flight', ['src.next() #0', 'src.next() #1']);
+
+  // Arm the third pull to throw synchronously, then vend the third call so that
+  // pull #2 (and only pull #2) throws.
+  src.throwNext(new Error('source throw 2'));
+  const r2 = f.next();
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('third pull throws synchronously and is stored, settling nothing', [
+    'src.next() #2 (throws)',
+  ]);
+
+  // Done at slot #1 (slot #0 still pending). The done caps slot #2, so the
+  // stored error is suppressed: r1 (its own position) and r2 (past the done)
+  // both settle done.
+  src.finish(1);
+  await flushMicrotasks();
+  t.expectLog('done caps the later error -> r1 and r2 done', [
+    'r1 resolved {"done":true}',
+    'r2 resolved {"done":true}',
+  ]);
+
+  // The still-pending earlier value arrives and is dropped. With the source
+  // already done there is no replacement pull and no error to expose, so r0 is
+  // simply done.
+  src.yield(0, 'v0');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the earlier value', ['pred("v0") #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('dropped value followed by the capped done -> r0 done', [
+    'r0 resolved {"done":true}',
+  ]);
+}]);
+
+// Once a source error has already rejected its own call (r0), a later
+// out-of-order value that drops retires the *latest* pending call (r2) done,
+// while the middle call (r1) stays pending behind its own in-flight slot.
+tests.push(['filter: a consumed source error no longer blocks a later done', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  src.throw(0, new Error('source reject 0'));
+  await flushMicrotasks();
+  t.expectLog('the error rejects its dependent call', ['r0 rejected source reject 0']);
+
+  // Slot #2 yields out of order while slot #1 is still pending.
+  src.yield(2, 'v0');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the out-of-order value', ['pred("v0") #0']);
+
+  // The drop cannot be replaced (source is terminal), and slot #2 is past the
+  // error cap, so the latest call retires done. r1 is still owed slot #1.
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('the latest pending call retires done', ['r2 resolved {"done":true}']);
+
+  await flushMicrotasks();
+  t.expectLog('the middle call stays pending', []);
+}]);
+
+// A known error sits one slot behind the head. Dropping the head exposes the
+// error as the next retained outcome, so it must reject the earliest pending
+// call before any later done is emitted.
+tests.push(['filter: a filtered-out value before a known error compacts the error first', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  // Error at slot #1 cannot surface while slot #0 is unresolved.
+  src.throw(1, new Error('source reject 1'));
+  await flushMicrotasks();
+  t.expectLog('error waits behind the unresolved head', []);
+
+  src.yield(0, 'v0');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the head value', ['pred("v0") #0']);
+
+  // Dropping the head exposes the slot #1 error as the next outcome: it rejects
+  // r0. Slot #2 is still in flight and is owed to r1, so only r2 (beyond it,
+  // with no new pulls coming) retires done; r1 stays pending.
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('error compacts forward to r0; the latest call retires done', [
+    'r0 rejected source reject 1',
+    'r2 resolved {"done":true}',
+  ]);
+
+  await flushMicrotasks();
+  t.expectLog('the middle call stays pending behind its in-flight slot', []);
+}]);
+
+// An error cap sits at slot #1 while slot #0 is still pending. A later
+// out-of-order value (slot #2) drops; because slot #2 is past the cap and
+// cannot be replaced, the latest call retires done while the earlier two wait.
+tests.push(['filter: a later filtered-out value after a pending error retires the latest done', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  src.throw(1, new Error('source reject 1'));
+  await flushMicrotasks();
+  t.expectLog('error at slot #1 waits behind the pending head', []);
+
+  // Slot #2 yields while slot #0 is still pending.
+  src.yield(2, 'v0');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the out-of-order value', ['pred("v0") #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('the latest call is beyond the cap and retires done', [
+    'r2 resolved {"done":true}',
+  ]);
+
+  await flushMicrotasks();
+  t.expectLog('the earlier two calls stay pending', []);
+}]);
+
+// The latest in-flight slot (#2) is a known error cap. An earlier value
+// (slot #0) drops while slot #1 is still pending. The latest call can be done
+// regardless of how slot #1 compacts, because at most two outcomes remain for
+// three calls.
+tests.push(['filter: an earlier filtered-out value before a later pending error retires the latest done', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  src.throw(2, new Error('source reject 2'));
+  await flushMicrotasks();
+  t.expectLog('error at the latest slot waits behind the earlier slots', []);
+
+  // Slot #0 yields while slot #1 is still pending.
+  src.yield(0, 'v0');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the head value', ['pred("v0") #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('only the latest call retires done', ['r2 resolved {"done":true}']);
+
+  await flushMicrotasks();
+  t.expectLog('the earlier two calls stay pending', []);
+}]);
+
+// A replacement pull (triggered by a drop) throws, but the error's final
+// filtered position is unknown while an earlier slot is unresolved. When that
+// earlier value also drops, the error compacts forward to the earliest call and
+// the tail call drains done — the rejection observed before the done.
+tests.push(['filter: a compacted source error rejects before the tail done', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  // Arm the replacement pull to throw, then drop slot #1's value so the helper
+  // issues that replacement pull (#2), which throws.
+  src.throwNext(new Error('source throw 2'));
+  src.yield(1, 'v0');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the later value', ['pred("v0") #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('replacement pull throws but waits: slot #0 is unresolved', [
+    'src.next() #2 (throws)',
+  ]);
+
+  src.yield(0, 'v1');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the earlier value', ['pred("v1") #1']);
+
+  // The earlier value also drops, so the compacted error is now the sole
+  // surviving outcome: it rejects r0, and r1 drains done after it.
+  pred.resolve(1, false);
+  await flushMicrotasks();
+  t.expectLog('compacted error rejects r0 before the tail done', [
+    'r0 rejected source throw 2',
+    'r1 resolved {"done":true}',
+  ]);
+}]);
+
 runTests(tests);

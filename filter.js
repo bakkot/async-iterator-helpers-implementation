@@ -78,6 +78,7 @@ class FilterHelper {
       if (done) {
         // Clean exhaustion: done, but the underlying is not closed.
         this.#done = true;
+        slot.status = 'done';
         if (this.#boundary === null || k < this.#boundary) {
           // The boundary moves down to k; discount the slots it now excludes,
           // [k, oldEnd), that #upper was still counting (oldEnd = the previous
@@ -134,8 +135,7 @@ class FilterHelper {
       } else if (slot.status === 'drop') {
         this.#cursor++;
       } else if (slot.status === 'done') {
-        for (const c of this.#consumers) c.resolve({ value: undefined, done: true });
-        this.#consumers.length = 0;
+        break;
       } else {
         // 'error': like a value, but the call at this position rejects. It does
         // not end the others — they keep being served — so advance and continue.

@@ -107,6 +107,7 @@ class FilterHelper {
         this.#tail = node;
         node.next = null;
         this.#pump();
+        this.#drainDone();
         return;
       }
       new Promise(resolve => resolve(this.#pred(value))).then(keep => {
@@ -132,6 +133,7 @@ class FilterHelper {
           this.#valueLimit--;
           if (!this.#done) this.#pull();
           this.#pump();
+          if (this.#done) this.#drainDone();
         }
       }, err => {
         if (this.#isIgnored(node)) return;
@@ -193,7 +195,6 @@ class FilterHelper {
       node.next = null;
       this.#valueLimit--;
     }
-    if (this.#done) this.#drainDone();
   }
 
   // Settle trailing calls that can no longer receive a value: those whose
@@ -223,6 +224,7 @@ class FilterHelper {
     node.status = 'error';
     node.error = err;
     this.#pump();
+    this.#drainDone();
   }
 
   #isIgnored(node) {

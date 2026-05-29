@@ -56,7 +56,6 @@ class FilterHelper {
       return { value: undefined, done: true };
     }
     this.#done = true;
-    this.#drainDone();
     await this.#it?.return();
     return { value: undefined, done: true };
   }

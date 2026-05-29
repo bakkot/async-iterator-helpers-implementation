@@ -33,7 +33,7 @@ class FilterHelper {
   #terminalIndex = null;
   // Waiting consumer deferreds, in call order.
   #consumers = [];
-  // Kept current so #drainDone never scans the retained list.
+  // Kept current so terminal done-settlement never scans the retained list.
   #valueLimit = 0;
 
   constructor(it, pred) {
@@ -106,7 +106,13 @@ class FilterHelper {
         this.#tail = node;
         node.next = null;
         this.#pump();
-        this.#drainDone();
+        for (let i = this.#valueLimit; i < this.#consumers.length; i++) {
+          this.#consumers[i].resolve({ value: undefined, done: true });
+        }
+        this.#consumers.length = this.#valueLimit;
+        if (this.#consumers.length === 0) {
+          this.#clearTerminalState();
+        }
         return;
       }
       new Promise(resolve => resolve(this.#pred(value))).then(keep => {
@@ -132,7 +138,13 @@ class FilterHelper {
           this.#valueLimit--;
           if (!this.#done) this.#pull();
           this.#pump();
-          if (this.#done) this.#settleOneDone();
+          if (this.#done && this.#consumers.length > this.#valueLimit) {
+            this.#consumers[this.#valueLimit].resolve({ value: undefined, done: true });
+            this.#consumers.length = this.#valueLimit;
+            if (this.#consumers.length === 0) {
+              this.#clearTerminalState();
+            }
+          }
         }
       }, err => {
         if (this.#isIgnored(node)) return;
@@ -193,31 +205,6 @@ class FilterHelper {
       }
       node.next = null;
       this.#valueLimit--;
-    }
-  }
-
-  // Settle trailing calls that can no longer receive a value: those whose
-  // position has reached the terminal value ceiling. The call at the ceiling's
-  // last position (an erroring one) stays — it is rejected in order by #pump.
-  #drainDone() {
-    for (let i = this.#valueLimit; i < this.#consumers.length; i++) {
-      this.#consumers[i].resolve({ value: undefined, done: true });
-    }
-    this.#consumers.length = this.#valueLimit;
-    if (this.#consumers.length === 0) {
-      this.#clearTerminalState();
-    }
-  }
-
-  // A post-terminal drop lowers #valueLimit by exactly one. Since #pump()
-  // consumes matching nodes and consumers together, at most one trailing
-  // consumer can newly become done.
-  #settleOneDone() {
-    if (this.#consumers.length <= this.#valueLimit) return;
-    this.#consumers[this.#valueLimit].resolve({ value: undefined, done: true });
-    this.#consumers.length = this.#valueLimit;
-    if (this.#consumers.length === 0) {
-      this.#clearTerminalState();
     }
   }
 

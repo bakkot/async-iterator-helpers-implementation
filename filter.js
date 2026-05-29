@@ -224,7 +224,6 @@ class FilterHelper {
     node.status = 'error';
     node.error = err;
     this.#pump();
-    this.#drainDone();
   }
 
   #isIgnored(node) {

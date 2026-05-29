@@ -9,12 +9,8 @@ class FilterHelper {
   // One slot per underlying pull, in pull order. status is
   // 'pending' | 'value' | 'drop' | 'done' | 'error'.
   #slots = [];
-  // Next slot to hand out, in order. The i-th passing value goes to the i-th
-  // consumer call, so values are delivered strictly in call order.
-  #cursor = 0;
-  // Waiting consumer deferreds, each tagged with its absolute call position.
+  // Waiting consumer deferreds, each tagged with its current queue position.
   #consumers = [];
-  #made = 0;
   // Exclusive index past which no value can exist, once known. A clean done at
   // index d caps it at d (the done slot yields nothing, and a well-behaved
   // source keeps returning done, so any pulls in flight past d would too). An
@@ -23,10 +19,10 @@ class FilterHelper {
   // Either way, trailing calls settle done ASAP, even while an earlier one is
   // still blocked.
   #boundary = null;
-  // The value ceiling: the number of non-dropped slots below #boundary. Kept
-  // current as we go (a pull adds one, a drop removes one) so #drainDone never
-  // rescans; setting #boundary then only has to discount the slots it excludes.
-  // While #boundary is null it counts every issued slot, which is exactly the
+  // The value ceiling: the number of non-dropped slots below #boundary in the
+  // current slot window. Kept current as we go (a pull adds one; a drop or
+  // settled head value removes one) so #drainDone never rescans. While
+  // #boundary is null it counts every slot in the window, which is exactly the
   // count #seal wants. A call whose position reaches it can never get a value.
   #upper = 0;
 
@@ -40,7 +36,7 @@ class FilterHelper {
       return Promise.resolve({ value: undefined, done: true });
     }
     const d = Promise.withResolvers();
-    d.position = this.#made++;
+    d.position = this.#consumers.length;
     this.#consumers.push(d);
     this.#pull();
     return d.promise;
@@ -61,7 +57,6 @@ class FilterHelper {
   // dropped value (to replace it), but never once we're done.
   #pull() {
     const slot = { status: 'pending', value: undefined, error: undefined };
-    const k = this.#slots.length;
     this.#slots.push(slot);
     this.#upper++; // a new non-dropped slot below the (not-yet-set) boundary
     new Promise(resolve => resolve(this.#it.next())).then(settled => {
@@ -79,10 +74,11 @@ class FilterHelper {
         // Clean exhaustion: done, but the underlying is not closed.
         this.#done = true;
         slot.status = 'done';
+        const k = this.#slotIndex(slot);
         if (this.#boundary === null || k < this.#boundary) {
           // The boundary moves down to k; discount the slots it now excludes,
           // [k, oldEnd), that #upper was still counting (oldEnd = the previous
-          // boundary, or every issued slot if none was set).
+          // boundary, or every slot in the window if none was set).
           const oldEnd = this.#boundary ?? this.#slots.length;
           for (let i = k; i < oldEnd; i++) {
             if (this.#slots[i].status !== 'drop') this.#upper--;
@@ -102,6 +98,7 @@ class FilterHelper {
           // A drop lowers the value ceiling, so it can both reissue a pull (to
           // replace the lost value) and let trailing done calls settle.
           slot.status = 'drop';
+          const k = this.#slotIndex(slot);
           if (this.#boundary === null || k < this.#boundary) this.#upper--;
           if (!this.#done) this.#pull();
           this.#pump();
@@ -127,22 +124,23 @@ class FilterHelper {
   // Deliver settled slots to waiting consumers in order.
   #pump() {
     while (this.#consumers.length > 0) {
-      const slot = this.#slots[this.#cursor];
+      const slot = this.#slots[0];
       if (!slot || slot.status === 'pending') break;
       if (slot.status === 'value') {
         this.#consumers.shift().resolve({ value: slot.value, done: false });
-        this.#cursor++;
+        this.#settleHeadSlot();
       } else if (slot.status === 'drop') {
-        this.#cursor++;
+        this.#discardHeadSlot(false);
       } else if (slot.status === 'done') {
         break;
       } else {
         // 'error': like a value, but the call at this position rejects. It does
         // not end the others — they keep being served — so advance and continue.
         this.#consumers.shift().reject(slot.error);
-        this.#cursor++;
+        this.#settleHeadSlot();
       }
     }
+    this.#drainDone();
   }
 
   // Settle trailing calls that can no longer receive a value: those whose
@@ -171,7 +169,7 @@ class FilterHelper {
   }
 
   // Once we will pull no more (an error or return()), no value can exist past
-  // the pulls already issued: freeze the boundary there so calls that would need
+  // the current slot window: freeze the boundary there so calls that would need
   // a new pull settle done. #upper already counts exactly those slots, so no
   // adjustment is needed. A clean done sets a tighter boundary itself, so only
   // seal when none is set yet.
@@ -179,6 +177,21 @@ class FilterHelper {
     if (this.#boundary === null) {
       this.#boundary = this.#slots.length;
     }
+  }
+
+  #slotIndex(slot) {
+    return this.#slots.indexOf(slot);
+  }
+
+  #settleHeadSlot() {
+    this.#discardHeadSlot(true);
+    for (const c of this.#consumers) c.position--;
+  }
+
+  #discardHeadSlot(countedValue) {
+    this.#slots.shift();
+    if (countedValue) this.#upper--;
+    if (this.#boundary !== null) this.#boundary--;
   }
 
   #close() {

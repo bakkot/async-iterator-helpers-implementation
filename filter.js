@@ -15,11 +15,13 @@ class FilterHelper {
   // Waiting consumer deferreds, each tagged with its absolute call position.
   #consumers = [];
   #made = 0;
-  // Exclusive index past which no value can exist, set when a done is seen: a
-  // done at index d caps it at d (the done slot itself yields nothing). A well-
-  // behaved source keeps returning done, so the pulls already in flight past d
-  // would resolve done too — capping just lets trailing calls settle done ASAP,
-  // even while an earlier one is still blocked. Errors do NOT cap it (see #fail).
+  // Exclusive index past which no value can exist, once known. A clean done at
+  // index d caps it at d (the done slot yields nothing, and a well-behaved
+  // source keeps returning done, so any pulls in flight past d would too). An
+  // error or return() instead seals it at the pulls already issued (#seal): no
+  // further pulls will happen, so a call that would need one can never be served.
+  // Either way, trailing calls settle done ASAP, even while an earlier one is
+  // still blocked.
   #boundary = null;
   // The value ceiling: how many value-positions exist below #boundary.
   // Maintained incrementally so #drainDone need not rescan — each drop before
@@ -48,6 +50,8 @@ class FilterHelper {
       return { value: undefined, done: true };
     }
     this.#done = true;
+    this.#seal();
+    this.#drainDone();
     await this.#it?.return();
     return { value: undefined, done: true };
   }
@@ -158,13 +162,27 @@ class FilterHelper {
   }
 
   // Record an error at a slot: it keeps its value-position and is rejected in
-  // order by #pump. Unlike a done it does NOT cap the boundary — an error only
-  // ends *future* next() calls (via #done); calls already vended stay served by
-  // the pulls already in flight, so their values are not lost.
+  // order by #pump. An error does not exhaust the source the way a done does, so
+  // the pulls already in flight still serve their calls (values are not lost);
+  // but no new pull will happen, so #seal lets any call that would need one
+  // settle done instead of hanging.
   #fail(slot, err) {
     slot.status = 'error';
     slot.error = err;
+    this.#seal();
     this.#pump();
+    this.#drainDone();
+  }
+
+  // Once we will pull no more (an error or return()), no value can exist past
+  // the pulls already issued: freeze the boundary there so calls that would need
+  // a new pull settle done. A clean done sets a tighter boundary itself, so only
+  // seal when none is set yet.
+  #seal() {
+    if (this.#boundary === null) {
+      this.#boundary = this.#slots.length;
+      this.#recomputeUpper();
+    }
   }
 
   #close() {

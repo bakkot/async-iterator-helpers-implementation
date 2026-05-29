@@ -102,6 +102,9 @@ via `tests.push([...])`. Run: `node test/map.js`.
 
 ### Bounded-exhaustive differential test — `test/map-bounded-exhaustive.js`
 
+Any case we think should be tested gets a test in `test/map.js`. But we can't
+think of everything. For that, we have enumeration.
+
 Enumerates **every distinct schedule** of up to `N` consumer calls and checks the
 real `map` against a reference oracle. Run: `node test/map-bounded-exhaustive.js
 [N]` (default 2; 3 is quick; 4 is exhaustive and takes a couple of minutes).

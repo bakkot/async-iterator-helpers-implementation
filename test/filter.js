@@ -401,4 +401,72 @@ tests.push(['filter: an in-flight call still resolves with a value after an earl
   ]);
 }]);
 
+// We must not leave a vended promise unsettled. After an error the source is
+// closed and no replacement pulls happen, so a vended call whose value would
+// have required a *new* pull (its in-flight slot drops) settles done rather than
+// hanging.
+tests.push(['filter: after an error, a vended call that would need a new pull settles done', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('predicate invoked on the first value', ['pred(1) #0']);
+
+  // The first predicate errors: r0 (at that position) rejects and the source
+  // closes. r1 is left in flight on pull #1.
+  pred.reject(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('error rejects r0 and closes the source', [
+    'src.return() #0',
+    'r0 rejected boom',
+  ]);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('predicate invoked on the second value', ['pred(2) #1']);
+
+  // Pull #1 drops. Normally that reissues a pull to satisfy r1, but the source
+  // is closed — so r1 can never be served and settles done instead of hanging.
+  pred.resolve(1, false);
+  await flushMicrotasks();
+  t.expectLog('the un-serviceable vended call settles done', ['r1 resolved {"done":true}']);
+}]);
+
+// return() closes the source the same way, so it too must not strand a vended
+// call whose value would need a new pull.
+tests.push(['filter: after return(), a vended call that would need a new pull settles done', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('a pull is in flight', ['src.next() #0']);
+
+  const ret = f.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes the source', ['src.return() #0', 'ret resolved {"done":true}']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('predicate still runs on the in-flight value', ['pred(1) #0']);
+
+  // The in-flight value is dropped; with the source closed there is no
+  // replacement pull, so r0 settles done instead of hanging.
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('the un-serviceable vended call settles done', ['r0 resolved {"done":true}']);
+}]);
+
 runTests(tests);

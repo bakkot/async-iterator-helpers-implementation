@@ -103,7 +103,18 @@ class FilterHelper {
           this.#pump();
         } else {
           // A dropped value is deleted from the retained sequence.
-          this.#remove(node);
+          if (node.prev) {
+            node.prev.next = node.next;
+          } else {
+            this.#head = node.next;
+          }
+          if (node.next) {
+            node.next.prev = node.prev;
+          } else {
+            this.#tail = node.prev;
+          }
+          node.prev = null;
+          node.next = null;
           this.#valueLimit--;
           if (!this.#done) this.#pull();
           this.#pump();
@@ -135,11 +146,9 @@ class FilterHelper {
       const node = this.#head;
       if (!node || node.status === 'pending') break;
 
-      let settledConsumer = false;
       switch (node.status) {
         case 'value':
           this.#consumers.shift().resolve({ value: node.value, done: false });
-          settledConsumer = true;
           break;
         case 'done':
           this.#drainDone();
@@ -149,14 +158,17 @@ class FilterHelper {
           // does not end the others — they keep being served — so advance and
           // continue.
           this.#consumers.shift().reject(node.error);
-          settledConsumer = true;
           break;
       }
 
-      this.#remove(node);
-      if (settledConsumer) {
-        this.#valueLimit--;
+      this.#head = node.next;
+      if (this.#head) {
+        this.#head.prev = null;
+      } else {
+        this.#tail = null;
       }
+      node.next = null;
+      this.#valueLimit--;
     }
     if (this.#done) this.#drainDone();
   }
@@ -197,21 +209,6 @@ class FilterHelper {
       this.#head = node;
     }
     this.#tail = node;
-  }
-
-  #remove(node) {
-    if (node.prev) {
-      node.prev.next = node.next;
-    } else if (this.#head === node) {
-      this.#head = node.next;
-    }
-    if (node.next) {
-      node.next.prev = node.prev;
-    } else if (this.#tail === node) {
-      this.#tail = node.prev;
-    }
-    node.prev = null;
-    node.next = null;
   }
 
   #truncateAfter(node) {

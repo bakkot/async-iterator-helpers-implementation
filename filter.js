@@ -183,7 +183,6 @@ class FilterHelper {
            this.#consumers[this.#consumers.length - 1].position >= this.#consumerBase + this.#upper) {
       this.#consumers.pop().resolve({ value: undefined, done: true });
     }
-    if (this.#done && this.#consumers.length === 0) this.#clearSlotWindow();
   }
 
   // Record an error at a slot: it keeps its value-position and is rejected in
@@ -213,13 +212,6 @@ class FilterHelper {
   #currentSlotIndex(slot) {
     const index = slot.index - this.#slotBase;
     return index >= 0 ? index : null;
-  }
-
-  #clearSlotWindow() {
-    this.#slots.length = 0;
-    this.#slotBase = this.#nextSlot;
-    this.#upper = 0;
-    this.#boundary = 0;
   }
 
   #close() {

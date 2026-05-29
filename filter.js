@@ -15,11 +15,11 @@ class FilterHelper {
   // Waiting consumer deferreds, each tagged with its absolute call position.
   #consumers = [];
   #made = 0;
-  // Exclusive index past which no value-position can exist, once known. A done
-  // at index d caps it at d (the done slot yields nothing); an error at index e
-  // caps it at e + 1 (the error fills that position with a rejection, like a
-  // `true` that also ends the stream). This lets trailing calls settle done
-  // while an earlier one is still blocked.
+  // Exclusive index past which no value can exist, set when a done is seen: a
+  // done at index d caps it at d (the done slot itself yields nothing). A well-
+  // behaved source keeps returning done, so the pulls already in flight past d
+  // would resolve done too — capping just lets trailing calls settle done ASAP,
+  // even while an earlier one is still blocked. Errors do NOT cap it (see #fail).
   #boundary = null;
   // The value ceiling: how many value-positions exist below #boundary.
   // Maintained incrementally so #drainDone need not rescan — each drop before
@@ -66,7 +66,7 @@ class FilterHelper {
         // A throwing result object is an error *from* the underlying: surface
         // it, but never close.
         this.#done = true;
-        this.#fail(slot, k, err);
+        this.#fail(slot, err);
         return;
       }
       if (done) {
@@ -96,18 +96,18 @@ class FilterHelper {
         }
       }, err => {
         // A predicate error is treated like `true` (the value still fills its
-        // position) but ends the stream and closes the underlying — the latter
-        // only if still live.
+        // position) except that position rejects, future next() calls get done,
+        // and the underlying is closed — the last only if still live.
         if (!this.#done) {
           this.#done = true;
           this.#close();
         }
-        this.#fail(slot, k, err);
+        this.#fail(slot, err);
       });
     }, err => {
       // Error from the underlying's .next(): surface it, but never close.
       this.#done = true;
-      this.#fail(slot, k, err);
+      this.#fail(slot, err);
     });
   }
 
@@ -125,9 +125,10 @@ class FilterHelper {
         for (const c of this.#consumers) c.resolve({ value: undefined, done: true });
         this.#consumers.length = 0;
       } else {
+        // 'error': like a value, but the call at this position rejects. It does
+        // not end the others — they keep being served — so advance and continue.
         this.#consumers.shift().reject(slot.error);
-        for (const c of this.#consumers) c.resolve({ value: undefined, done: true });
-        this.#consumers.length = 0;
+        this.#cursor++;
       }
     }
   }
@@ -156,18 +157,14 @@ class FilterHelper {
     this.#upper = upper;
   }
 
-  // Record an error at slot k and end the stream just past it. The slot keeps
-  // its value-position (rejected in order by #pump), and the boundary caps at
-  // k + 1 so trailing calls settle done.
-  #fail(slot, k, err) {
+  // Record an error at a slot: it keeps its value-position and is rejected in
+  // order by #pump. Unlike a done it does NOT cap the boundary — an error only
+  // ends *future* next() calls (via #done); calls already vended stay served by
+  // the pulls already in flight, so their values are not lost.
+  #fail(slot, err) {
     slot.status = 'error';
     slot.error = err;
-    if (this.#boundary === null || k + 1 < this.#boundary) {
-      this.#boundary = k + 1;
-      this.#recomputeUpper();
-    }
     this.#pump();
-    this.#drainDone();
   }
 
   #close() {

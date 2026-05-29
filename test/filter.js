@@ -306,12 +306,14 @@ tests.push(['filter: predicate error closes the underlying iterator', async func
   t.expectLog('subsequent next() is done', ['r1 resolved {"done":true}']);
 }]);
 
-// A predicate error is treated exactly like resolving `true` — the value fills
-// its slot's position — except that the stream ends there, the source is closed,
-// and that position rejects instead of delivering. So the error caps the
-// sequence just like a done: trailing calls can settle done immediately, even
-// while an earlier call is still blocked.
-tests.push(['filter: a predicate error settles trailing calls done while an earlier call is blocked', async function (t) {
+// A predicate error is treated exactly like resolving `true` — the erroring
+// value still occupies its position — except that position *rejects*, the
+// source is closed, and *future* next() calls get done. Crucially it does NOT
+// cap the sequence: calls already vended are still served by the pulls already
+// in flight (a predicate failure does not exhaust the source), so their values
+// are not lost. Here the third call, already vended, ultimately receives a real
+// value rather than being forced to done by the error.
+tests.push(['filter: a predicate error does not force an already-vended call to done', async function (t) {
   const src = controlledSource(t.log, 'src');
   const pred = controlledFn(t.log, 'pred');
   const f = filter(src.iterator, pred.fn);
@@ -330,19 +332,15 @@ tests.push(['filter: a predicate error settles trailing calls done while an earl
   await flushMicrotasks();
   t.expectLog('predicate invoked on the second value', ['pred(20) #0']);
 
-  // The predicate errors. Slot #1 still occupies a value position (like `true`)
-  // and ends the stream: the source closes, and since values can only come from
-  // slots #0 and #1, the third call can never get one and settles done now —
-  // while r0 remains blocked on pull #0.
+  // The predicate errors. The source is closed, but nothing settles yet: r0/r1
+  // are still in order behind pull #0, and r2 is NOT forced to done — it is
+  // still owed whatever pull #2 produces.
   pred.reject(0, new Error('boom'));
   await flushMicrotasks();
-  t.expectLog('error closes the source and settles the trailing call done', [
-    'src.return() #0',
-    'r2 resolved {"done":true}',
-  ]);
+  t.expectLog('error closes the source; no call is forced to done', ['src.return() #0']);
 
-  // Pull #0 yields a passing value: it still reaches r0 (not lost). Only then
-  // does the error reach r1 — the call at the erroring value's position.
+  // Pull #0 yields a passing value: it reaches r0 (not lost). Only then does the
+  // error reach r1 — the call at the erroring value's position.
   src.yield(0, 10);
   await flushMicrotasks();
   t.expectLog('predicate invoked on the first value', ['pred(10) #1']);
@@ -353,39 +351,53 @@ tests.push(['filter: a predicate error settles trailing calls done while an earl
     'r0 resolved {"value":10,"done":false}',
     'r1 rejected boom',
   ]);
+
+  // r2's own in-flight pull resolves with a passing value: it gets that value,
+  // done:false — the error never turned it into a done.
+  src.yield(2, 30);
+  await flushMicrotasks();
+  t.expectLog('predicate invoked on the third value', ['pred(30) #2']);
+
+  pred.resolve(2, true);
+  await flushMicrotasks();
+  t.expectLog('the already-vended third call still delivers a value', [
+    'r2 resolved {"value":30,"done":false}',
+  ]);
 }]);
 
-// Like the done case, a single predicate error can release several trailing
-// blocked calls at once: with pull #0 still pending, slots #0 and #1 are the
-// only possible value positions, so both r2 and r3 settle done together.
-tests.push(['filter: a predicate error releases all trailing blocked calls at once', async function (t) {
+// Mirrors the map invariant "an in-flight call may resolve done:false after an
+// earlier error": the first predicate errors (rejecting r0 and closing the
+// source), yet r1 — already in flight — still resolves with its own value.
+tests.push(['filter: an in-flight call still resolves with a value after an earlier error', async function (t) {
   const src = controlledSource(t.log, 'src');
   const pred = controlledFn(t.log, 'pred');
   const f = filter(src.iterator, pred.fn);
 
   const r0 = f.next();
   const r1 = f.next();
-  const r2 = f.next();
-  const r3 = f.next();
   track(t.log, 'r0', r0);
   track(t.log, 'r1', r1);
-  track(t.log, 'r2', r2);
-  track(t.log, 'r3', r3);
   await flushMicrotasks();
-  t.expectLog('four concurrent pulls', [
-    'src.next() #0', 'src.next() #1', 'src.next() #2', 'src.next() #3',
-  ]);
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
 
-  src.yield(1, 20);
+  src.yield(0, 1);
+  src.yield(1, 2);
   await flushMicrotasks();
-  t.expectLog('predicate invoked on the second value', ['pred(20) #0']);
+  t.expectLog('both predicates in flight', ['pred(1) #0', 'pred(2) #1']);
 
+  // The earlier predicate errors: r0 rejects and the source closes. r1 is left
+  // pending on its own predicate, not forced to done.
   pred.reject(0, new Error('boom'));
   await flushMicrotasks();
-  t.expectLog('error closes the source and settles both trailing calls done', [
+  t.expectLog('earlier error rejects r0 and closes the source', [
     'src.return() #0',
-    'r3 resolved {"done":true}',
-    'r2 resolved {"done":true}',
+    'r0 rejected boom',
+  ]);
+
+  pred.resolve(1, true);
+  await flushMicrotasks();
+  t.expectLog('later in-flight call still resolves done:false', [
+    'r1 resolved {"value":2,"done":false}',
   ]);
 }]);
 

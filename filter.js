@@ -6,8 +6,11 @@ class FilterHelper {
   #done = false;
   #it;
   #pred;
-  // One slot per underlying pull, in pull order. status is
-  // 'pending' | 'value' | 'drop' | 'done' | 'error'.
+  // Slot[] where Slot =
+  //   | { status: 'pending' | 'drop' | 'done', index: number }
+  //   | { status: 'value', value: unknown, index: number }
+  //   | { status: 'error', error: unknown, index: number }
+  // One slot per underlying pull, in pull order.
   #slots = [];
   // Stable pull indexes let async completions find their current window index
   // without searching or renumbering the remaining slots after compaction.

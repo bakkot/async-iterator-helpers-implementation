@@ -83,7 +83,6 @@ class FilterHelper {
           this.#slots.length = k + 1;
         }
         this.#pump();
-        this.#drainDone();
         return;
       }
       new Promise(resolve => resolve(this.#pred(value))).then(keep => {
@@ -99,7 +98,6 @@ class FilterHelper {
           if (k !== null) this.#upper--;
           if (!this.#done) this.#pull();
           this.#pump();
-          this.#drainDone();
         }
       }, err => {
         // A predicate error is treated like `true` (the value still fills its
@@ -150,18 +148,17 @@ class FilterHelper {
         this.#upper--;
       }
     }
-    this.#drainDone();
+    if (this.#done) this.#drainDone();
   }
 
   // Settle trailing calls that can no longer receive a value: those whose
   // position has reached the terminal value ceiling. The call at the ceiling's
   // last position (an erroring one) stays — it is rejected in order by #pump.
   #drainDone() {
-    if (!this.#done) return;
     while (this.#consumers.length > this.#upper) {
       this.#consumers.pop().resolve({ value: undefined, done: true });
     }
-    if (this.#done && this.#consumers.length === 0) {
+    if (this.#consumers.length === 0) {
       // No slot can become observable after terminal drain; drop references
       // eagerly while allowing already-issued pulls to finish harmlessly.
       this.#slotBase += this.#slots.length;
@@ -179,7 +176,6 @@ class FilterHelper {
     slot.status = 'error';
     slot.error = err;
     this.#pump();
-    this.#drainDone();
   }
 
   #currentSlotIndex(slot) {

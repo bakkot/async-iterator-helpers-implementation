@@ -165,7 +165,16 @@ class FilterHelper {
           this.#consumers.shift().resolve({ value: node.value, done: false });
           break;
         case 'done':
-          this.#drainDone();
+          // A done wall at the head means no retained node can still produce a
+          // value, so every waiting consumer is done.
+          for (const consumer of this.#consumers) {
+            consumer.resolve({ value: undefined, done: true });
+          }
+          this.#consumers.length = 0;
+          this.#head = null;
+          this.#tail = null;
+          this.#valueLimit = 0;
+          this.#terminalIndex = -1;
           return;
         case 'error':
           // 'error': like a value, but the call at this position rejects. It

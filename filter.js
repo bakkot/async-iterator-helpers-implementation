@@ -70,7 +70,13 @@ class FilterHelper {
       prev: null,
       next: null,
     };
-    this.#append(node);
+    if (this.#tail) {
+      node.prev = this.#tail;
+      this.#tail.next = node;
+    } else {
+      this.#head = node;
+    }
+    this.#tail = node;
     this.#valueLimit++;
     new Promise(resolve => resolve(this.#it.next())).then(settled => {
       if (this.#isIgnored(node)) return;
@@ -91,7 +97,15 @@ class FilterHelper {
         this.#terminalIndex = node.index;
         node.status = 'done';
         this.#valueLimit--;
-        this.#truncateAfter(node);
+        for (let n = node.next; n;) {
+          const next = n.next;
+          if (n.status !== 'done') this.#valueLimit--;
+          n.prev = null;
+          n.next = null;
+          n = next;
+        }
+        this.#tail = node;
+        node.next = null;
         this.#pump();
         return;
       }
@@ -199,28 +213,6 @@ class FilterHelper {
     node.status = 'error';
     node.error = err;
     this.#pump();
-  }
-
-  #append(node) {
-    if (this.#tail) {
-      node.prev = this.#tail;
-      this.#tail.next = node;
-    } else {
-      this.#head = node;
-    }
-    this.#tail = node;
-  }
-
-  #truncateAfter(node) {
-    for (let n = node.next; n;) {
-      const next = n.next;
-      if (n.status !== 'done') this.#valueLimit--;
-      n.prev = null;
-      n.next = null;
-      n = next;
-    }
-    this.#tail = node;
-    node.next = null;
   }
 
   #isIgnored(node) {

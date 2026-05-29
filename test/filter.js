@@ -201,6 +201,37 @@ tests.push(['filter: a done releases all trailing blocked calls at once', async 
   t.expectLog('the first call still delivers its value', ['r0 resolved {"value":1,"done":false}']);
 }]);
 
+// Once a clean done has settled every outstanding consumer, later completions
+// from pulls that were already issued must be harmless. They may update their
+// own slot bookkeeping, but there is no consumer left to resolve or reject.
+tests.push(['filter: in-flight pull completion after all calls are done is harmless', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  // Pull #0 is done, so no values can exist for either call. Both settle done
+  // even though pull #1 is still in flight.
+  src.finish(0);
+  await flushMicrotasks();
+  t.expectLog('earlier done settles every outstanding call', [
+    'r1 resolved {"done":true}',
+    'r0 resolved {"done":true}',
+  ]);
+
+  // The later in-flight pull completing after that should have no observable
+  // consumer effect.
+  src.finish(1);
+  await flushMicrotasks();
+  t.expectLog('late completion is ignored', []);
+}]);
+
 // Two concurrent calls where the first value is dropped. The drop must reissue
 // a pull to replace the lost value, and the surviving values are handed to the
 // calls in call order: the first survivor to r0, the second to r1 — regardless

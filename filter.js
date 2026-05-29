@@ -19,7 +19,8 @@ class FilterHelper {
   //
   // Core invariants:
   // - #terminalIndex is null while live. Once terminal, completions with a
-  //   higher index are ignored.
+  //   higher index are ignored. -Infinity means all remaining completions are
+  //   ignored after no consumer can observe them.
   // - #valueLimit counts retained nodes that can still consume one caller:
   //   'pending', 'value', and 'error'. It excludes the terminal 'done' wall.
   // - 0 <= #valueLimit <= retained node count.
@@ -110,13 +111,7 @@ class FilterHelper {
         node.next = null;
         this.#pump();
         if (this.#consumers.length > this.#valueLimit) {
-          for (let i = this.#valueLimit; i < this.#consumers.length; i++) {
-            this.#consumers[i].resolve({ value: undefined, done: true });
-          }
-          this.#consumers.length = this.#valueLimit;
-          if (this.#consumers.length === 0) {
-            this.#clearTerminalState();
-          }
+          this.#settleDoneFrom(this.#valueLimit);
         }
         return;
       }
@@ -146,11 +141,9 @@ class FilterHelper {
           if (!this.#done) this.#pull();
           if (wasHead && successor) this.#pump();
           if (this.#done && this.#consumers.length > this.#valueLimit) {
-            this.#consumers[this.#valueLimit].resolve({ value: undefined, done: true });
-            this.#consumers.length = this.#valueLimit;
-            if (this.#consumers.length === 0) {
-              this.#clearTerminalState();
-            }
+            // This drop lowered #valueLimit by one, so at most one consumer
+            // newly falls past the terminal ceiling.
+            this.#settleDoneFrom(this.#valueLimit);
           }
         }
       }, err => {
@@ -211,13 +204,23 @@ class FilterHelper {
     }
   }
 
+  #settleDoneFrom(firstDone) {
+    for (let i = firstDone; i < this.#consumers.length; i++) {
+      this.#consumers[i].resolve({ value: undefined, done: true });
+    }
+    this.#consumers.length = firstDone;
+    if (this.#consumers.length === 0) {
+      this.#clearTerminalState();
+    }
+  }
+
   #clearTerminalState() {
     // No node can become observable after terminal drain; drop references
     // eagerly while allowing already-issued pulls to finish harmlessly.
     this.#head = null;
     this.#tail = null;
     this.#valueLimit = 0;
-    this.#terminalIndex = -1;
+    this.#terminalIndex = -Infinity;
   }
 
   // Record an error at a node: it keeps its value-position and is rejected in

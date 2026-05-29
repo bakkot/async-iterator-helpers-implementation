@@ -80,7 +80,7 @@ class FilterHelper {
         // A throwing result object is an error *from* the underlying: surface
         // it, but never close.
         this.#done = true;
-        this.#terminalIndex = this.#nextIndex - 1;
+        this.#terminalIndex = Math.min(this.#terminalIndex, this.#nextIndex - 1);
         this.#fail(node, err);
         return;
       }
@@ -94,7 +94,7 @@ class FilterHelper {
         for (const n of this.#nodes) {
           if (truncate) {
             this.#nodes.delete(n);
-            this.#valueLimit--;
+            if (n.status !== 'done') this.#valueLimit--;
           } else if (n === node) {
             truncate = true;
           }
@@ -139,7 +139,7 @@ class FilterHelper {
       if (this.#isIgnored(node)) return;
       // Error from the underlying's .next(): surface it, but never close.
       this.#done = true;
-      this.#terminalIndex = this.#nextIndex - 1;
+      this.#terminalIndex = Math.min(this.#terminalIndex, this.#nextIndex - 1);
       this.#fail(node, err);
     });
   }
@@ -181,6 +181,7 @@ class FilterHelper {
   }
 
   #settleDoneFrom(firstDone) {
+    firstDone = Math.min(firstDone, this.#consumers.length);
     for (let i = firstDone; i < this.#consumers.length; i++) {
       this.#consumers[i].resolve({ value: undefined, done: true });
     }

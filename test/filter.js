@@ -201,6 +201,74 @@ tests.push(['filter: a done releases all trailing blocked calls at once', async 
   t.expectLog('the first call still delivers its value', ['r0 resolved {"value":1,"done":false}']);
 }]);
 
+// Regression from the bounded-exhaustive suite: if a later done wall is observed
+// before an earlier done wall, truncating the later done must not decrement the
+// possible-value count a second time. The first pending value still belongs to
+// r0 after r1/r2 are known done.
+tests.push(['filter: earlier done after later done does not erase a pending value', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('first predicate is pending', ['pred(1) #0']);
+
+  src.finish(2);
+  await flushMicrotasks();
+  t.expectLog('later done releases only the trailing call', ['r2 resolved {"done":true}']);
+
+  src.finish(1);
+  await flushMicrotasks();
+  t.expectLog('earlier done releases r1 but leaves r0 pending', ['r1 resolved {"done":true}']);
+
+  pred.resolve(0, true);
+  await flushMicrotasks();
+  t.expectLog('pending value still reaches r0', ['r0 resolved {"value":1,"done":false}']);
+}]);
+
+// Regression from the bounded-exhaustive suite: an underlying error that
+// arrives before an already-observed done wall must not reopen later pulls that
+// the done wall already made unobservable.
+tests.push(['filter: earlier underlying error after later done does not reopen truncated pulls', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  src.finish(1);
+  await flushMicrotasks();
+  t.expectLog('done releases trailing calls', [
+    'r1 resolved {"done":true}',
+    'r2 resolved {"done":true}',
+  ]);
+
+  src.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('earlier underlying error rejects only r0', ['r0 rejected boom']);
+
+  src.yield(2, 99);
+  await flushMicrotasks();
+  t.expectLog('truncated later pull remains ignored', []);
+}]);
+
 // The done slot may arrive after earlier head slots have already been compacted
 // away. The done position must still be interpreted relative to the current
 // slot window, not the original pull history.

@@ -104,6 +104,7 @@ function runModel(N, chooser) {
   };
 
   const settleDoneFrom = (firstDone) => {
+    firstDone = Math.min(firstDone, consumers.length);
     for (let i = firstDone; i < consumers.length; i++) {
       settleNext(consumers[i], { value: undefined, done: true });
     }
@@ -197,13 +198,14 @@ function runModel(N, chooser) {
       valueLimit--;
       const idx = nodes.indexOf(node);
       for (let i = nodes.length - 1; i > idx; i--) {
+        if (nodes[i].status !== 'done') valueLimit--;
         nodes.splice(i, 1);
-        valueLimit--;
       }
       pump();
       if (consumers.length > valueLimit) settleDoneFrom(valueLimit);
     } else {
       done = true;
+      terminalIndex = Math.min(terminalIndex, nextPullId - 1);
       failNode(node, pullError(node.pullId));
     }
   }
@@ -508,49 +510,42 @@ function compareTraces(model, real) {
 async function main() {
   const N = Number(process.argv[2] ?? 2);
   let scheduleCount = 0;
-  let traceFailures = 0;
-  let propertyFailures = 0;
-  let invariantFailures = 0;
-  const MAX_REPORT = 10;
 
   for (const s of enumerate(N)) {
     scheduleCount++;
     const { realTrace, invariantViolation } = await runReal(s.schedule);
     const diff = compareTraces(s.modelTrace, realTrace);
     if (diff) {
-      traceFailures++;
-      if (traceFailures <= MAX_REPORT) reportTraceFailure(s, realTrace, diff);
+      reportTraceFailure(s, realTrace, diff, scheduleCount);
+      process.exitCode = 1;
+      return;
     }
     if (invariantViolation) {
-      invariantFailures++;
-      if (invariantFailures <= MAX_REPORT) reportInvariantFailure(s, invariantViolation);
+      reportInvariantFailure(s, invariantViolation, scheduleCount);
+      process.exitCode = 1;
+      return;
     }
     const prop = checkSequentialProperty(s.schedule, s.callResults);
     if (prop) {
-      propertyFailures++;
-      if (propertyFailures <= MAX_REPORT) reportPropertyFailure(s, prop);
+      reportPropertyFailure(s, prop, scheduleCount);
+      process.exitCode = 1;
+      return;
     }
   }
 
   console.log('');
   console.log(`N = ${N}`);
   console.log(`schedules explored: ${scheduleCount}`);
-  console.log(`trace mismatches (real vs oracle): ${traceFailures}`);
-  console.log(`invariant violations (.return() after underlying error): ${invariantFailures}`);
-  console.log(`property violations (oracle vs sequential spec): ${propertyFailures}`);
-  if (traceFailures === 0 && propertyFailures === 0 && invariantFailures === 0) {
-    console.log('all schedules passed');
-  } else {
-    process.exitCode = 1;
-  }
+  console.log('all schedules passed');
 }
 
 function describeSchedule(s) {
   return s.schedule.actions.map(actionLabel).join('  ');
 }
 
-function reportTraceFailure(s, realTrace, diff) {
+function reportTraceFailure(s, realTrace, diff, scheduleCount) {
   console.log('TRACE MISMATCH');
+  console.log(`  after schedules explored: ${scheduleCount}`);
   console.log('  schedule: ' + describeSchedule(s));
   console.log('  pullShapes:   ' + JSON.stringify(s.schedule.pullShapes));
   console.log('  predShapes:   ' + JSON.stringify(s.schedule.predShapes));
@@ -565,15 +560,17 @@ function reportTraceFailure(s, realTrace, diff) {
   console.log('');
 }
 
-function reportInvariantFailure(s, violation) {
+function reportInvariantFailure(s, violation, scheduleCount) {
   console.log('INVARIANT VIOLATION');
+  console.log(`  after schedules explored: ${scheduleCount}`);
   console.log('  schedule: ' + describeSchedule(s));
   console.log('  ' + violation);
   console.log('');
 }
 
-function reportPropertyFailure(s, prop) {
+function reportPropertyFailure(s, prop, scheduleCount) {
   console.log('PROPERTY VIOLATION (oracle disagrees with sequential spec)');
+  console.log(`  after schedules explored: ${scheduleCount}`);
   console.log('  schedule: ' + describeSchedule(s));
   console.log(`  call #${prop.callId}: expected ${prop.expectedRhs}, oracle gave ${prop.actualRhs}`);
   console.log('');

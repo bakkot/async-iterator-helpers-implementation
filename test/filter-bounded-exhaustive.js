@@ -11,7 +11,12 @@
 
 import { filter } from '../filter.js';
 
-const FLUSH_ROUNDS = 20;
+// A single action can trigger a synchronous cascade of sync-false replacement
+// pulls up to maxPulls deep, each adding ~2 microtask hops before the final
+// consumer settlement; the flush has to outrun that or it truncates the real
+// trace one hop short. So rounds scale with maxPulls (set per-run in main).
+let FLUSH_ROUNDS = 20;
+const setFlushRounds = (n) => { FLUSH_ROUNDS = n; };
 const flush = async () => { for (let i = 0; i < FLUSH_ROUNDS; i++) await Promise.resolve(); };
 
 // The driver settles exactly one underlying promise per action and flushes to
@@ -597,6 +602,9 @@ function countSchedules(maxEvents) {
 
 async function main() {
   const maxEvents = Number(process.argv[2] ?? 5);
+  // Outrun the deepest possible sync-false replacement cascade (~2 hops per
+  // pull, maxPulls = 2*maxEvents) plus the trailing settlement, with margin.
+  setFlushRounds(8 * maxEvents + 40);
   if (process.env.COUNT) return countSchedules(maxEvents);
   let scheduleCount = 0;
 

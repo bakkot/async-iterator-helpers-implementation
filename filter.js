@@ -141,19 +141,34 @@ class FilterHelper {
     while (this.#consumers.length > 0) {
       const slot = this.#slots[0];
       if (!slot || slot.status === 'pending') break;
-      if (slot.status === 'value') {
-        this.#consumers.shift().resolve({ value: slot.value, done: false });
-        this.#settleHeadSlot();
-      } else if (slot.status === 'drop') {
-        this.#discardHeadSlot(false);
-      } else if (slot.status === 'done') {
-        break;
-      } else {
-        // 'error': like a value, but the call at this position rejects. It does
-        // not end the others — they keep being served — so advance and continue.
-        this.#consumers.shift().reject(slot.error);
-        this.#settleHeadSlot();
+
+      let consumesConsumer = false;
+      switch (slot.status) {
+        case 'value':
+          this.#consumers.shift().resolve({ value: slot.value, done: false });
+          consumesConsumer = true;
+          break;
+        case 'drop':
+          break;
+        case 'done':
+          this.#drainDone();
+          return;
+        case 'error':
+          // 'error': like a value, but the call at this position rejects. It
+          // does not end the others — they keep being served — so advance and
+          // continue.
+          this.#consumers.shift().reject(slot.error);
+          consumesConsumer = true;
+          break;
       }
+
+      this.#slots.shift();
+      this.#slotBase++;
+      if (consumesConsumer) {
+        this.#upper--;
+        this.#consumerBase++;
+      }
+      if (this.#boundary !== null) this.#boundary--;
     }
     this.#drainDone();
   }
@@ -198,18 +213,6 @@ class FilterHelper {
   #currentSlotIndex(slot) {
     const index = slot.index - this.#slotBase;
     return index >= 0 ? index : null;
-  }
-
-  #settleHeadSlot() {
-    this.#discardHeadSlot(true);
-    this.#consumerBase++;
-  }
-
-  #discardHeadSlot(countedValue) {
-    this.#slots.shift();
-    this.#slotBase++;
-    if (countedValue) this.#upper--;
-    if (this.#boundary !== null) this.#boundary--;
   }
 
   #clearSlotWindow() {

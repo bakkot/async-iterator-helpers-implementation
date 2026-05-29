@@ -333,6 +333,129 @@ tests.push(['filter: in-flight pull completion after all calls are done is harml
   t.expectLog('late completion is ignored', []);
 }]);
 
+// return() means no more demand, not "cancel the promises already handed out".
+// Already-vended calls still observe their in-flight source values if those
+// values pass the predicate, while calls made after return() are done.
+tests.push(['filter: return() does not cancel already-requested passing values', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three pulls are in flight', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  const ret = f.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes the source and resolves', [
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+
+  src.yield(0, 10);
+  src.yield(1, 20);
+  src.yield(2, 30);
+  await flushMicrotasks();
+  t.expectLog('predicates still run for already-requested values', [
+    'pred(10) #0',
+    'pred(20) #1',
+    'pred(30) #2',
+  ]);
+
+  pred.resolve(0, true);
+  pred.resolve(1, true);
+  pred.resolve(2, true);
+  await flushMicrotasks();
+  t.expectLog('already-requested passing values are delivered', [
+    'r0 resolved {"value":10,"done":false}',
+    'r1 resolved {"value":20,"done":false}',
+    'r2 resolved {"value":30,"done":false}',
+  ]);
+
+  const r3 = f.next();
+  track(t.log, 'r3', r3);
+  await flushMicrotasks();
+  t.expectLog('a next() after return() is done', ['r3 resolved {"done":true}']);
+}]);
+
+// A source error rejects only the call that depends on that source position.
+// Other already-vended calls remain tied to their own source/predicate work.
+tests.push(['filter: source error does not reject unrelated outstanding calls', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three pulls are in flight', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  src.throw(0, new Error('source reject 0'));
+  await flushMicrotasks();
+  t.expectLog('only the dependent call rejects', ['r0 rejected source reject 0']);
+
+  src.yield(1, 20);
+  src.yield(2, 30);
+  await flushMicrotasks();
+  t.expectLog('unrelated predicates still run', ['pred(20) #0', 'pred(30) #1']);
+
+  pred.resolve(0, true);
+  pred.resolve(1, true);
+  await flushMicrotasks();
+  t.expectLog('unrelated outstanding calls still receive values', [
+    'r1 resolved {"value":20,"done":false}',
+    'r2 resolved {"value":30,"done":false}',
+  ]);
+
+  const r3 = f.next();
+  track(t.log, 'r3', r3);
+  await flushMicrotasks();
+  t.expectLog('a later next() after the source error is done', ['r3 resolved {"done":true}']);
+}]);
+
+// A later source done can prove trailing calls are done even while an earlier
+// source pull has not yielded anything yet. The earlier call still receives its
+// value if that pending pull later produces one that passes.
+tests.push(['filter: source done settles trailing calls while an earlier source pull is pending', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three pulls are in flight', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  src.finish(1);
+  await flushMicrotasks();
+  t.expectLog('done from pull #1 settles trailing calls', [
+    'r1 resolved {"done":true}',
+    'r2 resolved {"done":true}',
+  ]);
+
+  src.yield(0, 10);
+  await flushMicrotasks();
+  t.expectLog('the earlier source value still runs the predicate', ['pred(10) #0']);
+
+  pred.resolve(0, true);
+  await flushMicrotasks();
+  t.expectLog('the earlier call still delivers its value', ['r0 resolved {"value":10,"done":false}']);
+}]);
+
 // If an already-issued pull produces a value after a clean done has drained all
 // consumers, the terminal cutoff ignores it before the predicate runs.
 tests.push(['filter: late value after terminal done has no consumer effect', async function (t) {
@@ -498,6 +621,28 @@ tests.push(['filter: predicate error closes the underlying iterator', async func
   t.expectLog('predicate error -> close source, reject', [
     'src.return() #0',
     'r0 rejected boom',
+  ]);
+
+  const r1 = f.next();
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('subsequent next() is done', ['r1 resolved {"done":true}']);
+}]);
+
+tests.push(['filter: synchronous predicate throw closes the underlying iterator', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const f = filter(src.iterator, () => { throw new Error('predicate throw 0'); });
+
+  const r0 = f.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('sync predicate throw -> close source, reject', [
+    'src.return() #0',
+    'r0 rejected predicate throw 0',
   ]);
 
   const r1 = f.next();
@@ -701,6 +846,67 @@ tests.push(['filter: after return(), a vended call that would need a new pull se
   pred.resolve(0, false);
   await flushMicrotasks();
   t.expectLog('the un-serviceable vended call settles done', ['r0 resolved {"done":true}']);
+}]);
+
+tests.push(['filter: return() after source done does not close the source', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two pulls are in flight', ['src.next() #0', 'src.next() #1']);
+
+  src.finish(0);
+  await flushMicrotasks();
+  t.expectLog('source done settles outstanding calls', [
+    'r0 resolved {"done":true}',
+    'r1 resolved {"done":true}',
+  ]);
+
+  const ret = f.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() after source done does not call source.return()', [
+    'ret resolved {"done":true}',
+  ]);
+}]);
+
+tests.push(['filter: return() after source error does not close the source', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two pulls are in flight', ['src.next() #0', 'src.next() #1']);
+
+  src.throw(0, new Error('source reject 0'));
+  await flushMicrotasks();
+  t.expectLog('source error rejects its dependent call', ['r0 rejected source reject 0']);
+
+  const ret = f.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() after source error does not call source.return()', [
+    'ret resolved {"done":true}',
+  ]);
+
+  src.yield(1, 20);
+  await flushMicrotasks();
+  t.expectLog('already-requested value still runs the predicate', ['pred(20) #0']);
+
+  pred.resolve(0, true);
+  await flushMicrotasks();
+  t.expectLog('already-requested value still reaches its call', [
+    'r1 resolved {"value":20,"done":false}',
+  ]);
 }]);
 
 // Regression from the bounded-exhaustive suite: if an underlying error is

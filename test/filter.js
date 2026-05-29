@@ -549,6 +549,154 @@ tests.push(['filter: a dropped value reissues a pull; survivors go to calls in o
   t.expectLog('the second survivor goes to r1', ['r1 resolved {"value":30,"done":false}']);
 }]);
 
+// If return() has stopped new demand, an earlier dropped value must retire the
+// latest pending request, not the earlier one. A later in-flight survivor can
+// still move forward to satisfy the earlier request.
+tests.push(['filter: after return(), an earlier drop retires the latest pending request', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two pulls are in flight', ['src.next() #0', 'src.next() #1']);
+
+  const ret = f.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes the source', ['src.return() #0', 'ret resolved {"done":true}']);
+
+  src.yield(0, 'v0');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the earlier value', ['pred("v0") #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('the later pending request is retired', ['r1 resolved {"done":true}']);
+
+  src.yield(1, 'v1');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the later value', ['pred("v1") #1']);
+
+  pred.resolve(1, true);
+  await flushMicrotasks();
+  t.expectLog('the later survivor satisfies the earlier request', [
+    'r0 resolved {"value":"v1","done":false}',
+  ]);
+}]);
+
+// Same return() shape, but the filtered-out value comes from the later source
+// pull while the earlier pull is still pending. The later request is done; the
+// earlier request still waits for its own in-flight source work.
+tests.push(['filter: after return(), an out-of-order drop retires the latest pending request', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two pulls are in flight', ['src.next() #0', 'src.next() #1']);
+
+  const ret = f.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes the source', ['src.return() #0', 'ret resolved {"done":true}']);
+
+  src.yield(1, 'v0');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the later value', ['pred("v0") #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('the later pending request is retired', ['r1 resolved {"done":true}']);
+
+  src.yield(0, 'v1');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the earlier value', ['pred("v1") #1']);
+
+  pred.resolve(1, true);
+  await flushMicrotasks();
+  t.expectLog('the earlier request still receives its value', [
+    'r0 resolved {"value":"v1","done":false}',
+  ]);
+}]);
+
+// Once a source error has closed the helper, a later in-flight value that drops
+// cannot be replaced. The already-vended trailing request resolves done.
+tests.push(['filter: after source error, a later drop settles the trailing request done', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two pulls are in flight', ['src.next() #0', 'src.next() #1']);
+
+  src.throw(0, new Error('source reject 0'));
+  await flushMicrotasks();
+  t.expectLog('source error rejects the dependent request', ['r0 rejected source reject 0']);
+
+  src.yield(1, 'v0');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the later value', ['pred("v0") #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('the trailing request settles done without a replacement pull', [
+    'r1 resolved {"done":true}',
+  ]);
+}]);
+
+// A filtered-out out-of-order value still consumes one in-flight source slot.
+// If the source is still open, the helper must immediately pull a replacement.
+// But an error from that replacement cannot be assigned to a result request
+// until earlier filtering decisions are known: an earlier drop could shift the
+// replacement error forward to the earlier request.
+tests.push(['filter: out-of-order replacement error waits behind earlier filtering', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two pulls are in flight', ['src.next() #0', 'src.next() #1']);
+
+  src.throwNext(new Error('source throw 2'));
+
+  src.yield(1, 'v0');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the later value', ['pred("v0") #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('replacement pull errors but waits behind the earlier request', [
+    'src.next() #2 (throws)',
+  ]);
+
+  src.yield(0, 'v1');
+  await flushMicrotasks();
+  t.expectLog('predicate runs for the earlier value', ['pred("v1") #1']);
+
+  pred.resolve(1, true);
+  await flushMicrotasks();
+  t.expectLog('the earlier request settles before the replacement error is observed', [
+    'r0 resolved {"value":"v1","done":false}',
+    'r1 rejected source throw 2',
+  ]);
+}]);
+
 // A drop lowers the possible value count, but before a terminal event the
 // helper must not use that finite-looking count to settle trailing calls done:
 // another replacement pull can still produce more values.

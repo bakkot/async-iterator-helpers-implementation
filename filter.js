@@ -100,6 +100,8 @@ class FilterHelper {
         for (let n = node.next; n;) {
           const next = n.next;
           this.#valueLimit--;
+          // Truncated nodes may still be held by pending pull completions; cut
+          // their list links so ignored work does not retain live values.
           n.prev = null;
           n.next = null;
           n = next;
@@ -126,20 +128,20 @@ class FilterHelper {
           this.#pump();
         } else {
           // A dropped value is deleted from the retained sequence.
-          const wasHead = node === this.#head;
+          let wasHead = false;
+          const predecessor = node.prev;
           const successor = node.next;
-          if (node.prev) {
-            node.prev.next = node.next;
+          if (predecessor) {
+            predecessor.next = successor;
           } else {
-            this.#head = node.next;
+            wasHead = true;
+            this.#head = successor;
           }
-          if (node.next) {
-            node.next.prev = node.prev;
+          if (successor) {
+            successor.prev = predecessor;
           } else {
-            this.#tail = node.prev;
+            this.#tail = predecessor;
           }
-          node.prev = null;
-          node.next = null;
           this.#valueLimit--;
           if (!this.#done) this.#pull();
           if (wasHead && successor) this.#pump();
@@ -205,7 +207,6 @@ class FilterHelper {
       } else {
         this.#tail = null;
       }
-      node.next = null;
       this.#valueLimit--;
     }
   }

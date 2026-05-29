@@ -16,6 +16,14 @@ class FilterHelper {
   // values/errors from the remaining window, so consumers beyond it can resolve
   // done immediately even if earlier slots are still pending.
   //
+  // Core invariants:
+  // - #slotBase is the stable index of #slots[0], if the window is non-empty.
+  // - slot.index === #slotBase + its current offset, while retained.
+  // - #valueLimit counts retained slots that can still consume one caller:
+  //   'pending', 'value', and 'error'. It excludes 'drop' and the terminal
+  //   'done' wall.
+  // - 0 <= #valueLimit <= #slots.length.
+  //
   // Slot[] where Slot =
   //   | { status: 'pending' | 'drop' | 'done', index: number }
   //   | { status: 'value', value: unknown, index: number }
@@ -27,8 +35,7 @@ class FilterHelper {
   #slotBase = 0;
   // Waiting consumer deferreds, in call order.
   #consumers = [];
-  // Number of non-dropped slots that can still produce a consumer result in the
-  // current slot window.
+  // Kept current so #drainDone never rescans the slot window.
   #valueLimit = 0;
 
   constructor(it, pred) {
@@ -61,8 +68,6 @@ class FilterHelper {
   #pull() {
     const slot = {
       status: 'pending',
-      value: undefined,
-      error: undefined,
       index: this.#slotBase + this.#slots.length,
     };
     this.#slots.push(slot);
@@ -82,7 +87,7 @@ class FilterHelper {
         // Clean exhaustion: done, but the underlying is not closed.
         this.#done = true;
         slot.status = 'done';
-        const slotIndex = this.#currentSlotIndex(slot);
+        const slotIndex = this.#retainedSlotIndex(slot);
         if (slotIndex !== null) {
           // The done slot and every later slot cannot produce values. Discount
           // that suffix and stop retaining later in-flight slots.
@@ -103,7 +108,7 @@ class FilterHelper {
           // A drop lowers the value ceiling. While live, replace the lost value
           // with another pull; after done, the lower ceiling may drain callers.
           slot.status = 'drop';
-          const slotIndex = this.#currentSlotIndex(slot);
+          const slotIndex = this.#retainedSlotIndex(slot);
           if (slotIndex !== null) this.#valueLimit--;
           if (!this.#done) this.#pull();
           this.#pump();
@@ -131,11 +136,11 @@ class FilterHelper {
       const slot = this.#slots[0];
       if (!slot || slot.status === 'pending') break;
 
-      let consumesConsumer = false;
+      let settledConsumer = false;
       switch (slot.status) {
         case 'value':
           this.#consumers.shift().resolve({ value: slot.value, done: false });
-          consumesConsumer = true;
+          settledConsumer = true;
           break;
         case 'drop':
           break;
@@ -147,13 +152,13 @@ class FilterHelper {
           // does not end the others — they keep being served — so advance and
           // continue.
           this.#consumers.shift().reject(slot.error);
-          consumesConsumer = true;
+          settledConsumer = true;
           break;
       }
 
       this.#slots.shift();
       this.#slotBase++;
-      if (consumesConsumer) {
+      if (settledConsumer) {
         this.#valueLimit--;
       }
     }
@@ -187,7 +192,8 @@ class FilterHelper {
     this.#pump();
   }
 
-  #currentSlotIndex(slot) {
+  // Returns null for late completions whose slot was already compacted away.
+  #retainedSlotIndex(slot) {
     const index = slot.index - this.#slotBase;
     return index >= 0 && index < this.#slots.length ? index : null;
   }

@@ -1,9 +1,13 @@
 // Bounded-exhaustive differential test for the concurrent `filter`.
 //
-// Usage: `node test/filter-bounded-exhaustive.js [N]`   (default N = 2)
+// Usage: `node test/filter-bounded-exhaustive.js [N]`   (default N = 5)
 //
-// N bounds consumer calls. Unlike map, filter can issue replacement pulls when
-// predicates return false, so this also bounds total underlying pulls to 2N.
+// N bounds the total number of harness events in a schedule -- consumer
+// next()/return() calls plus underlying pull/predicate/return settlements.
+// Once a schedule reaches N events it is forced to stop (leaving any in-flight
+// operations unsettled), so the schedule space scales gently with N and N can
+// be raised incrementally. Underlying pulls are separately capped to bound the
+// sync-false replacement chains a single event can trigger.
 
 import { filter } from '../filter.js';
 
@@ -67,10 +71,9 @@ class Chooser {
   }
 }
 
-function runModel(N, chooser) {
-  const maxPulls = Math.max(1, 2 * N);
+function runModel(maxEvents, chooser) {
+  const maxPulls = Math.max(1, 2 * maxEvents);
   let done = false;
-  let budget = N;
   let callCount = 0;
   let nextPullId = 0, nextPredId = 0, nextReturnId = 0;
   let terminalIndex = Infinity;
@@ -265,11 +268,12 @@ function runModel(N, chooser) {
   }
 
   const computeLegal = () => {
+    // Force termination once the schedule reaches the event budget; any
+    // in-flight pulls/predicates/returns are simply left unsettled.
+    if (schedule.actions.length >= maxEvents) return [{ t: 'stop' }];
     const legal = [];
-    if (budget > 0) {
-      legal.push({ t: 'next' });
-      legal.push({ t: 'return' });
-    }
+    legal.push({ t: 'next' });
+    legal.push({ t: 'return' });
     for (const p of pendingPulls) for (const o of PULL_OUTCOMES) legal.push({ t: 'settlePull', id: p.id, o });
     for (const p of pendingPreds) {
       for (const o of choosePredOutcomes()) legal.push({ t: 'settlePred', id: p.id, o });
@@ -279,16 +283,21 @@ function runModel(N, chooser) {
     return legal;
   };
 
+  let truncated = false;
   for (;;) {
     const legal = computeLegal();
     const act = legal[chooser.choose(legal.length)];
     schedule.actions.push(act);
-    if (act.t === 'stop') break;
+    if (act.t === 'stop') {
+      // A natural stop only happens once nothing is pending; a stop with work
+      // still in flight is the event budget cutting the schedule short.
+      truncated = pendingPulls.length > 0 || pendingPreds.length > 0 || pendingReturns.length > 0;
+      break;
+    }
 
     ev = [];
     if (act.t === 'next') {
       const callId = callCount++;
-      budget--;
       if (done) settleNext(callId, { value: undefined, done: true });
       else {
         consumers.push(callId);
@@ -296,7 +305,6 @@ function runModel(N, chooser) {
       }
     } else if (act.t === 'return') {
       const callId = callCount++;
-      budget--;
       if (done) settleReturn(callId);
       else {
         done = true;
@@ -326,14 +334,14 @@ function runModel(N, chooser) {
     modelTrace.push(ev.map((e) => e.s));
   }
 
-  return { schedule, modelTrace, callResults, numDecisions: chooser.i, frontierOptionCount: chooser.frontierOptionCount };
+  return { schedule, modelTrace, callResults, truncated, numDecisions: chooser.i, frontierOptionCount: chooser.frontierOptionCount };
 }
 
-function* enumerate(N) {
+function* enumerate(maxEvents) {
   const worklist = [[]];
   while (worklist.length) {
     const V = worklist.pop();
-    const r = runModel(N, new Chooser(V));
+    const r = runModel(maxEvents, new Chooser(V));
     if (r.numDecisions === V.length) yield r;
     else for (let a = 0; a < r.frontierOptionCount; a++) worklist.push([...V, a]);
   }
@@ -542,12 +550,6 @@ function compareTraces(model, real) {
   return null;
 }
 
-function eventKind(label) {
-  if (label.startsWith('U.next#') || label.startsWith('U.return#') || label.startsWith('pred(')) return 'sync';
-  if (label.startsWith('next#') || label.startsWith('return#')) return 'settle';
-  return 'other';
-}
-
 // Oracle-independent sanity check over the *real* trace: assert the necessary
 // happens-before edges that any correct run must satisfy, without trusting the
 // oracle's predicted ordering. A predicate can't be called on a value before
@@ -577,50 +579,28 @@ function checkPartialOrder(realTrace) {
   return null;
 }
 
-// Temporary diagnostic: enumerate every schedule, and for each step of the real
-// trace where a synchronous call is observed after a settlement (the premise
-// violation), tally a generalized signature so we can see how many distinct
-// interleaving shapes actually arise. Run with `SCAN=1 node ... [N]`.
-async function scan(N) {
-  const patterns = new Map(); // signature -> { count, example }
-  let scheduleCount = 0;
-  for (const s of enumerate(N)) {
-    scheduleCount++;
-    const { realTrace } = await runReal(s.schedule);
-    for (let step = 0; step < realTrace.length; step++) {
-      const kinds = realTrace[step].map(eventKind);
-      let seenSettle = false, violates = false;
-      for (const k of kinds) {
-        if (k === 'settle') seenSettle = true;
-        else if (k === 'sync' && seenSettle) violates = true;
-      }
-      if (!violates) continue;
-      const action = s.schedule.actions[step];
-      const sig = `${action.t}:${action.o ?? ''} :: ${kinds.join(' ')}`;
-      if (!patterns.has(sig)) {
-        patterns.set(sig, {
-          count: 0,
-          example: { schedule: describeSchedule(s), step, trace: realTrace[step] },
-        });
-      }
-      patterns.get(sig).count++;
-    }
+function countSchedules(maxEvents) {
+  const byLen = new Map();
+  let total = 0;
+  for (const s of enumerate(maxEvents)) {
+    total++;
+    const len = s.schedule.actions.length;
+    byLen.set(len, (byLen.get(len) ?? 0) + 1);
   }
-  console.log(`\nN = ${N}; schedules explored: ${scheduleCount}`);
-  console.log(`distinct sync-after-settle patterns: ${patterns.size}\n`);
-  for (const [sig, info] of [...patterns].sort((a, b) => b[1].count - a[1].count)) {
-    console.log(`  [${info.count}×] ${sig}`);
-    console.log(`        e.g. step ${info.example.step} of: ${info.example.schedule}`);
-    console.log(`        trace: ${JSON.stringify(info.example.trace)}`);
+  console.log(`N = ${maxEvents}; total schedules: ${total}`);
+  let cum = 0;
+  for (const len of [...byLen.keys()].sort((a, b) => a - b)) {
+    cum += byLen.get(len);
+    console.log(`  len ${String(len).padStart(2)}: ${String(byLen.get(len)).padStart(8)}  (cumulative ${cum})`);
   }
 }
 
 async function main() {
-  const N = Number(process.argv[2] ?? 2);
-  if (process.env.SCAN) return scan(N);
+  const maxEvents = Number(process.argv[2] ?? 5);
+  if (process.env.COUNT) return countSchedules(maxEvents);
   let scheduleCount = 0;
 
-  for (const s of enumerate(N)) {
+  for (const s of enumerate(maxEvents)) {
     scheduleCount++;
     const { realTrace, invariantViolation } = await runReal(s.schedule);
     const diff = compareTraces(s.modelTrace, realTrace);
@@ -634,7 +614,10 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    const prop = checkSequentialProperty(s.schedule, s.callResults);
+    // A truncated schedule leaves some next()/return() calls unsettled, so the
+    // sequential spec (which expects every call to resolve) does not apply; the
+    // exact-trace comparison above is still the oracle for these.
+    const prop = s.truncated ? null : checkSequentialProperty(s.schedule, s.callResults);
     if (prop) {
       reportPropertyFailure(s, prop, scheduleCount);
       process.exitCode = 1;
@@ -651,7 +634,7 @@ async function main() {
   }
 
   console.log('');
-  console.log(`N = ${N}`);
+  console.log(`N = ${maxEvents} (max events)`);
   console.log(`schedules explored: ${scheduleCount}`);
   console.log('all schedules passed');
 }
@@ -697,11 +680,7 @@ function reportPartialOrderFailure(s, po, scheduleCount) {
   console.log('PARTIAL-ORDER VIOLATION (real trace breaks a happens-before premise)');
   console.log(`  after schedules explored: ${scheduleCount}`);
   console.log('  schedule: ' + describeSchedule(s));
-  if (po.kind === 'sync-after-settle') {
-    console.log(`  step ${po.step}: synchronous "${po.label}" observed after a settlement`);
-    console.log('    (breaks the [sync] ++ [settle] partition the oracle relies on)');
-    console.log('    step trace: ' + JSON.stringify(po.trace));
-  } else if (po.kind === 'pred-before-pull') {
+  if (po.kind === 'pred-before-pull') {
     console.log(`  "${po.label}" (index ${po.at}) precedes its pull "${po.dep}" (index ${po.depAt})`);
   } else if (po.kind === 'value-before-pred') {
     console.log(`  "${po.label}" (index ${po.at}) precedes its predicate "${po.dep}" (index ${po.depAt})`);

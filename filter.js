@@ -9,8 +9,15 @@ class FilterHelper {
   // One slot per underlying pull, in pull order. status is
   // 'pending' | 'value' | 'drop' | 'done' | 'error'.
   #slots = [];
-  // Waiting consumer deferreds, each tagged with its current queue position.
+  // Stable pull indexes let async completions find their current window index
+  // without searching or renumbering the remaining slots after compaction.
+  #slotBase = 0;
+  #nextSlot = 0;
+  // Waiting consumer deferreds, each tagged with its absolute call position.
   #consumers = [];
+  // Absolute position of #consumers[0], avoiding an O(n) position decrement
+  // when the head consumer settles.
+  #consumerBase = 0;
   // Exclusive index past which no value can exist, once known. A clean done at
   // index d caps it at d (the done slot yields nothing, and a well-behaved
   // source keeps returning done, so any pulls in flight past d would too). An
@@ -36,7 +43,7 @@ class FilterHelper {
       return Promise.resolve({ value: undefined, done: true });
     }
     const d = Promise.withResolvers();
-    d.position = this.#consumers.length;
+    d.position = this.#consumerBase + this.#consumers.length;
     this.#consumers.push(d);
     this.#pull();
     return d.promise;
@@ -56,7 +63,12 @@ class FilterHelper {
   // Issue one underlying pull. Called once per consumer call and once more per
   // dropped value (to replace it), but never once we're done.
   #pull() {
-    const slot = { status: 'pending', value: undefined, error: undefined };
+    const slot = {
+      status: 'pending',
+      value: undefined,
+      error: undefined,
+      index: this.#nextSlot++,
+    };
     this.#slots.push(slot);
     this.#upper++; // a new non-dropped slot below the (not-yet-set) boundary
     new Promise(resolve => resolve(this.#it.next())).then(settled => {
@@ -74,8 +86,8 @@ class FilterHelper {
         // Clean exhaustion: done, but the underlying is not closed.
         this.#done = true;
         slot.status = 'done';
-        const k = this.#slotIndex(slot);
-        if (this.#boundary === null || k < this.#boundary) {
+        const k = this.#currentSlotIndex(slot);
+        if (k !== null && (this.#boundary === null || k < this.#boundary)) {
           // The boundary moves down to k; discount the slots it now excludes,
           // [k, oldEnd), that #upper was still counting (oldEnd = the previous
           // boundary, or every slot in the window if none was set).
@@ -98,8 +110,8 @@ class FilterHelper {
           // A drop lowers the value ceiling, so it can both reissue a pull (to
           // replace the lost value) and let trailing done calls settle.
           slot.status = 'drop';
-          const k = this.#slotIndex(slot);
-          if (this.#boundary === null || k < this.#boundary) this.#upper--;
+          const k = this.#currentSlotIndex(slot);
+          if (k !== null && (this.#boundary === null || k < this.#boundary)) this.#upper--;
           if (!this.#done) this.#pull();
           this.#pump();
           this.#drainDone();
@@ -150,9 +162,10 @@ class FilterHelper {
   #drainDone() {
     if (this.#boundary === null) return;
     while (this.#consumers.length > 0 &&
-           this.#consumers[this.#consumers.length - 1].position >= this.#upper) {
+           this.#consumers[this.#consumers.length - 1].position >= this.#consumerBase + this.#upper) {
       this.#consumers.pop().resolve({ value: undefined, done: true });
     }
+    if (this.#done && this.#consumers.length === 0) this.#clearSlotWindow();
   }
 
   // Record an error at a slot: it keeps its value-position and is rejected in
@@ -179,19 +192,28 @@ class FilterHelper {
     }
   }
 
-  #slotIndex(slot) {
-    return this.#slots.indexOf(slot);
+  #currentSlotIndex(slot) {
+    const index = slot.index - this.#slotBase;
+    return index >= 0 ? index : null;
   }
 
   #settleHeadSlot() {
     this.#discardHeadSlot(true);
-    for (const c of this.#consumers) c.position--;
+    this.#consumerBase++;
   }
 
   #discardHeadSlot(countedValue) {
     this.#slots.shift();
+    this.#slotBase++;
     if (countedValue) this.#upper--;
     if (this.#boundary !== null) this.#boundary--;
+  }
+
+  #clearSlotWindow() {
+    this.#slots.length = 0;
+    this.#slotBase = this.#nextSlot;
+    this.#upper = 0;
+    this.#boundary = 0;
   }
 
   #close() {

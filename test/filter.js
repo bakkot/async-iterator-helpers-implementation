@@ -191,8 +191,8 @@ tests.push(['filter: a done releases all trailing blocked calls at once', async 
   src.finish(1);
   await flushMicrotasks();
   t.expectLog('done settles both trailing calls together', [
-    'r2 resolved {"done":true}',
     'r1 resolved {"done":true}',
+    'r2 resolved {"done":true}',
   ]);
 
   // The first call was never affected; its value still arrives.
@@ -229,8 +229,8 @@ tests.push(['filter: done after head compaction still drains trailing calls', as
   src.finish(1);
   await flushMicrotasks();
   t.expectLog('done is relative to the compacted window', [
-    'r2 resolved {"done":true}',
     'r1 resolved {"done":true}',
+    'r2 resolved {"done":true}',
   ]);
 }]);
 
@@ -254,8 +254,8 @@ tests.push(['filter: in-flight pull completion after all calls are done is harml
   src.finish(0);
   await flushMicrotasks();
   t.expectLog('earlier done settles every outstanding call', [
-    'r1 resolved {"done":true}',
     'r0 resolved {"done":true}',
+    'r1 resolved {"done":true}',
   ]);
 
   // The later in-flight pull completing after that should have no observable
@@ -282,8 +282,8 @@ tests.push(['filter: late value after terminal done has no consumer effect', asy
   src.finish(0);
   await flushMicrotasks();
   t.expectLog('done drains all consumers', [
-    'r1 resolved {"done":true}',
     'r0 resolved {"done":true}',
+    'r1 resolved {"done":true}',
   ]);
 
   src.yield(1, 99);

@@ -191,9 +191,10 @@ class FilterHelper {
   // position has reached the terminal value ceiling. The call at the ceiling's
   // last position (an erroring one) stays — it is rejected in order by #pump.
   #drainDone() {
-    while (this.#consumers.length > this.#valueLimit) {
-      this.#consumers.pop().resolve({ value: undefined, done: true });
+    for (let i = this.#valueLimit; i < this.#consumers.length; i++) {
+      this.#consumers[i].resolve({ value: undefined, done: true });
     }
+    this.#consumers.length = this.#valueLimit;
     if (this.#consumers.length === 0) {
       // No node can become observable after terminal drain; drop references
       // eagerly while allowing already-issued pulls to finish harmlessly.

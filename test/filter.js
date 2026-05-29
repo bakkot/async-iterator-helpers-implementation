@@ -635,4 +635,74 @@ tests.push(['filter: after return(), a vended call that would need a new pull se
   t.expectLog('the un-serviceable vended call settles done', ['r0 resolved {"done":true}']);
 }]);
 
+// Regression from the bounded-exhaustive suite: if an underlying error is
+// sitting behind an earlier predicate that later drops, the error shifts forward
+// to the earlier call, and any already-vended trailing call that would need a
+// new pull must settle done rather than hang.
+tests.push(['filter: underlying error behind an earlier drop drains trailing calls', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('first predicate is pending', ['pred(1) #0']);
+
+  // The underlying error is in the second retained slot, so it cannot surface
+  // until the first slot is resolved.
+  src.throw(1, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('underlying error waits behind the earlier predicate', []);
+
+  // Dropping the first slot makes the underlying error reject r0. With the
+  // source terminal and no replacement pull possible, r1 resolves done.
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('error shifts forward and the trailing call drains', [
+    'r0 rejected boom',
+    'r1 resolved {"done":true}',
+  ]);
+}]);
+
+// Same shape, but the terminal event is a predicate error rather than an
+// underlying error. The erroring value still occupies a slot, so when an earlier
+// value drops the error moves forward and trailing unserviceable calls drain.
+tests.push(['filter: predicate error behind an earlier drop drains trailing calls', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  src.yield(0, 1);
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('both predicates are pending', ['pred(1) #0', 'pred(2) #1']);
+
+  pred.reject(1, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('later predicate error closes but waits behind the first predicate', [
+    'src.return() #0',
+  ]);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('error shifts forward and the trailing call drains', [
+    'r0 rejected boom',
+    'r1 resolved {"done":true}',
+  ]);
+}]);
+
 runTests(tests);

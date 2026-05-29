@@ -80,7 +80,7 @@ class FilterHelper {
         // A throwing result object is an error *from* the underlying: surface
         // it, but never close.
         this.#done = true;
-        this.#terminalIndex ??= this.#nextIndex - 1;
+        this.#terminalIndex = this.#nextIndex - 1;
         this.#fail(node, err);
         return;
       }
@@ -139,7 +139,7 @@ class FilterHelper {
       if (this.#isIgnored(node)) return;
       // Error from the underlying's .next(): surface it, but never close.
       this.#done = true;
-      this.#terminalIndex ??= this.#nextIndex - 1;
+      this.#terminalIndex = this.#nextIndex - 1;
       this.#fail(node, err);
     });
   }
@@ -148,6 +148,10 @@ class FilterHelper {
   #pump() {
     while (this.#consumers.length > 0) {
       const node = this.#head();
+      if (!node) {
+        if (this.#done) this.#settleDoneFrom(0);
+        break;
+      }
       if (node.status === 'pending') break;
 
       switch (node.status) {
@@ -203,6 +207,9 @@ class FilterHelper {
     node.status = 'error';
     node.error = err;
     this.#pump();
+    if (this.#done && this.#consumers.length > this.#valueLimit) {
+      this.#settleDoneFrom(this.#valueLimit);
+    }
   }
 
   #isIgnored(node) {

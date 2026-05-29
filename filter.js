@@ -137,7 +137,7 @@ class FilterHelper {
           node.next = null;
           this.#valueLimit--;
           if (!this.#done) this.#pull();
-          this.#pump();
+          if (this.#head) this.#pump();
           if (this.#done && this.#consumers.length > this.#valueLimit) {
             this.#consumers[this.#valueLimit].resolve({ value: undefined, done: true });
             this.#consumers.length = this.#valueLimit;
@@ -171,7 +171,7 @@ class FilterHelper {
   #pump() {
     while (this.#consumers.length > 0) {
       const node = this.#head;
-      if (!node || node.status === 'pending') break;
+      if (node.status === 'pending') break;
 
       switch (node.status) {
         case 'value':

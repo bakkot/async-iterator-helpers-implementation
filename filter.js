@@ -7,9 +7,10 @@ class FilterHelper {
   #it;
   #pred;
 
-  // The helper keeps a compact window of issued underlying pulls. Each consumer
-  // receives the next slot in that window whose predicate passes; dropped slots
-  // are skipped and replaced with another pull while the source is still live.
+  // The helper keeps a retained sequence of issued underlying pulls. Each
+  // consumer receives the next node in that sequence whose predicate passes;
+  // dropped nodes are deleted and replaced with another pull while the source
+  // is still live.
   //
   // Once #done is set, no replacement pulls will be issued. At that point
   // #valueLimit is a ceiling on how many waiting consumers can still receive
@@ -98,7 +99,7 @@ class FilterHelper {
         this.#valueLimit--;
         for (let n = node.next; n;) {
           const next = n.next;
-          if (n.status !== 'done') this.#valueLimit--;
+          this.#valueLimit--;
           n.prev = null;
           n.next = null;
           n = next;
@@ -106,12 +107,14 @@ class FilterHelper {
         this.#tail = node;
         node.next = null;
         this.#pump();
-        for (let i = this.#valueLimit; i < this.#consumers.length; i++) {
-          this.#consumers[i].resolve({ value: undefined, done: true });
-        }
-        this.#consumers.length = this.#valueLimit;
-        if (this.#consumers.length === 0) {
-          this.#clearTerminalState();
+        if (this.#consumers.length > this.#valueLimit) {
+          for (let i = this.#valueLimit; i < this.#consumers.length; i++) {
+            this.#consumers[i].resolve({ value: undefined, done: true });
+          }
+          this.#consumers.length = this.#valueLimit;
+          if (this.#consumers.length === 0) {
+            this.#clearTerminalState();
+          }
         }
         return;
       }
@@ -123,6 +126,8 @@ class FilterHelper {
           this.#pump();
         } else {
           // A dropped value is deleted from the retained sequence.
+          const wasHead = node === this.#head;
+          const successor = node.next;
           if (node.prev) {
             node.prev.next = node.next;
           } else {
@@ -137,7 +142,7 @@ class FilterHelper {
           node.next = null;
           this.#valueLimit--;
           if (!this.#done) this.#pull();
-          if (this.#head) this.#pump();
+          if (wasHead && successor) this.#pump();
           if (this.#done && this.#consumers.length > this.#valueLimit) {
             this.#consumers[this.#valueLimit].resolve({ value: undefined, done: true });
             this.#consumers.length = this.#valueLimit;
@@ -184,10 +189,7 @@ class FilterHelper {
             consumer.resolve({ value: undefined, done: true });
           }
           this.#consumers.length = 0;
-          this.#head = null;
-          this.#tail = null;
-          this.#valueLimit = 0;
-          this.#terminalIndex = -1;
+          this.#clearTerminalState();
           return;
         case 'error':
           // 'error': like a value, but the call at this position rejects. It

@@ -56,6 +56,33 @@ tests.push(['filter: sequential, drops a value then delivers the next', async fu
   t.expectLog('the passing value is delivered', ['r0 resolved {"value":2,"done":false}']);
 }]);
 
+// If a dropped value requires a replacement pull and that replacement .next()
+// throws synchronously, the still-unsatisfied consumer call observes that source
+// error. It must not be converted into done.
+tests.push(['filter: synchronous source throw from replacement pull rejects the pending call', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls the source once', ['src.next() #0']);
+
+  src.throwNext(new Error('source throw 1'));
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('predicate invoked on the first value', ['pred(1) #0']);
+
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('replacement pull throws and rejects the pending call', [
+    'src.next() #1 (throws)',
+    'r0 rejected source throw 1',
+  ]);
+}]);
+
 // Clean exhaustion: a done from the underlying propagates as done and does NOT
 // close the source (no src.return()), exactly as in map.
 tests.push(['filter: done propagates and leaves the source open', async function (t) {

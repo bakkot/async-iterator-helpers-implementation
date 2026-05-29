@@ -266,8 +266,7 @@ tests.push(['filter: in-flight pull completion after all calls are done is harml
 }]);
 
 // If an already-issued pull produces a value after a clean done has drained all
-// consumers, its predicate may still run, but the result must not become
-// observable or issue replacement pulls.
+// consumers, the terminal cutoff ignores it before the predicate runs.
 tests.push(['filter: late value after terminal done has no consumer effect', async function (t) {
   const src = controlledSource(t.log, 'src');
   const pred = controlledFn(t.log, 'pred');
@@ -289,11 +288,7 @@ tests.push(['filter: late value after terminal done has no consumer effect', asy
 
   src.yield(1, 99);
   await flushMicrotasks();
-  t.expectLog('late value still reaches the predicate', ['pred(99) #0']);
-
-  pred.resolve(0, false);
-  await flushMicrotasks();
-  t.expectLog('late predicate result is ignored', []);
+  t.expectLog('late value is ignored', []);
 }]);
 
 // Two concurrent calls where the first value is dropped. The drop must reissue

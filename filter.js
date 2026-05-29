@@ -13,29 +13,27 @@ class FilterHelper {
   //
   // Once #done is set, no replacement pulls will be issued. At that point
   // #valueLimit is a ceiling on how many waiting consumers can still receive
-  // values/errors from the remaining window, so consumers beyond it can resolve
-  // done immediately even if earlier slots are still pending.
+  // values/errors from the remaining list, so consumers beyond it can resolve
+  // done immediately even if earlier nodes are still pending.
   //
   // Core invariants:
-  // - #slotBase is the stable index of #slots[0], if the window is non-empty.
-  // - slot.index === #slotBase + its current offset, while retained.
-  // - #valueLimit counts retained slots that can still consume one caller:
-  //   'pending', 'value', and 'error'. It excludes 'drop' and the terminal
-  //   'done' wall.
-  // - 0 <= #valueLimit <= #slots.length.
+  // - #terminalIndex is null while live. Once terminal, completions with a
+  //   higher index are ignored.
+  // - #valueLimit counts retained nodes that can still consume one caller:
+  //   'pending', 'value', and 'error'. It excludes the terminal 'done' wall.
+  // - 0 <= #valueLimit <= retained node count.
   //
-  // Slot[] where Slot =
-  //   | { status: 'pending' | 'drop' | 'done', index: number }
-  //   | { status: 'value', value: unknown, index: number }
-  //   | { status: 'error', error: unknown, index: number }
-  // One slot per underlying pull, in pull order.
-  #slots = [];
-  // Stable pull indexes let async completions find their current window index
-  // without searching or renumbering the remaining slots after compaction.
-  #slotBase = 0;
+  // Node =
+  //   | { status: 'pending' | 'done', index: number, prev: Node?, next: Node? }
+  //   | { status: 'value', value: unknown, index: number, prev: Node?, next: Node? }
+  //   | { status: 'error', error: unknown, index: number, prev: Node?, next: Node? }
+  #head = null;
+  #tail = null;
+  #nextIndex = 0;
+  #terminalIndex = null;
   // Waiting consumer deferreds, in call order.
   #consumers = [];
-  // Kept current so #drainDone never rescans the slot window.
+  // Kept current so #drainDone never scans the retained list.
   #valueLimit = 0;
 
   constructor(it, pred) {
@@ -66,13 +64,16 @@ class FilterHelper {
   // Issue one underlying pull. Called once per consumer call and once more per
   // dropped value (to replace it), but never once we're done.
   #pull() {
-    const slot = {
+    const node = {
       status: 'pending',
-      index: this.#slotBase + this.#slots.length,
+      index: this.#nextIndex++,
+      prev: null,
+      next: null,
     };
-    this.#slots.push(slot);
+    this.#append(node);
     this.#valueLimit++;
     new Promise(resolve => resolve(this.#it.next())).then(settled => {
+      if (this.#isIgnored(node)) return;
       let value, done;
       try {
         ({ value, done } = settled);
@@ -80,69 +81,65 @@ class FilterHelper {
         // A throwing result object is an error *from* the underlying: surface
         // it, but never close.
         this.#done = true;
-        this.#fail(slot, err);
+        this.#terminalIndex ??= this.#nextIndex - 1;
+        this.#fail(node, err);
         return;
       }
       if (done) {
         // Clean exhaustion: done, but the underlying is not closed.
         this.#done = true;
-        slot.status = 'done';
-        const slotIndex = this.#retainedSlotIndex(slot);
-        if (slotIndex !== null) {
-          // The done slot and every later slot cannot produce values. Discount
-          // that suffix and stop retaining later in-flight slots.
-          for (let i = slotIndex; i < this.#slots.length; i++) {
-            if (this.#slots[i].status !== 'drop') this.#valueLimit--;
-          }
-          this.#slots.length = slotIndex + 1;
-        }
+        this.#terminalIndex = node.index;
+        node.status = 'done';
+        this.#valueLimit--;
+        this.#truncateAfter(node);
         this.#pump();
         return;
       }
       new Promise(resolve => resolve(this.#pred(value))).then(keep => {
+        if (this.#isIgnored(node)) return;
         if (keep) {
-          slot.status = 'value';
-          slot.value = value;
+          node.status = 'value';
+          node.value = value;
           this.#pump();
         } else {
-          // A drop lowers the value ceiling. While live, replace the lost value
-          // with another pull; after done, the lower ceiling may drain callers.
-          slot.status = 'drop';
-          const slotIndex = this.#retainedSlotIndex(slot);
-          if (slotIndex !== null) this.#valueLimit--;
+          // A dropped value is deleted from the retained sequence.
+          this.#remove(node);
+          this.#valueLimit--;
           if (!this.#done) this.#pull();
           this.#pump();
         }
       }, err => {
+        if (this.#isIgnored(node)) return;
         // A predicate error is treated like `true` (the value still fills its
         // position) except that position rejects, future next() calls get done,
         // and the underlying is closed — the last only if still live.
         if (!this.#done) {
           this.#done = true;
+          this.#terminalIndex = this.#nextIndex - 1;
           this.#close();
         }
-        this.#fail(slot, err);
+        this.#fail(node, err);
       });
     }, err => {
+      if (this.#isIgnored(node)) return;
       // Error from the underlying's .next(): surface it, but never close.
       this.#done = true;
-      this.#fail(slot, err);
+      this.#terminalIndex ??= this.#nextIndex - 1;
+      this.#fail(node, err);
     });
   }
 
-  // Deliver settled slots to waiting consumers in order.
+  // Deliver settled nodes to waiting consumers in order.
   #pump() {
     while (this.#consumers.length > 0) {
-      const slot = this.#slots[0];
-      if (!slot || slot.status === 'pending') break;
+      const node = this.#head;
+      if (!node || node.status === 'pending') break;
 
       let settledConsumer = false;
-      switch (slot.status) {
+      switch (node.status) {
         case 'value':
-          this.#consumers.shift().resolve({ value: slot.value, done: false });
+          this.#consumers.shift().resolve({ value: node.value, done: false });
           settledConsumer = true;
-          break;
-        case 'drop':
           break;
         case 'done':
           this.#drainDone();
@@ -151,13 +148,12 @@ class FilterHelper {
           // 'error': like a value, but the call at this position rejects. It
           // does not end the others — they keep being served — so advance and
           // continue.
-          this.#consumers.shift().reject(slot.error);
+          this.#consumers.shift().reject(node.error);
           settledConsumer = true;
           break;
       }
 
-      this.#slots.shift();
-      this.#slotBase++;
+      this.#remove(node);
       if (settledConsumer) {
         this.#valueLimit--;
       }
@@ -173,29 +169,65 @@ class FilterHelper {
       this.#consumers.pop().resolve({ value: undefined, done: true });
     }
     if (this.#consumers.length === 0) {
-      // No slot can become observable after terminal drain; drop references
+      // No node can become observable after terminal drain; drop references
       // eagerly while allowing already-issued pulls to finish harmlessly.
-      this.#slotBase += this.#slots.length;
-      this.#slots.length = 0;
+      this.#head = null;
+      this.#tail = null;
       this.#valueLimit = 0;
+      this.#terminalIndex = -1;
     }
   }
 
-  // Record an error at a slot: it keeps its value-position and is rejected in
+  // Record an error at a node: it keeps its value-position and is rejected in
   // order by #pump. An error does not exhaust the source the way a done does, so
   // the pulls already in flight still serve their calls (values are not lost);
   // but no new pull will happen, so #done lets any call that would need one
   // settle done instead of hanging.
-  #fail(slot, err) {
-    slot.status = 'error';
-    slot.error = err;
+  #fail(node, err) {
+    node.status = 'error';
+    node.error = err;
     this.#pump();
   }
 
-  // Returns null for late completions whose slot was already compacted away.
-  #retainedSlotIndex(slot) {
-    const index = slot.index - this.#slotBase;
-    return index >= 0 && index < this.#slots.length ? index : null;
+  #append(node) {
+    if (this.#tail) {
+      node.prev = this.#tail;
+      this.#tail.next = node;
+    } else {
+      this.#head = node;
+    }
+    this.#tail = node;
+  }
+
+  #remove(node) {
+    if (node.prev) {
+      node.prev.next = node.next;
+    } else if (this.#head === node) {
+      this.#head = node.next;
+    }
+    if (node.next) {
+      node.next.prev = node.prev;
+    } else if (this.#tail === node) {
+      this.#tail = node.prev;
+    }
+    node.prev = null;
+    node.next = null;
+  }
+
+  #truncateAfter(node) {
+    for (let n = node.next; n;) {
+      const next = n.next;
+      if (n.status !== 'done') this.#valueLimit--;
+      n.prev = null;
+      n.next = null;
+      n = next;
+    }
+    this.#tail = node;
+    node.next = null;
+  }
+
+  #isIgnored(node) {
+    return this.#terminalIndex !== null && node.index > this.#terminalIndex;
   }
 
   #close() {

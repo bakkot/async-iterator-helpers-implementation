@@ -8,11 +8,12 @@
 // Internal model (per the spec):
 //
 //   * `#positions` is a plain array used as a queue, one entry per in-flight
-//     source pull, in pull order. Each entry is a record `{ status, value,
-//     error, removed }` with status one of 'pending' | 'value' | 'error' |
-//     'dropped'. Delivery happens strictly at the head (index 0), in call order:
-//     a head `value` resolves the front call, a head `error` rejects it, a
-//     pending head blocks everything behind it.
+//     source pull, in pull order. Each entry is a record discriminated on
+//     `status` (one of 'pending' | 'value' | 'error' | 'dropped' | 'removed';
+//     see the #positions declaration for the full shape). Delivery happens
+//     strictly at the head (index 0), in call order: a head `value` resolves the
+//     front call, a head `error` rejects it, a pending head blocks everything
+//     behind it.
 //   * A drop is recorded as a TOMBSTONE (status 'dropped') rather than removed
 //     in place; it lingers in the array until the head reaches it and is then
 //     shifted away. While live, a drop also issues a fresh replacement pull at
@@ -40,12 +41,14 @@ class FilterHelper {
   // Positions in pull order (see the model comment above). Each entry is one of:
   //
   //   type Position =
-  //     | { status: 'pending'; removed: boolean }
-  //     | { status: 'value';   removed: boolean; value: unknown }
-  //     | { status: 'dropped'; removed: boolean }
-  //     | { status: 'error';   removed: boolean; error: unknown; closeState: CloseState }
+  //     | { status: 'pending' }
+  //     | { status: 'value';   value: unknown }
+  //     | { status: 'dropped' }
+  //     | { status: 'error';   error: unknown; closeState: CloseState }
+  //     | { status: 'removed' }
   //
-  // `removed` marks a position discarded by a terminal `done` wall, so a late pull
+  // 'removed' is the terminal state of a position discarded by a terminal `done`
+  // wall: it is popped from the queue, and a later in-flight pull/predicate
   // settlement for it is ignored. For a predicate-error position, the it.return()
   // close must settle before the error is surfaced; `closeState` tracks that wait:
   //
@@ -99,7 +102,6 @@ class FilterHelper {
       status: 'pending',
       value: undefined,
       error: undefined,
-      removed: false,
       closeState: 'ready',
     };
     this.#positions.push(pos);
@@ -123,7 +125,7 @@ class FilterHelper {
   }
 
   #settlePull(pos, result) {
-    if (pos.removed) return; // discarded
+    if (pos.status === 'removed') return; // discarded
     if (result && result.done) {
       this.#handleDone(pos);
     } else {
@@ -132,7 +134,7 @@ class FilterHelper {
   }
 
   #rejectPull(pos, err) {
-    if (pos.removed) return; // discarded
+    if (pos.status === 'removed') return; // discarded
     // Source error: positional error, does not close the source.
     pos.status = 'error';
     pos.error = err;
@@ -157,7 +159,7 @@ class FilterHelper {
     }
     Promise.resolve(res).then(
       (keep) => {
-        if (pos.removed) return;
+        if (pos.status === 'removed') return;
         if (keep) {
           pos.status = 'value';
           this.#process();
@@ -170,7 +172,7 @@ class FilterHelper {
   }
 
   #predErrored(pos, err) {
-    if (pos.removed) return; // discarded
+    if (pos.status === 'removed') return; // discarded
     pos.status = 'error';
     pos.error = err;
     const wasLive = !this.#finished; // is this error the terminal event?
@@ -205,7 +207,7 @@ class FilterHelper {
   // ---- drops and done ---------------------------------------------------
 
   #handleDrop(pos) {
-    if (pos.removed) return;
+    if (pos.status === 'removed') return;
     // Tombstone the dropped position: it stays in #positions until the head
     // reaches it (then it is shifted away), but no longer counts toward the
     // value ceiling. Surviving values still deliver strictly in pull order, so
@@ -224,19 +226,19 @@ class FilterHelper {
   }
 
   #handleDone(pos) {
-    if (pos.removed) return;
+    if (pos.status === 'removed') return;
     // This done is the terminal wall: discard its position and every later one
     // (overriding any later error or later done). Pop from the back until the
     // done record itself is popped. `pos` is still pending here (a pending head
     // blocks delivery), so it has not been shifted off the front and the
     // pop-loop reaches it; earlier positions are left untouched.
-    let removed;
+    let discarded;
     do {
-      removed = this.#positions.pop();
-      removed.removed = true;
+      discarded = this.#positions.pop();
       // Tombstoned drops were already counted out of #liveCount.
-      if (removed.status !== 'dropped') this.#liveCount--;
-    } while (removed !== pos);
+      if (discarded.status !== 'dropped') this.#liveCount--;
+      discarded.status = 'removed';
+    } while (discarded !== pos);
     this.#finished = true; // a clean done does not close the source.
     this.#process();
   }

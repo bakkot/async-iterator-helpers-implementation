@@ -46,14 +46,24 @@ Outstanding `next()` calls are served **strictly in call order** for kept values
 and errors. Equivalently: the *i*-th position (in pull order) that resolves to a
 kept value or an error is matched to the *i*-th `next()` call (in call order).
 
-A consequence that distinguishes `filter` from `map`: **a later call can never
-settle with a value or an error before every earlier call has settled.** A later
-position's value may become known first, but it cannot be handed out yet, because
-if an earlier position turns out to be a drop this value belongs to the earlier
-call instead. So nothing is delivered past a still-pending earlier position.
+A consequence that distinguishes `filter` from `map`: **a later call generally
+cannot settle with a value or an error before every earlier call has settled.** A
+later position's value may become known first, but it cannot be handed out yet,
+because if an earlier position turns out to be a drop this value belongs to the
+earlier call instead. So nothing is delivered past a still-**pending** earlier
+position — it is *pending-ness*, not mere earlier-ness, that blocks: an earlier
+position whose outcome is already known (a value, or an error) cannot swallow a
+later value, so it does not hold later delivery hostage in the same way.
 
-The single exception is **done**, which can settle a later call ahead of an
-earlier one (see §4).
+Two cases let a later call settle ahead of an earlier one:
+
+- **done** can settle a later call early (see §4).
+- An earlier **error that is only waiting for its source close** to settle (a
+  predicate error, see §6) does not block later calls. Its recipient is already
+  fixed (a head error cannot be dropped onto an earlier call), so the later calls
+  take their own values/done while that one call alone waits for the close.
+
+Outside these, settlement is in call order.
 
 ---
 
@@ -173,9 +183,11 @@ Closing is part of finishing, so the rejection is **withheld until that
 (The close result itself, a value or a rejection, is discarded; it matters only as
 the signal that closing is complete. A missing `it.return()`, or one that throws or
 returns a non-thenable, settles synchronously, so the error is surfaced with no
-delay.) Only the erroring position waits this way: earlier positions still deliver
-their values, and trailing calls beyond the value ceiling (§4) still settle `done`,
-neither of them gated on the close.
+delay.) **Only that one call waits.** Once the error reaches the head of the queue
+its recipient is fixed (a head error cannot be dropped onto an earlier call), so
+everything else proceeds without the close: earlier positions deliver their values,
+the values *behind* the error are delivered to the later calls, and trailing calls
+beyond the value ceiling (§4) settle `done` — none of them gated on the close.
 
 A source error does **not** call `it.return()` — the source already faulted, and
 the result never calls `it.return()` after observing a source error — so a source
@@ -216,11 +228,14 @@ A `next()` call made after `return()` returns `{ done: true }`.
 
 1. One `next()` ⇒ one source pull, while live; concurrent calls ⇒ concurrent
    pulls, in call order.
-2. Values and errors are delivered to calls strictly in call order; the *i*-th
-   surviving outcome goes to the *i*-th call.
+2. Each surviving outcome is matched to a call in order: the *i*-th surviving
+   outcome (value or error) goes to the *i*-th call. Calls settle in call order
+   apart from the two cases in (4).
 3. A drop is invisible to consumers and, while live, triggers a replacement pull.
-4. Only `done` can settle a later call before an earlier one — via the value
-   ceiling, which only applies once the result is finished.
+4. A later call can settle before an earlier one in exactly two cases, both only
+   once the result is finished: a `done` past the value ceiling (§4), or an earlier
+   error that is merely awaiting its source close (§6). A value never overtakes an
+   earlier *pending* position.
 5. An error rejects only the single call at its position; values are never lost to
    it, and it never forces an already-vended call to done.
 6. A terminal event (done, source error, predicate error, `return()`) finishes the

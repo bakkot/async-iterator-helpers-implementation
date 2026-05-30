@@ -141,6 +141,8 @@ function runModel(maxEvents, chooser) {
   const nodes = [];     // retained pull slots, in pull order
   const consumers = []; // pending next() call ids, in call order
   let valueLimit = 0;   // pending/value/error slots before the terminal wall
+  let deferredError = null; // a head predicate error committed to a call but
+                            // awaiting its source close: { callId, error }
 
   const pendingPulls = [];   // { id, node }
   const pendingPreds = [];   // { id, node, arg }
@@ -203,10 +205,16 @@ function runModel(maxEvents, chooser) {
         nodes.shift();
         valueLimit--;
       } else if (node.status === 'error') {
-        if (node.heldForClose) break; // withheld until its source close settles
-        rejectNext(consumers.shift(), node.error);
         nodes.shift();
         valueLimit--;
+        if (node.heldForClose) {
+          // A head error awaiting its source close: commit it to the head call
+          // but defer the rejection until the close settles, without blocking the
+          // values behind it.
+          deferredError = { callId: consumers.shift(), error: node.error };
+        } else {
+          rejectNext(consumers.shift(), node.error);
+        }
       } else {
         for (const callId of consumers) settleNext(callId, { value: undefined, done: true });
         consumers.length = 0;
@@ -405,9 +413,16 @@ function runModel(maxEvents, chooser) {
       const r = pendingReturns[idx];
       pendingReturns.splice(idx, 1);
       if (r.heldNode) {
-        // An internal predicate-error close settling: release the withheld
-        // error so it can finally reject its consumer.
+        // An internal predicate-error close settling. If the error already
+        // reached the head and was committed to a call, reject it now; otherwise
+        // it is still behind a pending position and will be delivered in order
+        // once it reaches the head (heldForClose is now clear).
         r.heldNode.heldForClose = false;
+        if (deferredError) {
+          const { callId, error } = deferredError;
+          deferredError = null;
+          rejectNext(callId, error);
+        }
         pump();
         if (done && consumers.length > valueLimit) settleDoneFrom(valueLimit);
       } else {

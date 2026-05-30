@@ -39,8 +39,8 @@ class FilterHelper {
 
   // Positions in pull order (see the model comment above). Each entry is a
   // record { status, value, error, removed, heldForClose }. `heldForClose` is
-  // set on a predicate-error position whose delivery is withheld until the
-  // it.return() it triggered settles (see #predErrored).
+  // set on a predicate-error position whose rejection must wait for the
+  // it.return() it triggered to settle (see #predErrored).
   #positions = [];
 
   // Outstanding consumer next() calls in call order; each entry is
@@ -57,6 +57,15 @@ class FilterHelper {
   // every terminal transition flips it true in the same synchronous step, so
   // there is no separate "finished but source still live" state to track.
   #finished = false;
+
+  // A predicate error whose source close (it.return()) has not yet settled, but
+  // which has already reached the head of the queue and so been committed to its
+  // consumer call: { call, error }. Its recipient is fixed (a head error cannot be
+  // dropped onto an earlier call), so the values behind it are delivered to the
+  // later calls right away, while this one call waits for the close to settle and
+  // is then rejected. At most one such deferral exists at a time — only the single
+  // terminal predicate error closes the source.
+  #deferredError = null;
 
   constructor(it, pred) {
     this.#it = it;
@@ -185,13 +194,23 @@ class FilterHelper {
     this.#finished = true;
     if (wasLive) {
       // This error is the terminal event, so it closes the source. The error
-      // must not be surfaced to a consumer until that it.return() settles, so
-      // withhold this position's delivery (#process skips a held error) and
-      // release it once the close completes. If the source had already ended on
-      // its own (not wasLive) there is no close and nothing to wait for.
+      // must not be surfaced to its consumer until that it.return() settles, so
+      // mark it held: #process will commit it to its call but defer the rejection
+      // until the close completes (only the rejection waits — the values behind it
+      // are not held). If the source had already ended on its own (not wasLive)
+      // there is no close and nothing to wait for.
       pos.heldForClose = true;
       this.#closeSourceForError(() => {
         pos.heldForClose = false;
+        // If the error already reached the head and was committed to a call,
+        // reject it now that the close has settled. Otherwise it is still behind a
+        // pending position and will be delivered in order once it reaches the head
+        // (heldForClose is now clear, so #process no longer defers it).
+        if (this.#deferredError) {
+          const { call, error } = this.#deferredError;
+          this.#deferredError = null;
+          call.reject(error);
+        }
         this.#process();
       });
     }
@@ -247,7 +266,10 @@ class FilterHelper {
     }
 
     // 2) Deliver from the head, in order. A pending head blocks everything
-    //    behind it.
+    //    behind it (its outcome could still be a drop, which would shift later
+    //    values forward). A head error never blocks: even one still awaiting its
+    //    source close is committed to the head call and deferred (below), letting
+    //    the values behind it flow on.
     while (this.#calls.length > 0 && this.#positions.length > 0) {
       const pos = this.#positions[0];
       if (pos.status === 'value') {
@@ -255,12 +277,18 @@ class FilterHelper {
         this.#liveCount--;
         this.#calls.shift().resolve({ value: pos.value, done: false });
       } else if (pos.status === 'error') {
-        // A predicate error whose source close has not yet settled is withheld:
-        // it blocks the head exactly like a pending position until released.
-        if (pos.heldForClose) break;
         this.#positions.shift();
         this.#liveCount--;
-        this.#calls.shift().reject(pos.error);
+        if (pos.heldForClose) {
+          // The source close this predicate error triggered has not settled yet.
+          // Unlike a pending position, a head error has a fixed recipient (it
+          // cannot be dropped onto an earlier call), so commit it to the head call
+          // and defer the rejection until the close settles — without blocking the
+          // values behind it, which keep flowing to the later calls below.
+          this.#deferredError = { call: this.#calls.shift(), error: pos.error };
+        } else {
+          this.#calls.shift().reject(pos.error);
+        }
       } else if (pos.status === 'dropped') {
         this.#positions.shift(); // a tombstone exposed mid-loop
       } else {

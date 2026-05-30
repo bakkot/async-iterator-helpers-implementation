@@ -60,15 +60,23 @@ earlier one (see §4).
 ## 3. Drops and replacement pulls
 
 A drop (a value rejected by `pred`) is removed from the queue entirely and is
-never delivered. Because an outstanding call still needs a value, the result —
-**if it is still live** — immediately issues a **replacement** `it.next()` pull to
-take the dropped position's place. The replacement value is then subject to `pred`
-like any other.
+never delivered; the queue **compacts** around it. Because an outstanding call
+still needs a value, the result — **if it is still live** — immediately issues a
+**replacement** `it.next()` pull. The replacement does *not* occupy the dropped
+position's slot: it is a fresh pull appended at the **back** of the queue (it is,
+after all, the most recent pull), and its value is subject to `pred` like any
+other.
 
 Surviving values continue to fill the outstanding calls in call order, regardless
-of which pull (original or replacement) produced them. A drop on its own — while
-the result is still live — never settles any call as done; another replacement
-pull could always still produce a value.
+of which pull (original or replacement) produced them. A consequence of compaction
+plus back-appending: an already-known value from a *later* pull is **not** held
+behind a freshly-issued replacement. As soon as the positions ahead of it resolve
+(or drop), it shifts forward to the earliest still-waiting call — exactly the
+forward-shift §2 describes when an earlier position turns out to be a drop. The
+replacement only ever serves a call that no surviving value reaches.
+
+A drop on its own — while the result is still live — never settles any call as
+done; another replacement pull could always still produce a value.
 
 ---
 
@@ -95,7 +103,10 @@ live positions.
 
 This is the only mechanism by which a later call settles before an earlier one,
 and it fires as a single step: one terminal event releases *all* the trailing
-calls that exceed the ceiling at once, not one per event.
+calls that exceed the ceiling at once, not one per event. When several are
+released together, they settle in **call order** (the earliest of the released
+trailing calls first), even though it is the most-recently-made calls being
+retired.
 
 While the result is still **live**, the ceiling is not used to settle anyone done:
 a replacement pull can always raise it again. The ceiling only governs behavior

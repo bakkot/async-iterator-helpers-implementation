@@ -53,20 +53,22 @@ async function test_basic_sequential() {
 }
 
 async function test_concurrent_order() {
-  // Two concurrent calls; the later position's value becomes known first but
-  // must still be delivered after the earlier call.
+  // Two concurrent calls. P0 drops, so the queue compacts and a replacement is
+  // pulled at the back. Survivors fill calls in call order regardless of which
+  // pull produced them: the first survivor (P1='B') goes to C0, and the
+  // replacement value ('A') goes to C1.
   const s = makeSource();
   const f = filter(s.it, async (x) => x !== 'drop');
   const p0 = f.next();        // pull 0
   const p1 = f.next();        // pull 1
   await tick();
-  s.value(0, 'drop');         // P0 drops -> replacement pull 2 (in P0's place)
+  s.value(0, 'drop');         // P0 drops -> removed; replacement pull 2 at back
   await tick();
-  s.value(1, 'B');            // P1's value becomes known first
+  s.value(1, 'B');            // first survivor
   await tick();
   s.value(2, 'A');            // replacement value
   const [r0, r1] = await Promise.all([p0, p1]);
-  ok(r0.value === 'A' && r1.value === 'B', 'concurrent_order', r0, r1);
+  ok(r0.value === 'B' && r1.value === 'A', 'concurrent_order', r0, r1);
 }
 
 async function test_done_ceiling_with_values() {
@@ -312,30 +314,30 @@ async function test_async_pred_drop_replacement() {
   ok(r0.value === 20, 'async_pred_drop_replacement', r0);
 }
 
-async function test_replacement_takes_dropped_slot() {
-  // The replacement pull is the newest pull chronologically but must occupy the
-  // dropped position's ORDERING slot, not the tail. So a later position's value
-  // (P2='C') known first cannot be delivered to C1 while the replacement of the
-  // dropped P1 is still pending — if that replacement also dropped, 'C' would
-  // belong to C1.
+async function test_drop_compacts_replacement_at_back() {
+  // A drop removes its position and the queue compacts; the replacement is a
+  // fresh pull at the BACK. So an already-known later survivor (P2='C') shifts
+  // forward to the earliest waiting call as soon as the positions ahead of it
+  // resolve — it does NOT wait behind the freshly-issued replacement.
   const s = makeSource();
   const f = filter(s.it, (x) => x !== 'drop');
   const p0 = f.next(), p1 = f.next(), p2 = f.next(); // pulls 0,1,2
   await tick();
   s.value(2, 'C');    // P2's value known first
   await tick();
-  s.value(1, 'drop'); // P1 drops -> replacement pull 3 inserted at slot 1
+  s.value(1, 'drop'); // P1 drops -> removed; replacement pull 3 at the back
   await tick();
-  s.value(0, 'A');    // P0 -> C0
-  // C1 must NOT have grabbed 'C' while the replacement is still pending.
-  let c1settled = false;
-  p1.then(() => { c1settled = true; });
-  await tick(); await tick();
-  ok(c1settled === false, 'replacement_takes_dropped_slot: C1 waits for replacement');
-  s.value(3, 'B');    // replacement kept
-  const [r0, r1, r2] = await Promise.all([p0, p1, p2]);
-  ok(r0.value === 'A' && r1.value === 'B' && r2.value === 'C',
-    'replacement_takes_dropped_slot: delivered in call order', r0, r1, r2);
+  s.value(0, 'A');    // P0 kept
+  // Surviving order is now P0='A', P2='C', P3(pending). C0<-A and C1<-C should
+  // both settle immediately; only C2 waits for the replacement.
+  let r0, r1;
+  await p0.then((v) => (r0 = v));
+  await p1.then((v) => (r1 = v));
+  ok(r0.value === 'A' && r1.value === 'C',
+    'drop_compacts: earlier survivors delivered in call order', r0, r1);
+  s.value(3, 'B');    // replacement kept -> C2
+  const r2 = await p2;
+  ok(r2.value === 'B', 'drop_compacts: replacement feeds the last call', r2);
 }
 
 for (const t of [
@@ -343,7 +345,7 @@ for (const t of [
   test_ceiling_lowers_on_drop_after_done,
   test_value_before_later_error,
   test_async_pred_drop_replacement,
-  test_replacement_takes_dropped_slot,
+  test_drop_compacts_replacement_at_back,
 ]) {
   await t();
 }

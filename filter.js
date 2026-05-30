@@ -90,21 +90,6 @@ class LinkedList {
     this.#size--;
   }
 
-  // Replace `node` with a fresh node holding `value`, in the same slot. Returns
-  // the new node. Size is unchanged.
-  replace(node, value) {
-    const fresh = new ListNode(value);
-    fresh.prev = node.prev;
-    fresh.next = node.next;
-    if (node.prev) node.prev.next = fresh;
-    else this.#head = fresh;
-    if (node.next) node.next.prev = fresh;
-    else this.#tail = fresh;
-    node.removed = true;
-    node.prev = node.next = null;
-    return fresh;
-  }
-
   // Remove `node` and every node after it.
   removeFrom(node) {
     if (node.removed) return;
@@ -251,15 +236,18 @@ class FilterHelper {
 
   #handleDrop(node) {
     if (node.removed) return;
-    if (this.#finished) {
-      // Cannot replace; the position is gone and the value ceiling in
-      // #process() will release a trailing call to done.
-      this.#positions.remove(node);
-    } else {
-      // Still live: replace the dropped position in place with a fresh pull.
-      const fresh = this.#positions.replace(node, makePosition());
-      this.#startPull(fresh);
+    // The dropped position is removed and the queue compacts: surviving values
+    // are delivered strictly in pull order, so an already-known later value
+    // shifts forward to the earliest waiting call.
+    this.#positions.remove(node);
+    if (!this.#finished) {
+      // Still live: the outstanding call still needs a value, so issue a fresh
+      // pull at the BACK of the queue. It does not take the dropped slot — its
+      // value is just another candidate, behind everything already pulled.
+      this.#startPull(this.#positions.pushTail(makePosition()));
     }
+    // If finished, the position is simply gone; the value ceiling in #process()
+    // will release a trailing call to done.
     this.#process();
   }
 
@@ -291,12 +279,18 @@ class FilterHelper {
       }
     }
 
-    // 2) Once finished, the value ceiling (#positions.size) releases trailing
-    //    (most-recently made) calls to done whenever outstanding calls exceed
-    //    deliverable positions.
+    // 2) Once finished, the value ceiling (#positions.size) releases the
+    //    trailing (most-recently made) calls that exceed it to done. They are
+    //    settled in call order, even though it is the latest calls being
+    //    retired.
     if (this.#finished) {
-      while (this.#calls.size > this.#positions.size) {
-        this.#calls.popTail().resolve({ value: undefined, done: true });
+      const surplus = this.#calls.size - this.#positions.size;
+      if (surplus > 0) {
+        const drained = [];
+        for (let i = 0; i < surplus; i++) drained.push(this.#calls.popTail());
+        for (let i = drained.length - 1; i >= 0; i--) {
+          drained[i].resolve({ value: undefined, done: true });
+        }
       }
     }
   }

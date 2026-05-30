@@ -1,6 +1,7 @@
 // Bounded-exhaustive differential test for the concurrent `filter`.
 //
-// Usage: `node test/filter-bounded-exhaustive.js [N]`   (default N = 5)
+// Usage: `node test/filter-bounded-exhaustive.js [N] [--fuzz count] [--seed s]`
+//                                                       (default N = 5)
 //
 // N bounds the total number of harness events in a schedule -- consumer
 // next()/return() calls plus underlying pull/predicate/return settlements.
@@ -8,7 +9,14 @@
 // operations unsettled), so the schedule space scales gently with N and N can
 // be raised incrementally. Underlying pulls are separately capped to bound the
 // sync-false replacement chains a single event can trigger.
+//
+// With `--fuzz count` the test runs `count` randomly-generated schedules at the
+// given N instead of enumerating exhaustively, which is how large N (where the
+// exhaustive space is infeasible) gets covered. See RandomChooser below for the
+// reachability guarantee. A failing fuzz case prints a `--replay` vector that
+// re-runs that exact schedule deterministically.
 
+import { parseArgs } from 'node:util';
 import { filter } from '../filter.js';
 
 // Adaptive microtask drain. A single action can trigger a synchronous cascade
@@ -81,6 +89,43 @@ class Chooser {
   choose(n) {
     if (this.i === this.decisions.length) this.frontierOptionCount = n;
     const idx = this.i < this.decisions.length ? this.decisions[this.i] : 0;
+    this.i++;
+    return idx;
+  }
+}
+
+// mulberry32: a tiny seedable PRNG, so a fuzz run is reproducible from its seed.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// The fuzzing counterpart to Chooser: instead of replaying a fixed decision
+// vector it picks a uniformly random option at each branch point. Because every
+// option at every choose(n) has positive probability, a fuzz run can reach
+// *exactly* the schedules enumerate() can -- there is no schedule the exhaustive
+// search produces that the fuzzer cannot. It does not hit them with equal
+// probability, though: per-decision uniform choice weights a schedule by the
+// product of 1/n over its branches, so short schedules (and the empty one, when
+// `stop` is among the first legal options) are oversampled relative to deep
+// ones. Equalizing would require weighting each choice by the leaf-count of its
+// subtree, which means knowing the whole tree -- the thing fuzzing exists to
+// avoid. It records its choices so a failing case can be replayed via Chooser.
+class RandomChooser {
+  constructor(rng) {
+    this.rng = rng;
+    this.i = 0;
+    this.decisions = [];
+    this.frontierOptionCount = null;
+  }
+  choose(n) {
+    const idx = Math.floor(this.rng() * n);
+    this.decisions.push(idx);
     this.i++;
     return idx;
   }
@@ -351,7 +396,7 @@ function runModel(maxEvents, chooser) {
     modelTrace.push(ev.slice());
   }
 
-  return { schedule, modelTrace, callResults, truncated, numDecisions: chooser.i, frontierOptionCount: chooser.frontierOptionCount };
+  return { schedule, modelTrace, callResults, truncated, numDecisions: chooser.i, frontierOptionCount: chooser.frontierOptionCount, decisions: chooser.decisions };
 }
 
 function* enumerate(maxEvents) {
@@ -613,58 +658,94 @@ function countSchedules(maxEvents) {
   }
 }
 
-async function main() {
-  const maxEvents = Number(process.argv[2] ?? 5);
-  setFlushChunk(Math.max(8, 2 * maxEvents));
-  if (process.env.COUNT) return countSchedules(maxEvents);
-  let scheduleCount = 0;
+// Run every check against one schedule, reporting the first failure. Returns
+// true on pass, false on failure (after printing the report). Shared by the
+// exhaustive, fuzz, and replay drivers so they all apply the identical oracle.
+async function checkSchedule(s, caseLabel) {
+  const { realTrace, invariantViolation } = await runReal(s.schedule);
+  const diff = compareTraces(s.modelTrace, realTrace);
+  if (diff) { reportTraceFailure(s, realTrace, diff, caseLabel); return false; }
+  if (invariantViolation) { reportInvariantFailure(s, invariantViolation, caseLabel); return false; }
+  // A truncated schedule leaves some next()/return() calls unsettled, so the
+  // sequential spec (which expects every call to resolve) does not apply; the
+  // exact-trace comparison above is still the oracle for these.
+  const prop = s.truncated ? null : checkSequentialProperty(s.schedule, s.callResults);
+  if (prop) { reportPropertyFailure(s, prop, caseLabel); return false; }
+  if (CHECK_PARTIAL_ORDER) {
+    const po = checkPartialOrder(realTrace);
+    if (po) { reportPartialOrderFailure(s, po, caseLabel); return false; }
+  }
+  return true;
+}
 
+async function runExhaustive(maxEvents) {
+  let scheduleCount = 0;
   for (const s of enumerate(maxEvents)) {
     scheduleCount++;
-    const { realTrace, invariantViolation } = await runReal(s.schedule);
-    const diff = compareTraces(s.modelTrace, realTrace);
-    if (diff) {
-      reportTraceFailure(s, realTrace, diff, scheduleCount);
+    if (!(await checkSchedule(s, scheduleCount))) {
       process.exitCode = 1;
       return;
-    }
-    if (invariantViolation) {
-      reportInvariantFailure(s, invariantViolation, scheduleCount);
-      process.exitCode = 1;
-      return;
-    }
-    // A truncated schedule leaves some next()/return() calls unsettled, so the
-    // sequential spec (which expects every call to resolve) does not apply; the
-    // exact-trace comparison above is still the oracle for these.
-    const prop = s.truncated ? null : checkSequentialProperty(s.schedule, s.callResults);
-    if (prop) {
-      reportPropertyFailure(s, prop, scheduleCount);
-      process.exitCode = 1;
-      return;
-    }
-    if (CHECK_PARTIAL_ORDER) {
-      const po = checkPartialOrder(realTrace);
-      if (po) {
-        reportPartialOrderFailure(s, po, scheduleCount);
-        process.exitCode = 1;
-        return;
-      }
     }
   }
-
   console.log('');
   console.log(`N = ${maxEvents} (max events)`);
   console.log(`schedules explored: ${scheduleCount}`);
   console.log('all schedules passed');
 }
 
+async function runFuzz(maxEvents, count, seedArg) {
+  // Per-case seeding (rather than one shared stream) so case i is reproducible
+  // independently of `count` and of the cases before it: a failing run prints
+  // its base seed, and re-running with that --seed regenerates the same cases.
+  const baseSeed = seedArg !== undefined ? (Number(seedArg) >>> 0) : (Math.floor(Math.random() * 2 ** 32) >>> 0);
+  console.log(`fuzzing N = ${maxEvents}; cases = ${count}; seed = ${baseSeed}`);
+  for (let i = 0; i < count; i++) {
+    const rng = mulberry32((baseSeed + Math.imul(i, 0x9e3779b9)) >>> 0);
+    const s = runModel(maxEvents, new RandomChooser(rng));
+    if (!(await checkSchedule(s, `fuzz #${i} (seed ${baseSeed})`))) {
+      console.log(`  replay with: node ${process.argv[1]} ${maxEvents} --replay '${JSON.stringify(s.decisions)}'`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+  console.log('');
+  console.log(`N = ${maxEvents} (max events)`);
+  console.log(`fuzz cases run: ${count} (seed ${baseSeed})`);
+  console.log('all fuzz cases passed');
+}
+
+async function runReplay(maxEvents, decisions) {
+  const s = runModel(maxEvents, new Chooser(decisions));
+  console.log('replaying decisions: ' + JSON.stringify(decisions));
+  console.log('schedule: ' + describeSchedule(s));
+  if (await checkSchedule(s, 'replay')) console.log('replay passed (no mismatch)');
+  else process.exitCode = 1;
+}
+
+async function main() {
+  const { values, positionals } = parseArgs({
+    allowPositionals: true,
+    options: {
+      fuzz: { type: 'string' },   // number of random cases to run
+      seed: { type: 'string' },   // base PRNG seed for --fuzz (default: random)
+      replay: { type: 'string' }, // JSON decision vector printed by a fuzz failure
+    },
+  });
+  const maxEvents = Number(positionals[0] ?? 5);
+  setFlushChunk(Math.max(8, 2 * maxEvents));
+  if (process.env.COUNT) return countSchedules(maxEvents);
+  if (values.replay !== undefined) return runReplay(maxEvents, JSON.parse(values.replay));
+  if (values.fuzz !== undefined) return runFuzz(maxEvents, Number(values.fuzz), values.seed);
+  return runExhaustive(maxEvents);
+}
+
 function describeSchedule(s) {
   return s.schedule.actions.map(actionLabel).join('  ');
 }
 
-function reportTraceFailure(s, realTrace, diff, scheduleCount) {
+function reportTraceFailure(s, realTrace, diff, caseLabel) {
   console.log('TRACE MISMATCH');
-  console.log(`  after schedules explored: ${scheduleCount}`);
+  console.log(`  case: ${caseLabel}`);
   console.log('  schedule: ' + describeSchedule(s));
   console.log('  pullShapes:   ' + JSON.stringify(s.schedule.pullShapes));
   console.log('  predShapes:   ' + JSON.stringify(s.schedule.predShapes));
@@ -679,25 +760,25 @@ function reportTraceFailure(s, realTrace, diff, scheduleCount) {
   console.log('');
 }
 
-function reportInvariantFailure(s, violation, scheduleCount) {
+function reportInvariantFailure(s, violation, caseLabel) {
   console.log('INVARIANT VIOLATION');
-  console.log(`  after schedules explored: ${scheduleCount}`);
+  console.log(`  case: ${caseLabel}`);
   console.log('  schedule: ' + describeSchedule(s));
   console.log('  ' + violation);
   console.log('');
 }
 
-function reportPropertyFailure(s, prop, scheduleCount) {
+function reportPropertyFailure(s, prop, caseLabel) {
   console.log('PROPERTY VIOLATION (oracle disagrees with sequential spec)');
-  console.log(`  after schedules explored: ${scheduleCount}`);
+  console.log(`  case: ${caseLabel}`);
   console.log('  schedule: ' + describeSchedule(s));
   console.log(`  call #${prop.callId}: expected ${prop.expectedRhs}, oracle gave ${prop.actualRhs}`);
   console.log('');
 }
 
-function reportPartialOrderFailure(s, po, scheduleCount) {
+function reportPartialOrderFailure(s, po, caseLabel) {
   console.log('PARTIAL-ORDER VIOLATION (real trace breaks a happens-before premise)');
-  console.log(`  after schedules explored: ${scheduleCount}`);
+  console.log(`  case: ${caseLabel}`);
   console.log('  schedule: ' + describeSchedule(s));
   if (po.kind === 'pred-before-pull') {
     console.log(`  "${po.label}" (index ${po.at}) precedes its pull "${po.dep}" (index ${po.depAt})`);

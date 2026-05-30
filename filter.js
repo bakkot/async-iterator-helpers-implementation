@@ -52,12 +52,11 @@ class FilterHelper {
   #liveCount = 0;
 
   // True once a terminal event has occurred (source done, source error,
-  // predicate error, or return()). No further source pulls are issued.
+  // predicate error, or return()). No further source pulls are issued. This is
+  // the whole lifecycle: while not finished the source is necessarily live, and
+  // every terminal transition flips it true in the same synchronous step, so
+  // there is no separate "finished but source still live" state to track.
   #finished = false;
-
-  // True while the source has neither completed (done/error) nor been closed by
-  // us via it.return(). Guards the "close exactly once, only while live" rule.
-  #sourceLive = true;
 
   constructor(it, pred) {
     this.#it = it;
@@ -66,13 +65,13 @@ class FilterHelper {
 
   // ---- source closing ---------------------------------------------------
 
-  // Close the source via it.return(), but only the first time and only while the
-  // source is still live (never after a source done/error, or a prior close).
-  // Returns the raw result of it.return() (a value or promise) so a caller can
-  // await it, or undefined if no close happened. May throw synchronously.
+  // Close the source via it.return(), returning the raw result (a value or
+  // promise) so a caller can await it, or undefined if it.return is absent. May
+  // throw synchronously. The "close exactly once, only while live" rule is
+  // enforced by the callers: this only runs on the single live -> finished
+  // transition (return() guards on #finished; a predicate error guards on
+  // wasLive), so it is never reached after a source done/error or a prior close.
   #closeSource() {
-    if (!this.#sourceLive) return undefined;
-    this.#sourceLive = false;
     if (typeof this.#it.return !== 'function') return undefined;
     return this.#it.return();
   }
@@ -112,8 +111,7 @@ class FilterHelper {
       // Synchronous throw: a source error at this position.
       pos.status = 'error';
       pos.error = e;
-      this.#finished = true;
-      this.#sourceLive = false; // source faulted; never call it.return().
+      this.#finished = true; // source faulted; never call it.return().
       this.#process();
       return;
     }
@@ -138,8 +136,7 @@ class FilterHelper {
     // Source error: positional error, does not close the source.
     pos.status = 'error';
     pos.error = err;
-    this.#finished = true;
-    this.#sourceLive = false; // never call it.return() after a source error.
+    this.#finished = true; // never call it.return() after a source error.
     this.#process();
   }
 
@@ -176,9 +173,11 @@ class FilterHelper {
     if (pos.removed) return; // discarded
     pos.status = 'error';
     pos.error = err;
+    const wasLive = !this.#finished; // is this error the terminal event?
     this.#finished = true;
-    // A predicate error closes the source (fire-and-forget) if still live.
-    this.#closeSourceFireAndForget();
+    // A predicate error closes the source (fire-and-forget), but only if it is
+    // the terminal event — never after the source already ended on its own.
+    if (wasLive) this.#closeSourceFireAndForget();
     this.#process();
   }
 
@@ -217,8 +216,7 @@ class FilterHelper {
       // Tombstoned drops were already counted out of #liveCount.
       if (removed.status !== 'dropped') this.#liveCount--;
     } while (removed !== pos);
-    this.#finished = true;
-    this.#sourceLive = false; // a clean done does not close the source.
+    this.#finished = true; // a clean done does not close the source.
     this.#process();
   }
 
@@ -288,9 +286,10 @@ class FilterHelper {
     }
     this.#finished = true;
 
-    // Close the source before resolving. We are not yet finished, so the source
-    // is necessarily still live and #closeSource() will call it.return() exactly
-    // once. A synchronous throw from it.return() rejects this return() call.
+    // Close the source before resolving. We were not yet finished (guarded
+    // above), so the source is necessarily still live and this is the single
+    // live -> finished transition that closes it. A synchronous throw from
+    // it.return() rejects this return() call.
     let r;
     try {
       r = this.#closeSource();

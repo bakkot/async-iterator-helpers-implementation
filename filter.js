@@ -7,33 +7,135 @@
 //
 // Internal model (per the spec):
 //
-//   * We keep an ordered list of `#positions`, one per in-flight source pull, in
-//     pull order. Each position is `pending`, then resolves to a `value`, an
-//     `error`, or a `done` (the terminal wall). Drops are removed eagerly and,
-//     while live, replaced in place by a fresh pull.
-//   * We keep a FIFO of outstanding consumer `next()` calls (`#calls`).
-//   * While the result is live, #positions === #outstanding calls.
-//   * Delivery happens strictly at the head of `#positions`, in call order:
-//     a head `value` resolves the front call, a head `error` rejects it.
-//   * Once finished, the "value ceiling" releases trailing (most-recently made)
-//     calls to `{done:true}` whenever there are more outstanding calls than
-//     deliverable positions.
+//   * `#positions` is an ordered list of positions, one per in-flight source
+//     pull, in pull order. Each position is `pending`, then resolves to a
+//     `value` or an `error`. Drops are removed eagerly and, while live, replaced
+//     in place by a fresh pull. A source `done` is the terminal wall: its
+//     position and every later one are discarded.
+//   * `#calls` is a FIFO of outstanding consumer `next()` calls.
+//   * While the result is live, #positions and #calls have equal length and are
+//     aligned by index from the head.
+//   * Delivery happens strictly at the head of `#positions`, in call order: a
+//     head `value` resolves the front call, a head `error` rejects it.
+//   * `#positions` only ever holds still-deliverable positions, so its size is
+//     the "value ceiling" V. Once finished, the ceiling releases trailing
+//     (most-recently made) calls to `{done:true}` whenever there are more
+//     outstanding calls than positions.
+//
+// Both lists are intrusive doubly-linked lists so that every operation the
+// model needs — push/shift/pop at the ends, plus arbitrary remove, in-place
+// replace, and discard-to-end for positions — is O(1) (the done-wall discard is
+// O(number discarded)).
 
 function noop() {}
+
+class ListNode {
+  prev = null;
+  next = null;
+  removed = false;
+
+  constructor(value) {
+    this.value = value;
+  }
+}
+
+class LinkedList {
+  #head = null;
+  #tail = null;
+  #size = 0;
+
+  get size() {
+    return this.#size;
+  }
+
+  isEmpty() {
+    return this.#size === 0;
+  }
+
+  // Value at the head, or undefined if empty.
+  peekHead() {
+    return this.#head ? this.#head.value : undefined;
+  }
+
+  pushTail(value) {
+    const node = new ListNode(value);
+    node.prev = this.#tail;
+    if (this.#tail) this.#tail.next = node;
+    else this.#head = node;
+    this.#tail = node;
+    this.#size++;
+    return node;
+  }
+
+  shiftHead() {
+    const node = this.#head;
+    if (node) this.remove(node);
+    return node ? node.value : undefined;
+  }
+
+  popTail() {
+    const node = this.#tail;
+    if (node) this.remove(node);
+    return node ? node.value : undefined;
+  }
+
+  remove(node) {
+    if (node.removed) return;
+    node.removed = true;
+    if (node.prev) node.prev.next = node.next;
+    else this.#head = node.next;
+    if (node.next) node.next.prev = node.prev;
+    else this.#tail = node.prev;
+    node.prev = node.next = null;
+    this.#size--;
+  }
+
+  // Replace `node` with a fresh node holding `value`, in the same slot. Returns
+  // the new node. Size is unchanged.
+  replace(node, value) {
+    const fresh = new ListNode(value);
+    fresh.prev = node.prev;
+    fresh.next = node.next;
+    if (node.prev) node.prev.next = fresh;
+    else this.#head = fresh;
+    if (node.next) node.next.prev = fresh;
+    else this.#tail = fresh;
+    node.removed = true;
+    node.prev = node.next = null;
+    return fresh;
+  }
+
+  // Remove `node` and every node after it.
+  removeFrom(node) {
+    if (node.removed) return;
+    const before = node.prev;
+    let cur = node;
+    while (cur) {
+      cur.removed = true;
+      const next = cur.next;
+      cur.prev = cur.next = null;
+      this.#size--;
+      cur = next;
+    }
+    if (before) before.next = null;
+    else this.#head = null;
+    this.#tail = before;
+  }
+}
 
 class FilterHelper {
   // The source async iterator and the predicate.
   #it;
   #pred;
 
-  // Ordered list of positions, in pull order.
-  //   pos = { status: 'pending'|'value'|'error'|'done', value, error, valid }
-  // `valid` becomes false when a position is discarded (after a done wall) or
-  // removed (drop); late settlements for such positions are ignored.
-  #positions = [];
+  // Positions in pull order. Each value is a record { status, value, error }
+  // with status one of 'pending' | 'value' | 'error'. The list holds only
+  // still-deliverable positions, so #positions.size is the value ceiling.
+  #positions = new LinkedList();
 
-  // FIFO of outstanding consumer next() calls: { resolve, reject }.
-  #calls = [];
+  // Outstanding consumer next() calls in call order; each value is
+  // { resolve, reject }.
+  #calls = new LinkedList();
 
   // True once a terminal event has occurred (source done, source error,
   // predicate error, or return()). No further source pulls are issued.
@@ -69,51 +171,42 @@ class FilterHelper {
 
   // ---- pulling ----------------------------------------------------------
 
-  // Issue a single source pull, inserting its position at `index`. Returns the
-  // new position. A synchronous throw from it.next() is a source error at that
-  // position. Callers must run #process() afterward.
-  #issuePull(index) {
-    const pos = {
-      status: 'pending',
-      value: undefined,
-      error: undefined,
-      valid: true,
-    };
-    this.#positions.splice(index, 0, pos);
-
+  // Drive a source pull for an already-inserted position node. A synchronous
+  // throw from it.next() is a source error at that position. Callers run
+  // #process() afterward.
+  #startPull(node) {
     let result;
     try {
       result = this.#it.next();
     } catch (e) {
       // Synchronous throw: a source error at this position.
-      pos.status = 'error';
-      pos.error = e;
+      node.value.status = 'error';
+      node.value.error = e;
       this.#finished = true;
       this.#sourceLive = false; // source faulted; never call it.return().
-      return pos;
+      return;
     }
 
     Promise.resolve(result).then(
-      (r) => this.#settlePull(pos, r),
-      (e) => this.#rejectPull(pos, e)
+      (r) => this.#settlePull(node, r),
+      (e) => this.#rejectPull(node, e)
     );
-    return pos;
   }
 
-  #settlePull(pos, result) {
-    if (!pos.valid) return; // discarded
+  #settlePull(node, result) {
+    if (node.removed) return; // discarded
     if (result && result.done) {
-      this.#handleDone(pos);
+      this.#handleDone(node);
     } else {
-      this.#invokePred(pos, result ? result.value : undefined);
+      this.#invokePred(node, result ? result.value : undefined);
     }
   }
 
-  #rejectPull(pos, err) {
-    if (!pos.valid) return; // discarded
+  #rejectPull(node, err) {
+    if (node.removed) return; // discarded
     // Source error: positional error, does not close the source.
-    pos.status = 'error';
-    pos.error = err;
+    node.value.status = 'error';
+    node.value.error = err;
     this.#finished = true;
     this.#sourceLive = false; // never call it.return() after a source error.
     this.#process();
@@ -121,33 +214,33 @@ class FilterHelper {
 
   // ---- predicate --------------------------------------------------------
 
-  #invokePred(pos, value) {
-    pos.value = value;
+  #invokePred(node, value) {
+    node.value.value = value;
     let res;
     try {
       res = this.#pred(value);
     } catch (e) {
-      this.#predErrored(pos, e);
+      this.#predErrored(node, e);
       return;
     }
     Promise.resolve(res).then(
       (keep) => {
-        if (!pos.valid) return;
+        if (node.removed) return;
         if (keep) {
-          pos.status = 'value';
+          node.value.status = 'value';
           this.#process();
         } else {
-          this.#handleDrop(pos);
+          this.#handleDrop(node);
         }
       },
-      (e) => this.#predErrored(pos, e)
+      (e) => this.#predErrored(node, e)
     );
   }
 
-  #predErrored(pos, err) {
-    if (!pos.valid) return; // discarded
-    pos.status = 'error';
-    pos.error = err;
+  #predErrored(node, err) {
+    if (node.removed) return; // discarded
+    node.value.status = 'error';
+    node.value.error = err;
     this.#finished = true;
     // A predicate error closes the source (fire-and-forget) if still live.
     this.#closeSourceFireAndForget();
@@ -156,32 +249,25 @@ class FilterHelper {
 
   // ---- drops and done ---------------------------------------------------
 
-  #handleDrop(pos) {
-    if (!pos.valid) return;
-    const idx = this.#positions.indexOf(pos);
-    if (idx < 0) return;
-    pos.valid = false;
-    this.#positions.splice(idx, 1);
-    if (!this.#finished) {
-      // Still live: replace the dropped position in place.
-      this.#issuePull(idx);
+  #handleDrop(node) {
+    if (node.removed) return;
+    if (this.#finished) {
+      // Cannot replace; the position is gone and the value ceiling in
+      // #process() will release a trailing call to done.
+      this.#positions.remove(node);
+    } else {
+      // Still live: replace the dropped position in place with a fresh pull.
+      const fresh = this.#positions.replace(node, makePosition());
+      this.#startPull(fresh);
     }
-    // If finished, the position is simply gone; the value ceiling in #process()
-    // will release a trailing call to done.
     this.#process();
   }
 
-  #handleDone(pos) {
-    if (!pos.valid) return;
-    const idx = this.#positions.indexOf(pos);
-    if (idx < 0) return;
-    // This done is the terminal wall. Discard every later position (overriding
-    // any later error or later done), keeping this position as the wall.
-    for (let i = idx + 1; i < this.#positions.length; i++) {
-      this.#positions[i].valid = false;
-    }
-    this.#positions.length = idx + 1;
-    pos.status = 'done';
+  #handleDone(node) {
+    if (node.removed) return;
+    // This done is the terminal wall: discard its position and every later one
+    // (overriding any later error or later done).
+    this.#positions.removeFrom(node);
     this.#finished = true;
     this.#sourceLive = false; // a clean done does not close the source.
     this.#process();
@@ -189,44 +275,28 @@ class FilterHelper {
 
   // ---- delivery ---------------------------------------------------------
 
-  // Number of still-deliverable positions (everything before the terminal
-  // wall): pending, value, or error. The done wall is not counted.
-  #deliverableCount() {
-    let v = 0;
-    for (let i = 0; i < this.#positions.length; i++) {
-      const s = this.#positions[i].status;
-      if (s === 'pending' || s === 'value' || s === 'error') v++;
-    }
-    return v;
-  }
-
   #process() {
-    // 1) Deliver from the head, in order: values and errors only. A pending
-    //    head blocks everything behind it.
-    while (this.#calls.length > 0 && this.#positions.length > 0) {
-      const pos = this.#positions[0];
+    // 1) Deliver from the head, in order. A pending head blocks everything
+    //    behind it.
+    while (!this.#calls.isEmpty() && !this.#positions.isEmpty()) {
+      const pos = this.#positions.peekHead();
       if (pos.status === 'value') {
-        this.#positions.shift();
-        const call = this.#calls.shift();
-        call.resolve({ value: pos.value, done: false });
+        this.#positions.shiftHead();
+        this.#calls.shiftHead().resolve({ value: pos.value, done: false });
       } else if (pos.status === 'error') {
-        this.#positions.shift();
-        const call = this.#calls.shift();
-        call.reject(pos.error);
+        this.#positions.shiftHead();
+        this.#calls.shiftHead().reject(pos.error);
       } else {
-        // pending or the done wall: stop.
-        break;
+        break; // pending
       }
     }
 
-    // 2) Once finished, the value ceiling releases trailing (most-recently
-    //    made) calls to done whenever outstanding calls exceed deliverable
-    //    positions.
+    // 2) Once finished, the value ceiling (#positions.size) releases trailing
+    //    (most-recently made) calls to done whenever outstanding calls exceed
+    //    deliverable positions.
     if (this.#finished) {
-      const v = this.#deliverableCount();
-      while (this.#calls.length > v) {
-        const call = this.#calls.pop();
-        call.resolve({ value: undefined, done: true });
+      while (this.#calls.size > this.#positions.size) {
+        this.#calls.popTail().resolve({ value: undefined, done: true });
       }
     }
   }
@@ -242,8 +312,8 @@ class FilterHelper {
       resolve = res;
       reject = rej;
     });
-    this.#calls.push({ resolve, reject });
-    this.#issuePull(this.#positions.length); // one pull per next(), at the tail.
+    this.#calls.pushTail({ resolve, reject });
+    this.#startPull(this.#positions.pushTail(makePosition())); // one pull per next().
     this.#process();
     return p;
   }
@@ -277,6 +347,10 @@ class FilterHelper {
   [Symbol.asyncIterator]() {
     return this;
   }
+}
+
+function makePosition() {
+  return { status: 'pending', value: undefined, error: undefined };
 }
 
 export default function filter(it, pred) {

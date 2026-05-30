@@ -1,6 +1,6 @@
 import { filter } from "../filter.js";
 
-const MAX_EVENT_COUNT = 5;
+const MAX_EVENT_COUNT = 7;
 
 const PREDICATE_OUTCOMES = ["pending", "true", "false", "throw"];
 const SOURCE_OUTCOMES = ["pending", "done", "throw", "value"];

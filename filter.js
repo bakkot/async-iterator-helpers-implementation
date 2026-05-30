@@ -37,13 +37,24 @@ class FilterHelper {
   #it;
   #pred;
 
-  // Positions in pull order (see the model comment above). Each entry is a
-  // record { status, value, error, removed, closeState }. For a predicate-error
-  // position whose it.return() close must settle before the error is surfaced,
-  // `closeState` tracks that wait: 'ready' (no wait — no close, or it has already
-  // settled), 'awaiting' (close pending, error not yet at the head), or a rejector
-  // function (close pending, error already committed to its call at the head). See
-  // #predErrored.
+  // Positions in pull order (see the model comment above). Each entry is one of:
+  //
+  //   type Position =
+  //     | { status: 'pending'; removed: boolean }
+  //     | { status: 'value';   removed: boolean; value: unknown }
+  //     | { status: 'dropped'; removed: boolean }
+  //     | { status: 'error';   removed: boolean; error: unknown; closeState: CloseState }
+  //
+  // `removed` marks a position discarded by a terminal `done` wall, so a late pull
+  // settlement for it is ignored. For a predicate-error position, the it.return()
+  // close must settle before the error is surfaced; `closeState` tracks that wait:
+  //
+  //   type CloseState =
+  //     | 'ready'      // no wait: no close, or the close has already settled
+  //     | 'awaiting'   // close pending, error not yet at the head of the queue
+  //     | ((e: Error) => void) // close pending, error committed to its call — invoke to reject it
+  //
+  // See #predErrored.
   #positions = [];
 
   // Outstanding consumer next() calls in call order; each entry is

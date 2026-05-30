@@ -826,6 +826,54 @@ tests.push(['filter: synchronous predicate throw closes the underlying iterator'
   t.expectLog('subsequent next() is done', ['r1 resolved {"done":true}']);
 }]);
 
+// When a predicate error closes the source via it.return(), the rejection must
+// not be surfaced to the consumer until that it.return() result settles. Per the
+// async-iteration model, closing the source is part of finishing, and it has to
+// complete before the error is observed — even though the close result itself is
+// swallowed. This is the simplest case: a single pull, no concurrency. The
+// controlled helpers settle .return() synchronously, so we hand-roll a source
+// whose .return() returns a promise the test settles on demand.
+tests.push(['filter: predicate error waits for it.return() to settle before rejecting', async function (t) {
+  let nextId = 0;
+  const pulls = [];
+  const returnDeferred = Promise.withResolvers();
+  const source = {
+    next() {
+      const i = nextId++;
+      t.log(`src.next() #${i}`);
+      const d = Promise.withResolvers();
+      pulls[i] = d;
+      return d.promise;
+    },
+    return() {
+      t.log('src.return() #0');
+      return returnDeferred.promise; // deliberately not settled yet
+    },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  const f = filter(source, () => { throw new Error('boom'); });
+
+  const r0 = f.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls', ['src.next() #0']);
+
+  pulls[0].resolve({ value: 1, done: false });
+  await flushMicrotasks();
+  // The predicate throws, so the source is closed — but because it.return() has
+  // not settled, the rejection is withheld. Only src.return() shows up here.
+  t.expectLog('predicate error closes the source but withholds the rejection', [
+    'src.return() #0',
+  ]);
+
+  // Now let it.return() settle; the rejection is finally surfaced.
+  returnDeferred.resolve({ value: undefined, done: true });
+  await flushMicrotasks();
+  t.expectLog('rejection surfaces only after it.return() settles', [
+    'r0 rejected boom',
+  ]);
+}]);
+
 // Regression for the microtask ordering of a *synchronous* predicate throw.
 // When a drop both unblocks a buffered value and issues a replacement pull, and
 // that replacement's value makes the predicate throw synchronously, the throw

@@ -201,12 +201,16 @@ class FilterHelper {
 
   #invokePred(node, value) {
     node.value.value = value;
+    // The predicate is *called* synchronously (so the call is observed in pull
+    // order), but its outcome is always handled one microtask hop later. A
+    // synchronous throw is funneled through a rejected promise so it takes the
+    // exact same deferred path as an asynchronous rejection — the source close
+    // it triggers then lands after any delivery this same step unblocked.
     let res;
     try {
       res = this.#pred(value);
     } catch (e) {
-      this.#predErrored(node, e);
-      return;
+      res = Promise.reject(e);
     }
     Promise.resolve(res).then(
       (keep) => {

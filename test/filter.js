@@ -826,6 +826,65 @@ tests.push(['filter: synchronous predicate throw closes the underlying iterator'
   t.expectLog('subsequent next() is done', ['r1 resolved {"done":true}']);
 }]);
 
+// Regression for the microtask ordering of a *synchronous* predicate throw.
+// When a drop both unblocks a buffered value and issues a replacement pull, and
+// that replacement's value makes the predicate throw synchronously, the throw
+// must be handled one hop later — exactly like an async rejection — not inline.
+// Otherwise the source close (and the rejection it leads to) jumps ahead of the
+// value the same step unblocked. This needs a synchronous source cascade, so it
+// uses a hand-rolled sync source/predicate rather than the controlled helpers:
+// pull #0 is async (so a later value can buffer behind it) while pulls #1/#2
+// return synchronously, and the predicate throws synchronously on 'B'.
+tests.push(['filter: a synchronous predicate throw on a replacement defers its close behind an unblocked value', async function (t) {
+  let nextId = 0, retId = 0;
+  const pending = [];
+  const source = {
+    next() {
+      const i = nextId++;
+      t.log(`src.next() #${i}`);
+      if (i === 0) { const d = Promise.withResolvers(); pending[i] = d; return d.promise; }
+      if (i === 1) return { value: 'A', done: false };
+      if (i === 2) return { value: 'B', done: false };
+      return { value: undefined, done: true };
+    },
+    return() { t.log(`src.return() #${retId++}`); return Promise.resolve({ value: undefined, done: true }); },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  const pred = (x) => {
+    t.log(`pred(${x})`);
+    if (x === 'B') throw new Error('boom'); // synchronous throw on the replacement value
+    return x === 'A';                       // 'A' passes; pull #0's value is dropped
+  };
+  const f = filter(source, pred);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  // Pull #0 stays pending; pull #1 synchronously yields 'A', which passes and is
+  // buffered behind the still-pending head.
+  t.expectLog('the second value is buffered behind the pending first pull', [
+    'src.next() #0',
+    'src.next() #1',
+    'pred(A)',
+  ]);
+
+  // Pull #0 resolves with a value the predicate drops. That frees the buffered
+  // 'A' for r0 and issues replacement pull #2, whose 'B' throws synchronously.
+  // The throw is deferred, so 'A' reaches r0 before the close and the rejection.
+  pending[0].resolve({ value: 'drop', done: false });
+  await flushMicrotasks();
+  t.expectLog('unblocked value delivered before the deferred predicate-error close', [
+    'pred(drop)',
+    'src.next() #2',
+    'pred(B)',
+    'r0 resolved {"value":"A","done":false}',
+    'src.return() #0',
+    'r1 rejected boom',
+  ]);
+}]);
+
 // A predicate error is treated exactly like resolving `true` — the erroring
 // value still occupies its position — except that position *rejects*, the
 // source is closed, and *future* next() calls get done. Crucially it does NOT

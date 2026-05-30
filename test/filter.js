@@ -874,6 +874,120 @@ tests.push(['filter: predicate error waits for it.return() to settle before reje
   ]);
 }]);
 
+// Withholding the predicate-error rejection until it.return() settles must not
+// hold up the *other* calls. Once the error reaches the head of the queue its
+// recipient is fixed (a head error cannot be dropped, so it cannot shift onto an
+// earlier call), so the values behind it can be delivered to the later calls right
+// away, without waiting for the pending close. Here pull #2's value is kept behind
+// the still-pending head, pull #1's predicate errors (closing the source via a
+// pending it.return()), and pull #0 is then dropped: that exposes the error at the
+// head, so pull #2's value flows to r1 and the now-surplus r2 settles done — both
+// while it.return() is still pending. Only r0, the error's recipient, waits.
+tests.push(['filter: a predicate-error close does not block later calls behind the held error', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  const r2 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three concurrent pulls', ['src.next() #0', 'src.next() #1', 'src.next() #2']);
+
+  // Pull #2 yields; its predicate passes -> a kept value buffered behind the
+  // still-pending earlier positions.
+  src.yield(2, 30);
+  await flushMicrotasks();
+  t.expectLog('the third value runs the predicate', ['pred(30) #0']);
+
+  pred.resolve(0, true);
+  await flushMicrotasks();
+  t.expectLog('the kept value is buffered behind the pending head', []);
+
+  // Pull #1 yields; its predicate errors, closing the source via a pending
+  // it.return(). The error sits behind the still-pending pull #0, so nothing
+  // settles yet — in particular r2 is not done, because pull #0 could still be a
+  // value that would feed it.
+  src.holdReturn();
+  src.yield(1, 20);
+  await flushMicrotasks();
+  t.expectLog('the second value runs the predicate', ['pred(20) #1']);
+
+  pred.reject(1, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the predicate error closes the source; nothing settles yet', ['src.return() #0']);
+
+  // Pull #0 yields and is dropped, exposing the error at the head. Its recipient
+  // (r0) is now fixed and it cannot be dropped, so pull #2's value flows to r1 and
+  // the now-surplus r2 settles done — without waiting for the pending it.return().
+  src.yield(0, 10);
+  await flushMicrotasks();
+  t.expectLog('the first value runs the predicate', ['pred(10) #2']);
+
+  pred.resolve(2, false);
+  await flushMicrotasks();
+  t.expectLog('the value behind the error is delivered and the surplus call is done', [
+    'r1 resolved {"value":30,"done":false}',
+    'r2 resolved {"done":true}',
+  ]);
+
+  // Only when it.return() settles does the error finally surface to r0.
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('the held error surfaces once the close settles', ['r0 rejected boom']);
+}]);
+
+// The same effect when the erroring value is already at the head of the queue
+// when its predicate errors. A value buffered behind it (pull #1's, kept) is
+// delivered to r1 the moment the head predicate errors and closes the source,
+// without waiting for the pending it.return(); only r0 — the error's recipient —
+// waits for the close.
+tests.push(['filter: a head predicate-error close delivers the value behind it immediately', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  // Pull #1 yields; its predicate passes -> a kept value buffered behind the
+  // still-pending head (pull #0).
+  src.yield(1, 20);
+  await flushMicrotasks();
+  t.expectLog('the second value runs the predicate', ['pred(20) #0']);
+
+  pred.resolve(0, true);
+  await flushMicrotasks();
+  t.expectLog('the kept value is buffered behind the pending head', []);
+
+  // Pull #0 yields; its predicate errors at the head of the queue, closing the
+  // source via a pending it.return(). The error's recipient (r0) is fixed, so the
+  // value behind it is delivered to r1 immediately — not blocked on the close.
+  src.holdReturn();
+  src.yield(0, 10);
+  await flushMicrotasks();
+  t.expectLog('the head value runs the predicate', ['pred(10) #1']);
+
+  pred.reject(1, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the close is called and the value behind the error is delivered', [
+    'src.return() #0',
+    'r1 resolved {"value":20,"done":false}',
+  ]);
+
+  // Only when it.return() settles does the error surface to r0.
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('the held error surfaces once the close settles', ['r0 rejected boom']);
+}]);
+
 // Regression for the microtask ordering of a *synchronous* predicate throw.
 // When a drop both unblocks a buffered value and issues a replacement pull, and
 // that replacement's value makes the predicate throw synchronously, the throw

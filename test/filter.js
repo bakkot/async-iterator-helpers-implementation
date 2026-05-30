@@ -988,6 +988,134 @@ tests.push(['filter: a head predicate-error close delivers the value behind it i
   t.expectLog('the held error surfaces once the close settles', ['r0 rejected boom']);
 }]);
 
+// A late `done` must not act as a terminal wall. Once the result is already
+// finished (a terminal event has happened), a `done` arriving from a still-in-flight
+// earlier pull is not a new wall that discards later positions — it just empties its
+// own slot, like a drop. The three tests below cover the three terminal events.
+
+// Predicate error: it closes the source via it.return(), and *this* upstream reacts
+// to return() by settling the still-outstanding earlier pull #0 with { done: true }.
+// That done arrives after the predicate error has already finished the result, so it
+// must NOT discard the erroring position — otherwise the error is swallowed and the
+// consumer never learns the predicate threw. Instead it empties pull #0's slot: the
+// error compacts forward to r0 and r1 drains to done. (The error still waits for
+// it.return() to settle, so r1's done is observed first.)
+tests.push(['filter: a return()-triggered upstream done surfaces the predicate error, not swallows it', async function (t) {
+  // Hand-rolled so return() can settle the outstanding pull #0 with done.
+  let nextId = 0;
+  const pulls = [];
+  const src = {
+    next() {
+      const i = nextId++;
+      t.log(`src.next() #${i}`);
+      const d = Promise.withResolvers();
+      pulls[i] = d;
+      return d.promise;
+    },
+    return() {
+      t.log('src.return() #0');
+      // The upstream treats return() as a cue to finish the outstanding pull #0.
+      pulls[0].resolve({ value: undefined, done: true });
+      return Promise.resolve({ value: undefined, done: true });
+    },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  // Pull #1 yields; pull #0 is still pending.
+  pulls[1].resolve({ value: 2, done: false });
+  await flushMicrotasks();
+  t.expectLog('the second value runs the predicate', ['pred(2) #0']);
+
+  // The predicate throws. it.return() settles pull #0 with done, but that late done
+  // must not bury the error: r1 drains done, then r0 gets the error once the close
+  // settles.
+  pred.reject(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the late done empties pull #0; the error still reaches r0', [
+    'src.return() #0',
+    'r1 resolved {"done":true}',
+    'r0 rejected boom',
+  ]);
+}]);
+
+// Source error: the later pull rejects (a source error, which does NOT close the
+// source); then the still-pending earlier pull #0 resolves done. That late done must
+// not discard the error — it just empties pull #0, so the error compacts forward to
+// r0 and r1 drains to done.
+tests.push(['filter: a late source done after a source error still surfaces the error', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  // Source error at the later pull; it sits behind the still-pending pull #0.
+  src.throw(1, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the source error waits behind the pending head', []);
+
+  // The earlier pull then resolves done. This late done must not bury the error.
+  src.finish(0);
+  await flushMicrotasks();
+  t.expectLog('the late done empties pull #0; the error reaches r0', [
+    'r0 rejected boom',
+    'r1 resolved {"done":true}',
+  ]);
+}]);
+
+// return(): the buried outcome here is a *value*. After return() closes the source,
+// pull #1 yields a value that passes; the still-pending earlier pull #0 then resolves
+// done. That late done must not discard pull #1's value — return() does not cancel
+// already-requested values — so the value compacts forward to r0 and r1 drains done.
+tests.push(['filter: a late source done after return() does not lose an already-requested value', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  const ret = f.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes the source', ['src.return() #0', 'ret resolved {"done":true}']);
+
+  // Pull #1 yields a passing value, buffered behind the still-pending pull #0.
+  src.yield(1, 20);
+  await flushMicrotasks();
+  t.expectLog('the second value runs the predicate', ['pred(20) #0']);
+
+  pred.resolve(0, true);
+  await flushMicrotasks();
+  t.expectLog('the value is buffered behind the pending head', []);
+
+  // The earlier pull resolves done. This late done must not discard pull #1's value.
+  src.finish(0);
+  await flushMicrotasks();
+  t.expectLog('the late done empties pull #0; the value reaches r0', [
+    'r0 resolved {"value":20,"done":false}',
+    'r1 resolved {"done":true}',
+  ]);
+}]);
+
 // Regression for the microtask ordering of a *synchronous* predicate throw.
 // When a drop both unblocks a buffered value and issues a replacement pull, and
 // that replacement's value makes the predicate throw synchronously, the throw

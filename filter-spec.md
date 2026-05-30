@@ -159,15 +159,27 @@ of the pull it came from (for a source error) or of the value it was evaluated o
 
 **Ordering with drops.** Like any position, an error waits its turn at the head of
 the queue: while an earlier position is still pending, the error cannot surface.
-If that earlier position then drops, the error **compacts forward** and rejects
-the now-earliest waiting call. So an earlier drop can shift an error onto an
-earlier call; and an error compacted to the head is observed *before* any trailing
-done that the same step produces.
+If that earlier position then drops, the error **compacts forward** to reject the
+now-earliest waiting call — an earlier drop can shift an error onto an earlier
+call. A source error, which involves no close, is then observed *before* any
+trailing done that the same drop step produces. A predicate error is additionally
+gated on its source close (below): the trailing done does not wait on the close,
+so if that `it.return()` has not yet settled the done is observed *first*, and the
+error follows once the close settles.
 
-**Closing the source.** A predicate error closes the source via `it.return()`
-(fire-and-forget; the rejection is not delayed by that return settling). A source
-error does **not** call `it.return()` — the source already faulted, and the result
-never calls `it.return()` after observing a source error.
+**Closing the source.** A predicate error closes the source via `it.return()`.
+Closing is part of finishing, so the rejection is **withheld until that
+`it.return()` result settles** — only then is the error surfaced to its call.
+(The close result itself, a value or a rejection, is discarded; it matters only as
+the signal that closing is complete. A missing `it.return()`, or one that throws or
+returns a non-thenable, settles synchronously, so the error is surfaced with no
+delay.) Only the erroring position waits this way: earlier positions still deliver
+their values, and trailing calls beyond the value ceiling (§4) still settle `done`,
+neither of them gated on the close.
+
+A source error does **not** call `it.return()` — the source already faulted, and
+the result never calls `it.return()` after observing a source error — so a source
+error is surfaced with no such delay.
 
 **A done overrides a later error.** A clean done discards every later position,
 including one that already errored (e.g. a pull that threw synchronously before
@@ -216,4 +228,5 @@ A `next()` call made after `return()` returns `{ done: true }`.
    ever left permanently unsettled.
 7. The source is closed via `it.return()` exactly once, and only by `return()` or
    a predicate error, and only while the source is still live — never after a
-   source done or a source error.
+   source done or a source error. A predicate error's rejection is surfaced only
+   after the `it.return()` it triggers has settled.

@@ -144,7 +144,9 @@ function runModel(maxEvents, chooser) {
 
   const pendingPulls = [];   // { id, node }
   const pendingPreds = [];   // { id, node, arg }
-  const pendingReturns = []; // explicit return() calls only
+  const pendingReturns = []; // pending it.return()s: explicit return() calls
+                             // ({id, callId}) and predicate-error closes
+                             // ({id, heldNode}), each settled by a settleReturn
 
   const schedule = {
     pullShapes: [],
@@ -201,6 +203,7 @@ function runModel(maxEvents, chooser) {
         nodes.shift();
         valueLimit--;
       } else if (node.status === 'error') {
+        if (node.heldForClose) break; // withheld until its source close settles
         rejectNext(consumers.shift(), node.error);
         nodes.shift();
         valueLimit--;
@@ -229,15 +232,21 @@ function runModel(maxEvents, chooser) {
 
   const canIssueReplacement = () => !done && nextPullId < maxPulls;
 
-  const closeForPredicateError = () => {
+  const closeForPredicateError = (node) => {
     done = true;
     terminalIndex = nextPullId - 1;
     const id = nextReturnId++;
     const shape = RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
     schedule.returnShapes[id] = shape;
     emitSync(evUReturn(id));
-    // filter's close is fire-and-forget; predicate rejection is not delayed by
-    // a pending underlying return().
+    // The error must not be surfaced until this it.return() settles. A sync
+    // close is already settled, so the error delivers immediately; a pending
+    // close holds the erroring node until a settleReturn releases it.
+    if (shape === 'pending') {
+      pendingReturns.push({ id, heldNode: node });
+      return true;
+    }
+    return false;
   };
 
   const failNode = (node, msg) => {
@@ -247,7 +256,7 @@ function runModel(maxEvents, chooser) {
   };
 
   const issuePull = () => {
-    const node = { status: 'pending', index: nextPullId, pullId: nextPullId };
+    const node = { status: 'pending', index: nextPullId, pullId: nextPullId, heldForClose: false };
     const pullId = nextPullId++;
     nodes.push(node);
     valueLimit++;
@@ -324,7 +333,11 @@ function runModel(maxEvents, chooser) {
       }
       if (done && consumers.length > valueLimit) settleDoneFrom(valueLimit);
     } else {
-      if (!done) closeForPredicateError();
+      // A predicate error is the terminal event while the source is still live,
+      // so it closes the source. The rejection must not be surfaced until that
+      // it.return() settles, so a pending close holds this node (see pump).
+      const held = !done && closeForPredicateError(node);
+      node.heldForClose = held;
       failNode(node, predError(arg));
     }
   }
@@ -391,7 +404,15 @@ function runModel(maxEvents, chooser) {
       const idx = pendingReturns.findIndex((r) => r.id === act.id);
       const r = pendingReturns[idx];
       pendingReturns.splice(idx, 1);
-      settleReturn(r.callId);
+      if (r.heldNode) {
+        // An internal predicate-error close settling: release the withheld
+        // error so it can finally reject its consumer.
+        r.heldNode.heldForClose = false;
+        pump();
+        if (done && consumers.length > valueLimit) settleDoneFrom(valueLimit);
+      } else {
+        settleReturn(r.callId);
+      }
     }
     modelTrace.push(ev.slice());
   }

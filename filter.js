@@ -32,15 +32,15 @@
 // of simultaneously-outstanding `next()` calls), so plain-array push/shift/pop
 // are the right primitives — no auxiliary list structure is needed.
 
-function noop() {}
-
 class FilterHelper {
   // The source async iterator and the predicate.
   #it;
   #pred;
 
   // Positions in pull order (see the model comment above). Each entry is a
-  // record { status, value, error, removed }.
+  // record { status, value, error, removed, heldForClose }. `heldForClose` is
+  // set on a predicate-error position whose delivery is withheld until the
+  // it.return() it triggered settles (see #predErrored).
   #positions = [];
 
   // Outstanding consumer next() calls in call order; each entry is
@@ -76,18 +76,25 @@ class FilterHelper {
     return this.#it.return();
   }
 
-  // Fire-and-forget close, used by a predicate error: the result's rejection
-  // must not wait on it.return() settling, and any throw/rejection from the
-  // close is swallowed.
-  #closeSourceFireAndForget() {
+  // Close the source for a predicate error, invoking `onClosed` once the
+  // it.return() result settles. Per the async-iteration model the error must
+  // not be surfaced to a consumer until that close completes, so the erroring
+  // position is withheld (see #predErrored) until this callback fires. The
+  // close result itself — a value or a rejection — is swallowed; we only care
+  // about *when* it settles. A missing it.return(), a synchronous throw, or a
+  // non-thenable result is already settled, so `onClosed` runs synchronously.
+  #closeSourceForError(onClosed) {
     let r;
     try {
       r = this.#closeSource();
     } catch {
-      return; // swallow a synchronous throw
+      onClosed(); // synchronous throw: already settled, swallow it
+      return;
     }
     if (r && typeof r.then === 'function') {
-      r.then(noop, noop); // swallow any rejection
+      r.then(onClosed, onClosed); // swallow value/rejection; release on settle
+    } else {
+      onClosed(); // no it.return() or a synchronous result: already settled
     }
   }
 
@@ -101,6 +108,7 @@ class FilterHelper {
       value: undefined,
       error: undefined,
       removed: false,
+      heldForClose: false,
     };
     this.#positions.push(pos);
     this.#liveCount++;
@@ -175,9 +183,18 @@ class FilterHelper {
     pos.error = err;
     const wasLive = !this.#finished; // is this error the terminal event?
     this.#finished = true;
-    // A predicate error closes the source (fire-and-forget), but only if it is
-    // the terminal event — never after the source already ended on its own.
-    if (wasLive) this.#closeSourceFireAndForget();
+    if (wasLive) {
+      // This error is the terminal event, so it closes the source. The error
+      // must not be surfaced to a consumer until that it.return() settles, so
+      // withhold this position's delivery (#process skips a held error) and
+      // release it once the close completes. If the source had already ended on
+      // its own (not wasLive) there is no close and nothing to wait for.
+      pos.heldForClose = true;
+      this.#closeSourceForError(() => {
+        pos.heldForClose = false;
+        this.#process();
+      });
+    }
     this.#process();
   }
 
@@ -238,6 +255,9 @@ class FilterHelper {
         this.#liveCount--;
         this.#calls.shift().resolve({ value: pos.value, done: false });
       } else if (pos.status === 'error') {
+        // A predicate error whose source close has not yet settled is withheld:
+        // it blocks the head exactly like a pending position until released.
+        if (pos.heldForClose) break;
         this.#positions.shift();
         this.#liveCount--;
         this.#calls.shift().reject(pos.error);

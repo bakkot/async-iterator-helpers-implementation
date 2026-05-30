@@ -7,120 +7,49 @@
 //
 // Internal model (per the spec):
 //
-//   * `#positions` is an ordered list of positions, one per in-flight source
-//     pull, in pull order. Each position is `pending`, then resolves to a
-//     `value` or an `error`. Drops are removed eagerly and, while live, replaced
-//     in place by a fresh pull. A source `done` is the terminal wall: its
-//     position and every later one are discarded.
-//   * `#calls` is a FIFO of outstanding consumer `next()` calls.
-//   * While the result is live, #positions and #calls have equal length and are
-//     aligned by index from the head.
-//   * Delivery happens strictly at the head of `#positions`, in call order: a
-//     head `value` resolves the front call, a head `error` rejects it.
-//   * `#positions` only ever holds still-deliverable positions, so its size is
-//     the "value ceiling" V. Once finished, the ceiling releases trailing
-//     (most-recently made) calls to `{done:true}` whenever there are more
-//     outstanding calls than positions.
+//   * `#positions` is a plain array used as a queue, one entry per in-flight
+//     source pull, in pull order. Each entry is a record `{ status, value,
+//     error, removed }` with status one of 'pending' | 'value' | 'error' |
+//     'dropped'. Delivery happens strictly at the head (index 0), in call order:
+//     a head `value` resolves the front call, a head `error` rejects it, a
+//     pending head blocks everything behind it.
+//   * A drop is recorded as a TOMBSTONE (status 'dropped') rather than removed
+//     in place; it lingers in the array until the head reaches it and is then
+//     shifted away. While live, a drop also issues a fresh replacement pull at
+//     the back of the queue.
+//   * A source `done` is the terminal wall: its position and every later one are
+//     discarded by popping from the back until the done record itself is popped.
+//   * `#calls` is a plain array used as a FIFO of outstanding consumer `next()`
+//     calls, in call order; each entry is `{ resolve, reject }`.
+//   * `#liveCount` is the number of still-deliverable positions (pending / value
+//     / error — neither tombstoned nor discarded). It is the "value ceiling" V:
+//     once finished, whenever there are more outstanding calls than that, the
+//     trailing (most-recently made) surplus calls are released to `{done:true}`.
+//     The raw array length is not the ceiling because it still includes
+//     not-yet-skipped tombstones, so V is tracked as a counter instead.
 //
-// Both lists are intrusive doubly-linked lists so that every operation the
-// model needs — push/shift/pop at the ends, plus arbitrary remove, in-place
-// replace, and discard-to-end for positions — is O(1) (the done-wall discard is
-// O(number discarded)).
+// The collections are only ever as large as the concurrency window (the number
+// of simultaneously-outstanding `next()` calls), so plain-array push/shift/pop
+// are the right primitives — no auxiliary list structure is needed.
 
 function noop() {}
-
-class ListNode {
-  prev = null;
-  next = null;
-  removed = false;
-
-  constructor(value) {
-    this.value = value;
-  }
-}
-
-class LinkedList {
-  #head = null;
-  #tail = null;
-  #size = 0;
-
-  get size() {
-    return this.#size;
-  }
-
-  isEmpty() {
-    return this.#size === 0;
-  }
-
-  // Value at the head, or undefined if empty.
-  peekHead() {
-    return this.#head ? this.#head.value : undefined;
-  }
-
-  pushTail(value) {
-    const node = new ListNode(value);
-    node.prev = this.#tail;
-    if (this.#tail) this.#tail.next = node;
-    else this.#head = node;
-    this.#tail = node;
-    this.#size++;
-    return node;
-  }
-
-  shiftHead() {
-    const node = this.#head;
-    if (node) this.remove(node);
-    return node ? node.value : undefined;
-  }
-
-  popTail() {
-    const node = this.#tail;
-    if (node) this.remove(node);
-    return node ? node.value : undefined;
-  }
-
-  remove(node) {
-    if (node.removed) return;
-    node.removed = true;
-    if (node.prev) node.prev.next = node.next;
-    else this.#head = node.next;
-    if (node.next) node.next.prev = node.prev;
-    else this.#tail = node.prev;
-    node.prev = node.next = null;
-    this.#size--;
-  }
-
-  // Remove `node` and every node after it.
-  removeFrom(node) {
-    if (node.removed) return;
-    const before = node.prev;
-    let cur = node;
-    while (cur) {
-      cur.removed = true;
-      const next = cur.next;
-      cur.prev = cur.next = null;
-      this.#size--;
-      cur = next;
-    }
-    if (before) before.next = null;
-    else this.#head = null;
-    this.#tail = before;
-  }
-}
 
 class FilterHelper {
   // The source async iterator and the predicate.
   #it;
   #pred;
 
-  // Positions in pull order. Each value is a record { status, value, error }
-  // with status one of 'pending' | 'value' | 'error'. The list holds only
-  // still-deliverable positions, so #positions.size is the value ceiling.
-  #positions = new LinkedList();
+  // Positions in pull order (see the model comment above). Each entry is a
+  // record { status, value, error, removed }.
+  #positions = [];
 
-  // Outstanding consumer next() calls in call order; each value is
+  // Outstanding consumer next() calls in call order; each entry is
   // { resolve, reject }.
-  #calls = new LinkedList();
+  #calls = [];
+
+  // The value ceiling V: count of still-deliverable positions (pending / value /
+  // error). Excludes tombstoned drops and discarded positions.
+  #liveCount = 0;
 
   // True once a terminal event has occurred (source done, source error,
   // predicate error, or return()). No further source pulls are issued.
@@ -137,17 +66,26 @@ class FilterHelper {
 
   // ---- source closing ---------------------------------------------------
 
-  // Fire-and-forget close, used by predicate errors. Closes at most once and
-  // only while the source is still live.
-  #closeSourceFireAndForget() {
-    if (!this.#sourceLive) return;
+  // Close the source via it.return(), but only the first time and only while the
+  // source is still live (never after a source done/error, or a prior close).
+  // Returns the raw result of it.return() (a value or promise) so a caller can
+  // await it, or undefined if no close happened. May throw synchronously.
+  #closeSource() {
+    if (!this.#sourceLive) return undefined;
     this.#sourceLive = false;
-    if (typeof this.#it.return !== 'function') return;
+    if (typeof this.#it.return !== 'function') return undefined;
+    return this.#it.return();
+  }
+
+  // Fire-and-forget close, used by a predicate error: the result's rejection
+  // must not wait on it.return() settling, and any throw/rejection from the
+  // close is swallowed.
+  #closeSourceFireAndForget() {
     let r;
     try {
-      r = this.#it.return();
-    } catch (e) {
-      return; // swallow
+      r = this.#closeSource();
+    } catch {
+      return; // swallow a synchronous throw
     }
     if (r && typeof r.then === 'function') {
       r.then(noop, noop); // swallow any rejection
@@ -156,42 +94,50 @@ class FilterHelper {
 
   // ---- pulling ----------------------------------------------------------
 
-  // Drive a source pull for an already-inserted position node. A synchronous
-  // throw from it.next() is a source error at that position. Callers run
-  // #process() afterward.
-  #startPull(node) {
+  // Issue one source pull, appended as a new position at the back of the queue.
+  // A synchronous throw from it.next() is a source error at that position.
+  #issuePull() {
+    const pos = {
+      status: 'pending',
+      value: undefined,
+      error: undefined,
+      removed: false,
+    };
+    this.#positions.push(pos);
+    this.#liveCount++;
     let result;
     try {
       result = this.#it.next();
     } catch (e) {
       // Synchronous throw: a source error at this position.
-      node.value.status = 'error';
-      node.value.error = e;
+      pos.status = 'error';
+      pos.error = e;
       this.#finished = true;
       this.#sourceLive = false; // source faulted; never call it.return().
+      this.#process();
       return;
     }
 
     Promise.resolve(result).then(
-      (r) => this.#settlePull(node, r),
-      (e) => this.#rejectPull(node, e)
+      (r) => this.#settlePull(pos, r),
+      (e) => this.#rejectPull(pos, e)
     );
   }
 
-  #settlePull(node, result) {
-    if (node.removed) return; // discarded
+  #settlePull(pos, result) {
+    if (pos.removed) return; // discarded
     if (result && result.done) {
-      this.#handleDone(node);
+      this.#handleDone(pos);
     } else {
-      this.#invokePred(node, result ? result.value : undefined);
+      this.#invokePred(pos, result ? result.value : undefined);
     }
   }
 
-  #rejectPull(node, err) {
-    if (node.removed) return; // discarded
+  #rejectPull(pos, err) {
+    if (pos.removed) return; // discarded
     // Source error: positional error, does not close the source.
-    node.value.status = 'error';
-    node.value.error = err;
+    pos.status = 'error';
+    pos.error = err;
     this.#finished = true;
     this.#sourceLive = false; // never call it.return() after a source error.
     this.#process();
@@ -199,8 +145,8 @@ class FilterHelper {
 
   // ---- predicate --------------------------------------------------------
 
-  #invokePred(node, value) {
-    node.value.value = value;
+  #invokePred(pos, value) {
+    pos.value = value;
     // The predicate is *called* synchronously (so the call is observed in pull
     // order), but its outcome is always handled one microtask hop later. A
     // synchronous throw is funneled through a rejected promise so it takes the
@@ -214,22 +160,22 @@ class FilterHelper {
     }
     Promise.resolve(res).then(
       (keep) => {
-        if (node.removed) return;
+        if (pos.removed) return;
         if (keep) {
-          node.value.status = 'value';
+          pos.status = 'value';
           this.#process();
         } else {
-          this.#handleDrop(node);
+          this.#handleDrop(pos);
         }
       },
-      (e) => this.#predErrored(node, e)
+      (e) => this.#predErrored(pos, e)
     );
   }
 
-  #predErrored(node, err) {
-    if (node.removed) return; // discarded
-    node.value.status = 'error';
-    node.value.error = err;
+  #predErrored(pos, err) {
+    if (pos.removed) return; // discarded
+    pos.status = 'error';
+    pos.error = err;
     this.#finished = true;
     // A predicate error closes the source (fire-and-forget) if still live.
     this.#closeSourceFireAndForget();
@@ -238,28 +184,39 @@ class FilterHelper {
 
   // ---- drops and done ---------------------------------------------------
 
-  #handleDrop(node) {
-    if (node.removed) return;
-    // The dropped position is removed and the queue compacts: surviving values
-    // are delivered strictly in pull order, so an already-known later value
-    // shifts forward to the earliest waiting call.
-    this.#positions.remove(node);
+  #handleDrop(pos) {
+    if (pos.removed) return;
+    // Tombstone the dropped position: it stays in #positions until the head
+    // reaches it (then it is shifted away), but no longer counts toward the
+    // value ceiling. Surviving values still deliver strictly in pull order, so
+    // an already-known later value shifts forward to the earliest waiting call.
+    pos.status = 'dropped';
+    this.#liveCount--;
     if (!this.#finished) {
       // Still live: the outstanding call still needs a value, so issue a fresh
       // pull at the BACK of the queue. It does not take the dropped slot — its
       // value is just another candidate, behind everything already pulled.
-      this.#startPull(this.#positions.pushTail(makePosition()));
+      this.#issuePull();
     }
     // If finished, the position is simply gone; the value ceiling in #process()
     // will release a trailing call to done.
     this.#process();
   }
 
-  #handleDone(node) {
-    if (node.removed) return;
+  #handleDone(pos) {
+    if (pos.removed) return;
     // This done is the terminal wall: discard its position and every later one
-    // (overriding any later error or later done).
-    this.#positions.removeFrom(node);
+    // (overriding any later error or later done). Pop from the back until the
+    // done record itself is popped. `pos` is still pending here (a pending head
+    // blocks delivery), so it has not been shifted off the front and the
+    // pop-loop reaches it; earlier positions are left untouched.
+    let removed;
+    do {
+      removed = this.#positions.pop();
+      removed.removed = true;
+      // Tombstoned drops were already counted out of #liveCount.
+      if (removed.status !== 'dropped') this.#liveCount--;
+    } while (removed !== pos);
     this.#finished = true;
     this.#sourceLive = false; // a clean done does not close the source.
     this.#process();
@@ -268,30 +225,39 @@ class FilterHelper {
   // ---- delivery ---------------------------------------------------------
 
   #process() {
-    // 1) Deliver from the head, in order. A pending head blocks everything
+    // 1) Compact leading tombstones (already out of #liveCount), so the head is
+    //    a real outcome or a pending position.
+    while (this.#positions.length > 0 && this.#positions[0].status === 'dropped') {
+      this.#positions.shift();
+    }
+
+    // 2) Deliver from the head, in order. A pending head blocks everything
     //    behind it.
-    while (!this.#calls.isEmpty() && !this.#positions.isEmpty()) {
-      const pos = this.#positions.peekHead();
+    while (this.#calls.length > 0 && this.#positions.length > 0) {
+      const pos = this.#positions[0];
       if (pos.status === 'value') {
-        this.#positions.shiftHead();
-        this.#calls.shiftHead().resolve({ value: pos.value, done: false });
+        this.#positions.shift();
+        this.#liveCount--;
+        this.#calls.shift().resolve({ value: pos.value, done: false });
       } else if (pos.status === 'error') {
-        this.#positions.shiftHead();
-        this.#calls.shiftHead().reject(pos.error);
+        this.#positions.shift();
+        this.#liveCount--;
+        this.#calls.shift().reject(pos.error);
+      } else if (pos.status === 'dropped') {
+        this.#positions.shift(); // a tombstone exposed mid-loop
       } else {
         break; // pending
       }
     }
 
-    // 2) Once finished, the value ceiling (#positions.size) releases the
-    //    trailing (most-recently made) calls that exceed it to done. They are
-    //    settled in call order, even though it is the latest calls being
-    //    retired.
+    // 3) Once finished, the value ceiling (#liveCount) releases the trailing
+    //    (most-recently made) calls that exceed it to done. They are settled in
+    //    call order, even though it is the latest calls being retired.
     if (this.#finished) {
-      const surplus = this.#calls.size - this.#positions.size;
+      const surplus = this.#calls.length - this.#liveCount;
       if (surplus > 0) {
         const drained = [];
-        for (let i = 0; i < surplus; i++) drained.push(this.#calls.popTail());
+        for (let i = 0; i < surplus; i++) drained.push(this.#calls.pop());
         for (let i = drained.length - 1; i >= 0; i--) {
           drained[i].resolve({ value: undefined, done: true });
         }
@@ -310,8 +276,8 @@ class FilterHelper {
       resolve = res;
       reject = rej;
     });
-    this.#calls.pushTail({ resolve, reject });
-    this.#startPull(this.#positions.pushTail(makePosition())); // one pull per next().
+    this.#calls.push({ resolve, reject });
+    this.#issuePull(); // one pull per next().
     this.#process();
     return p;
   }
@@ -322,18 +288,15 @@ class FilterHelper {
     }
     this.#finished = true;
 
-    // Close the source exactly once, if still live, before resolving.
+    // Close the source before resolving. We are not yet finished, so the source
+    // is necessarily still live and #closeSource() will call it.return() exactly
+    // once. A synchronous throw from it.return() rejects this return() call.
     let r;
-    if (this.#sourceLive) {
-      this.#sourceLive = false;
-      if (typeof this.#it.return === 'function') {
-        try {
-          r = this.#it.return();
-        } catch (e) {
-          this.#process();
-          return Promise.reject(e);
-        }
-      }
+    try {
+      r = this.#closeSource();
+    } catch (e) {
+      this.#process();
+      return Promise.reject(e);
     }
 
     // Outstanding calls keep their in-flight pulls; the ceiling governs them.
@@ -345,10 +308,6 @@ class FilterHelper {
   [Symbol.asyncIterator]() {
     return this;
   }
-}
-
-function makePosition() {
-  return { status: 'pending', value: undefined, error: undefined };
 }
 
 export default function filter(it, pred) {

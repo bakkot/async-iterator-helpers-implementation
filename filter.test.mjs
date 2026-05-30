@@ -312,11 +312,38 @@ async function test_async_pred_drop_replacement() {
   ok(r0.value === 20, 'async_pred_drop_replacement', r0);
 }
 
+async function test_replacement_takes_dropped_slot() {
+  // The replacement pull is the newest pull chronologically but must occupy the
+  // dropped position's ORDERING slot, not the tail. So a later position's value
+  // (P2='C') known first cannot be delivered to C1 while the replacement of the
+  // dropped P1 is still pending — if that replacement also dropped, 'C' would
+  // belong to C1.
+  const s = makeSource();
+  const f = filter(s.it, (x) => x !== 'drop');
+  const p0 = f.next(), p1 = f.next(), p2 = f.next(); // pulls 0,1,2
+  await tick();
+  s.value(2, 'C');    // P2's value known first
+  await tick();
+  s.value(1, 'drop'); // P1 drops -> replacement pull 3 inserted at slot 1
+  await tick();
+  s.value(0, 'A');    // P0 -> C0
+  // C1 must NOT have grabbed 'C' while the replacement is still pending.
+  let c1settled = false;
+  p1.then(() => { c1settled = true; });
+  await tick(); await tick();
+  ok(c1settled === false, 'replacement_takes_dropped_slot: C1 waits for replacement');
+  s.value(3, 'B');    // replacement kept
+  const [r0, r1, r2] = await Promise.all([p0, p1, p2]);
+  ok(r0.value === 'A' && r1.value === 'B' && r2.value === 'C',
+    'replacement_takes_dropped_slot: delivered in call order', r0, r1, r2);
+}
+
 for (const t of [
   test_done_overrides_later_error,
   test_ceiling_lowers_on_drop_after_done,
   test_value_before_later_error,
   test_async_pred_drop_replacement,
+  test_replacement_takes_dropped_slot,
 ]) {
   await t();
 }

@@ -77,7 +77,10 @@ class FilterHelper {
           }
           this.#finished = true; // a clean done does not close the source.
           this.#processQueue();
-          this.#releaseSurplusCalls();
+          const drained = this.#calls.splice(this.#positions.size);
+          for (const call of drained) {
+            call.resolve({ value: undefined, done: true });
+          }
         } else {
           this.#invokePred(pos, r.value);
         }
@@ -124,12 +127,12 @@ class FilterHelper {
             this.#issuePull();
             this.#processQueue();
           } else {
-            // Source already closed: no replacement pull, so dropping this
-            // position can leave a vended call with no value it could ever
-            // receive. Deliver whatever the drop exposed, then release the
-            // now-surplus trailing calls to done.
+            // Source already closed: no replacement pull. In a quiescent state
+            // #calls and #positions are equal in length, and we just removed one
+            // position without removing a call, so there is now exactly one
+            // surplus call, which we can settle.
             this.#processQueue();
-            this.#releaseSurplusCalls();
+            this.#calls.pop().resolve({ value: undefined, done: true });
           }
         }
       },
@@ -192,21 +195,6 @@ class FilterHelper {
       } else {
         // assert: pos.status === 'awaiting'
         break;
-      }
-    }
-  }
-
-  // Once finished, the value ceiling (#positions.size) can sit below the number
-  // of outstanding calls; the trailing (most-recently-made) surplus calls are
-  // then released to done — in call order, even though it is the latest calls
-  // being retired. This surplus only arises where a terminal event *removes*
-  // positions without consuming a call: a `done` wall, or a drop with the source
-  // already closed (so no replacement pull is issued).
-  #releaseSurplusCalls() {
-    if (this.#calls.length > this.#positions.size) {
-      const drained = this.#calls.splice(this.#positions.size);
-      for (const call of drained) {
-        call.resolve({ value: undefined, done: true });
       }
     }
   }

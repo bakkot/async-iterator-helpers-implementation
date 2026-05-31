@@ -136,11 +136,12 @@ class FilterHelper {
     try {
       result = this.#it.next();
     } catch (e) {
-      // Synchronous throw: a source error at this position.
+      // Synchronous throw: a source error at this position. Like the async paths,
+      // #issuePull only records the outcome; delivery is driven by the caller's
+      // #process() (in next() or #handleDrop), so we do not process here.
       pos.status = 'error';
       pos.error = e;
       this.#finished = true; // source faulted; never call it.return().
-      this.#process();
       return;
     }
 
@@ -324,15 +325,12 @@ class FilterHelper {
     // 3) Once finished, the value ceiling (#liveCount) releases the trailing
     //    (most-recently made) calls that exceed it to done. They are settled in
     //    call order, even though it is the latest calls being retired.
-    if (this.#finished) {
-      const surplus = this.#calls.length - this.#liveCount;
-      if (surplus > 0) {
-        const drained = [];
-        for (let i = 0; i < surplus; i++) drained.push(this.#calls.pop());
-        for (let i = drained.length - 1; i >= 0; i--) {
-          drained[i].resolve({ value: undefined, done: true });
-        }
-      }
+    if (this.#finished && this.#calls.length > this.#liveCount) {
+      // Release the trailing (most-recently-made) surplus calls to done. splice
+      // removes them from index #liveCount onward — already in call order — so
+      // resolving in iteration order settles them in call order.
+      const drained = this.#calls.splice(this.#liveCount);
+      for (const call of drained) call.resolve({ value: undefined, done: true });
     }
   }
 

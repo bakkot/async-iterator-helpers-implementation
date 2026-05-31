@@ -126,6 +126,12 @@ class FilterHelper {
           // here (an awaiting head blocks delivery), so it has not been delivered off the
           // front; iterate in insertion (= pull) order and, from `pos` onward, delete.
           // Earlier positions are left untouched.
+          //
+          // This is theoretically quadratic in the degree of concurrency: if we issue
+          // N pulls and they all settle with { done: true } back-to-front, then
+          // we will do N steps in this loop the first time, N-1 the second, etc.
+          // In practice this is unlikely to matter.
+          // A native implementation could probably avoid that cost.
           let discarding = false;
           for (const n of this.#positions) {
             if (n === pos) discarding = true;

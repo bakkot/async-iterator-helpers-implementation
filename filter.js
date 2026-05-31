@@ -15,6 +15,9 @@
 //     strictly at the head (index 0), in call order: a head `value` resolves the
 //     front call, a head `error` rejects it, a pending head blocks everything
 //     behind it.
+//     'removed' items are never actually present in the array; entries attain
+//     this status when being removed from the queue (because an earlier entry
+//     resolved with { done: true }).
 //   * A drop is recorded as a TOMBSTONE (status 'dropped') rather than removed
 //     in place; it lingers in the array until the head reaches it and is then
 //     shifted away. While live, a drop also issues a fresh replacement pull at
@@ -88,18 +91,6 @@ class FilterHelper {
     this.#pred = pred;
   }
 
-  // ---- source closing ---------------------------------------------------
-
-  // Close the source via it.return(), returning the raw result (a value or
-  // promise) so a caller can await it, or undefined if it.return is absent. May
-  // throw synchronously. The "close exactly once, only while live" rule is
-  // enforced by the callers: this only runs on the single live -> finished
-  // transition (return() guards on #finished; a predicate error guards on
-  // wasLive), so it is never reached after a source done/error or a prior close.
-  #closeSource() {
-    return this.#it?.return();
-  }
-
   // ---- pulling ----------------------------------------------------------
 
   // Issue one source pull, appended as a new position at the back of the queue.
@@ -119,7 +110,7 @@ class FilterHelper {
     } catch (e) {
       // Synchronous throw: a source error at this position. Like the async paths,
       // #issuePull only records the outcome; delivery is driven by the caller's
-      // #process() (in next() or the predicate-false case), so we do not process here.
+      // #processQueue() (in next() or the predicate-false case), so we do not process here.
       pos.status = 'error';
       pos.error = e;
       pos.closeState = 'ready'
@@ -127,9 +118,6 @@ class FilterHelper {
       return;
     }
 
-    // Resolve the pull one microtask hop later, handling the outcome in pull
-    // order. A position discarded by a terminal `done` wall ('removed') is
-    // ignored — its outcome no longer matters.
     Promise.resolve(result).then(
       (r) => {
         if (pos.status === 'removed') return;
@@ -151,7 +139,7 @@ class FilterHelper {
             discarded.status = 'removed';
           } while (discarded !== pos);
           this.#finished = true; // a clean done does not close the source.
-          this.#process();
+          this.#processQueue();
         } else {
           this.#invokePred(pos, r.value);
         }
@@ -163,7 +151,7 @@ class FilterHelper {
         pos.error = e;
         pos.closeState = 'ready';
         this.#finished = true; // never call it.return() after a source error.
-        this.#process();
+        this.#processQueue();
       }
     );
   }
@@ -177,6 +165,8 @@ class FilterHelper {
     // synchronous throw is funneled through a rejected promise so it takes the
     // exact same deferred path as an asynchronous rejection — the source close
     // it triggers then lands after any delivery this same step unblocked.
+    // TODO reconsider: maybe we shouldn't have to pay a microtask tick if the
+    // predicate synchronously returns true or false.
     let res;
     try {
       res = this.#pred(value);
@@ -188,26 +178,26 @@ class FilterHelper {
         if (pos.status === 'removed') return;
         if (keep) {
           pos.status = 'value';
-          this.#process();
+          this.#processQueue();
         } else {
           pos.status = 'dropped';
           this.#liveCount--;
           if (!this.#finished) {
             this.#issuePull();
           }
-          this.#process();
+          this.#processQueue();
         }
       },
       (err) => {
         if (pos.status === 'removed') return;
         pos.status = 'error';
         pos.error = err;
-        const wasLive = !this.#finished; // is this error the terminal event?
+        const wasLive = !this.#finished;
         this.#finished = true;
         if (wasLive) {
           // This error is the terminal event, so it closes the source. Its rejection
           // must wait for the it.return() to settle, so while that close is pending the
-          // position is 'awaiting'. #process commits the error to its call by leaving a
+          // position is 'awaiting'. #processQueue commits the error to its call by leaving a
           // rejector in closeState (without blocking the values behind it); the single
           // reaction below then either invokes that rejector or, if the error has not
           // reached the head yet, flips closeState to 'ready' so it rejects in order
@@ -215,7 +205,7 @@ class FilterHelper {
           // result is already settled — closeState stays 'ready' and there is no delay.
           let r;
           try {
-            r = this.#closeSource();
+            r = this.#it?.return();
           } catch {
             // synchronous throw from it.return() gets swallowed
           }
@@ -230,14 +220,14 @@ class FilterHelper {
             pos.closeState = 'ready';
           }
         }
-        this.#process();
+        this.#processQueue();
       }
     );
   }
 
   // ---- delivery ---------------------------------------------------------
 
-  #process() {
+  #processQueue() {
     // 1) Compact leading tombstones (already out of #liveCount), so the head is
     //    a real outcome or a pending position.
     while (this.#positions.length > 0 && this.#positions[0].status === 'dropped') {
@@ -276,11 +266,11 @@ class FilterHelper {
     //    (most-recently made) calls that exceed it to done. They are settled in
     //    call order, even though it is the latest calls being retired.
     if (this.#finished && this.#calls.length > this.#liveCount) {
-      // Release the trailing (most-recently-made) surplus calls to done. splice
-      // removes them from index #liveCount onward — already in call order — so
-      // resolving in iteration order settles them in call order.
+      // Release the trailing (most-recently-made) surplus calls to done.
       const drained = this.#calls.splice(this.#liveCount);
-      for (const call of drained) call.resolve({ value: undefined, done: true });
+      for (const call of drained) {
+        call.resolve({ value: undefined, done: true });
+      }
     }
   }
 
@@ -293,28 +283,27 @@ class FilterHelper {
     const { resolve, reject, promise } = Promise.withResolvers();
     this.#calls.push({ resolve, reject });
     this.#issuePull(); // one pull per next().
-    this.#process();
+    this.#processQueue();
     return promise;
   }
 
   return(value) {
     if (this.#finished) {
-      // TODO do we await this value?
+      // TODO do we await this value? do we do anything with it?
       return Promise.resolve({ value, done: true });
     }
     this.#finished = true;
 
     let r;
     try {
-      r = this.#closeSource();
+      r = this.#it?.return();
     } catch (e) {
-      // i.e. calling .return threw
-      this.#process();
+      this.#processQueue();
       return Promise.reject(e);
     }
 
     // Outstanding calls keep their in-flight pulls; the ceiling governs them.
-    this.#process();
+    this.#processQueue();
 
     return Promise.resolve(r).then(() => ({ value, done: true }));
   }

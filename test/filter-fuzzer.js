@@ -134,6 +134,8 @@ class RandomChooser {
 function runModel(maxEvents, chooser) {
   const maxPulls = Math.max(1, 2 * maxEvents);
   let done = false;
+  let closed = false; // we have closed the source via it.return() (predicate error
+                      // or return()); a `done` after this is drain, not a wall
   let callCount = 0;
   let nextPullId = 0, nextPredId = 0, nextReturnId = 0;
   let terminalIndex = Infinity;
@@ -242,6 +244,7 @@ function runModel(maxEvents, chooser) {
 
   const closeForPredicateError = (node) => {
     done = true;
+    closed = true;
     terminalIndex = nextPullId - 1;
     const id = nextReturnId++;
     const shape = RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
@@ -304,6 +307,18 @@ function runModel(maxEvents, chooser) {
     if (outcome === 'value') {
       invokePred(node, pullValue(node.pullId));
     } else if (outcome === 'done') {
+      if (closed) {
+        // Late done from a source we already closed: not a sequence-ending wall,
+        // just this one slot reporting no value. Empty it like a drop (no
+        // replacement, since we are finished) so an already-determined later
+        // position still compacts forward to its call.
+        valueLimit--;
+        const idx = nodes.indexOf(node);
+        if (idx !== -1) nodes.splice(idx, 1);
+        if (nodes.length > 0 && consumers.length > 0) pump();
+        if (consumers.length > valueLimit) settleDoneFrom(valueLimit);
+        return;
+      }
       done = true;
       terminalIndex = node.index;
       node.status = 'done';
@@ -391,6 +406,7 @@ function runModel(maxEvents, chooser) {
       if (done) settleReturn(callId);
       else {
         done = true;
+        closed = true;
         const id = nextReturnId++;
         const shape = RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
         schedule.returnShapes[id] = shape;

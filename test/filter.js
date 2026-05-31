@@ -1047,11 +1047,14 @@ tests.push(['filter: a return()-triggered upstream done surfaces the predicate e
   ]);
 }]);
 
-// Source error: the later pull rejects (a source error, which does NOT close the
-// source); then the still-pending earlier pull #0 resolves done. That late done must
-// not discard the error — it just empties pull #0, so the error compacts forward to
-// r0 and r1 drains to done.
-tests.push(['filter: a late source done after a source error still surfaces the error', async function (t) {
+// Contrast case: a source *error* does NOT close the source, so a `done` that
+// arrives afterward is still a genuine source signal — a real terminal wall. The
+// later pull rejects (source error); then the earlier pull #0 resolves done. Because
+// we never closed the source, that done legitimately ends the sequence at #0, making
+// the error at #1 a speculative over-pull beyond the end: it is capped, and both
+// calls resolve done. (Same family as "a source done retroactively caps a later
+// already-observed error" — only a done from a source *we* closed is not a wall.)
+tests.push(['filter: a source done after a source error still caps the over-pulled error', async function (t) {
   const src = controlledSource(t.log, 'src');
   const pred = controlledFn(t.log, 'pred');
   const f = filter(src.iterator, pred.fn);
@@ -1063,16 +1066,18 @@ tests.push(['filter: a late source done after a source error still surfaces the 
   await flushMicrotasks();
   t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
 
-  // Source error at the later pull; it sits behind the still-pending pull #0.
+  // Source error at the later pull; it sits behind the still-pending pull #0. A
+  // source error does not close the source.
   src.throw(1, new Error('boom'));
   await flushMicrotasks();
   t.expectLog('the source error waits behind the pending head', []);
 
-  // The earlier pull then resolves done. This late done must not bury the error.
+  // The earlier pull then resolves done. The source was never closed, so this done is
+  // a real wall: it ends the sequence at #0 and caps the over-pulled error at #1.
   src.finish(0);
   await flushMicrotasks();
-  t.expectLog('the late done empties pull #0; the error reaches r0', [
-    'r0 rejected boom',
+  t.expectLog('the done caps the over-pulled error -> both calls done', [
+    'r0 resolved {"done":true}',
     'r1 resolved {"done":true}',
   ]);
 }]);

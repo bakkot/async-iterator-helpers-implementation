@@ -18,8 +18,11 @@
 //     in place; it lingers in the array until the head reaches it and is then
 //     shifted away. While live, a drop also issues a fresh replacement pull at
 //     the back of the queue.
-//   * A source `done` is the terminal wall: its position and every later one are
-//     discarded by popping from the back until the done record itself is popped.
+//   * A source `done` received while the source is still open is the terminal
+//     wall: its position and every later one are discarded by popping from the back
+//     until the done record itself is popped. A `done` received after we have
+//     closed the source (it.return()) is not a wall — it just empties its own slot,
+//     like a drop, so it cannot swallow an already-determined later outcome.
 //   * `#calls` is a plain array used as a FIFO of outstanding consumer `next()`
 //     calls, in call order; each entry is `{ resolve, reject }`.
 //   * `#liveCount` is the number of still-deliverable positions (pending / value
@@ -75,6 +78,13 @@ class FilterHelper {
   // there is no separate "finished but source still live" state to track.
   #finished = false;
 
+  // True once we have closed the source via it.return() (a predicate error or a
+  // return() call) — but NOT for a source done or source error, which finish
+  // without closing. This is what distinguishes a genuine source `done` (a
+  // terminal wall that caps speculative over-pulls) from a `done` the source emits
+  // only while draining our close (not a wall — see #handleDone).
+  #closed = false;
+
   constructor(it, pred) {
     this.#it = it;
     this.#pred = pred;
@@ -89,6 +99,9 @@ class FilterHelper {
   // transition (return() guards on #finished; a predicate error guards on
   // wasLive), so it is never reached after a source done/error or a prior close.
   #closeSource() {
+    // We have entered the closing path; a source `done` from here on is just the
+    // source draining the close, not a sequence-ending wall (see #handleDone).
+    this.#closed = true;
     if (typeof this.#it.return !== 'function') return undefined;
     return this.#it.return();
   }
@@ -227,11 +240,24 @@ class FilterHelper {
 
   #handleDone(pos) {
     if (pos.status === 'removed') return;
-    // This done is the terminal wall: discard its position and every later one
-    // (overriding any later error or later done). Pop from the back until the
-    // done record itself is popped. `pos` is still pending here (a pending head
-    // blocks delivery), so it has not been shifted off the front and the
-    // pop-loop reaches it; earlier positions are left untouched.
+    if (this.#closed) {
+      // We already closed the source, so this done is not a sequence-ending wall —
+      // it is just the source draining our it.return(). It must not discard an
+      // already-determined later position (e.g. a value, or a predicate error that
+      // triggered the close), which would silently swallow that outcome. Empty just
+      // this one slot, like a drop (no replacement, since we are finished), so a
+      // later value/error still compacts forward to its call.
+      pos.status = 'dropped';
+      this.#liveCount--;
+      this.#process();
+      return;
+    }
+    // The source is still open, so this done is the genuine terminal wall: discard
+    // its position and every later one (overriding any later error or later done) —
+    // those later positions are speculative over-pulls beyond the sequence's end.
+    // Pop from the back until the done record itself is popped. `pos` is still
+    // pending here (a pending head blocks delivery), so it has not been shifted off
+    // the front and the pop-loop reaches it; earlier positions are left untouched.
     let discarded;
     do {
       discarded = this.#positions.pop();

@@ -94,9 +94,11 @@ done; another replacement pull could always still produce a value.
 
 A `{ done: true }` from the source is **terminal**: it ends the sequence at that
 position and makes the result *finished* (§5). A clean done does **not** close the
-source — `it.return()` is not called — and it makes every *later* in-flight pull
-unobservable: positions after the done are discarded, and a value arriving later
-for such a position is ignored without invoking `pred`.
+source — `it.return()` is not called — and, **while the source is still open**, it
+makes every *later* in-flight pull unobservable: positions after the done are
+discarded, and a value arriving later for such a position is ignored without
+invoking `pred`. (A done received *after* the source has been closed is not a wall;
+see §6.)
 
 Once the result is finished, no replacement pulls can ever happen, so the number
 of values it can still deliver is fixed. Define, at any such moment:
@@ -193,10 +195,23 @@ A source error does **not** call `it.return()` — the source already faulted, a
 the result never calls `it.return()` after observing a source error — so a source
 error is surfaced with no such delay.
 
-**A done overrides a later error.** A clean done discards every later position,
-including one that already errored (e.g. a pull that threw synchronously before
-the done arrived): that speculative error is suppressed, not resurrected, even if
-an earlier value is later dropped.
+**A done overrides a later error — but only while the source is open.** A done
+received while the source is still open discards every later position, including one
+that already errored (e.g. a pull that threw synchronously before the done arrived):
+that speculative over-pull is beyond the sequence's end, so its error is suppressed,
+not resurrected, even if an earlier value is later dropped. This still holds after a
+*source error* finishes the result, because a source error does **not** close the
+source: a subsequent source done is a genuine wall.
+
+**A done from a closed source is not a wall.** Once we have closed the source via
+`it.return()` — that is, after a predicate error (§6) or a `return()` (§7) — a
+`{ done: true }` it then produces is just the source draining the close, not a new
+terminal event. It must not retroactively discard an already-determined later
+position, which would silently **swallow** that outcome (the confusing case where a
+source reacts to `it.return()` by resolving an earlier outstanding pull with done,
+erasing the very predicate error that triggered the close). So such a done empties
+only its own slot, like a drop: a later kept value or error still **compacts
+forward** to the earliest waiting call, and the trailing calls drain to done.
 
 ---
 
@@ -245,3 +260,6 @@ A `next()` call made after `return()` returns `{ done: true }`.
    a predicate error, and only while the source is still live — never after a
    source done or a source error. A predicate error's rejection is surfaced only
    after the `it.return()` it triggers has settled.
+8. A `done` is a terminal wall (discarding later positions) only while the source is
+   open. A `done` the source produces after we have closed it is not a wall, so an
+   already-determined value or error is never silently swallowed by it (§4, §6).

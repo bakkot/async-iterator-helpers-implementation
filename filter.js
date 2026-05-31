@@ -77,6 +77,7 @@ class FilterHelper {
           }
           this.#finished = true; // a clean done does not close the source.
           this.#processQueue();
+          this.#releaseSurplusCalls();
         } else {
           this.#invokePred(pos, r.value);
         }
@@ -118,9 +119,18 @@ class FilterHelper {
         } else {
           this.#positions.delete(pos);
           if (!this.#finished) {
+            // Source still open: replace the lost value with a fresh pull, so the
+            // queue stays balanced and no call can become surplus.
             this.#issuePull();
+            this.#processQueue();
+          } else {
+            // Source already closed: no replacement pull, so dropping this
+            // position can leave a vended call with no value it could ever
+            // receive. Deliver whatever the drop exposed, then release the
+            // now-surplus trailing calls to done.
+            this.#processQueue();
+            this.#releaseSurplusCalls();
           }
-          this.#processQueue();
         }
       },
       (err) => {
@@ -160,10 +170,8 @@ class FilterHelper {
     );
   }
 
+  // Deliver no-longer-awaiting values/errors from the head, in order.
   #processQueue() {
-    // 1) Deliver no-longer-awaiting values from the head, in order. Drops and
-    //    discarded positions have already been deleted from #positions, so the
-    //    head is always a real outcome or an awaiting position.
     while (this.#calls.length > 0 && this.#positions.size > 0) {
       const pos = this.#head();
       if (pos.status === 'value') {
@@ -186,12 +194,16 @@ class FilterHelper {
         break;
       }
     }
+  }
 
-    // 2) Once finished, the value ceiling (#positions.size) releases the trailing
-    //    (most-recently made) calls that exceed it to done. They are settled in
-    //    call order, even though it is the latest calls being retired.
-    if (this.#finished && this.#calls.length > this.#positions.size) {
-      // Release the trailing (most-recently-made) surplus calls to done.
+  // Once finished, the value ceiling (#positions.size) can sit below the number
+  // of outstanding calls; the trailing (most-recently-made) surplus calls are
+  // then released to done — in call order, even though it is the latest calls
+  // being retired. This surplus only arises where a terminal event *removes*
+  // positions without consuming a call: a `done` wall, or a drop with the source
+  // already closed (so no replacement pull is issued).
+  #releaseSurplusCalls() {
+    if (this.#calls.length > this.#positions.size) {
       const drained = this.#calls.splice(this.#positions.size);
       for (const call of drained) {
         call.resolve({ value: undefined, done: true });

@@ -71,18 +71,31 @@ class FilterHelper {
   // error). Excludes tombstoned drops and discarded positions.
   #liveCount = 0;
 
+  // Lifecycle. Two booleans, but only THREE of the four combinations are
+  // reachable: #closed is only ever set on the same synchronous step that sets
+  // #finished (see #closeSource), so a closed-but-not-finished state never exists.
+  //
+  //   #finished  #closed   state
+  //   ---------  -------   -----------------------------------------------------
+  //   false      false     live — source open, still pulling
+  //   true       false     finished WITHOUT closing — source done or source error
+  //   true       true      finished BY closing — return() or a predicate error
+  //   false      true      (impossible)
+  //
+  // The open/closed distinction only matters after finishing: it tells a source
+  // `done` whether it is a genuine terminal wall (open: caps speculative
+  // over-pulls) or merely the source draining our it.return() (closed: empties
+  // one slot like a drop, never a wall). See #handleDone.
+
   // True once a terminal event has occurred (source done, source error,
-  // predicate error, or return()). No further source pulls are issued. This is
-  // the whole lifecycle: while not finished the source is necessarily live, and
-  // every terminal transition flips it true in the same synchronous step, so
-  // there is no separate "finished but source still live" state to track.
+  // predicate error, or return()). No further source pulls are issued. While not
+  // finished the source is necessarily live, and every terminal transition flips
+  // this true in the same synchronous step.
   #finished = false;
 
   // True once we have closed the source via it.return() (a predicate error or a
   // return() call) — but NOT for a source done or source error, which finish
-  // without closing. This is what distinguishes a genuine source `done` (a
-  // terminal wall that caps speculative over-pulls) from a `done` the source emits
-  // only while draining our close (not a wall — see #handleDone).
+  // without closing.
   #closed = false;
 
   constructor(it, pred) {
@@ -131,28 +144,24 @@ class FilterHelper {
       return;
     }
 
+    // Resolve the pull one microtask hop later, handling the outcome in pull
+    // order. A position discarded by a terminal `done` wall ('removed') is
+    // ignored — its outcome no longer matters.
     Promise.resolve(result).then(
-      (r) => this.#settlePull(pos, r),
-      (e) => this.#rejectPull(pos, e)
+      (r) => {
+        if (pos.status === 'removed') return;
+        if (r && r.done) this.#handleDone(pos);
+        else this.#invokePred(pos, r ? r.value : undefined);
+      },
+      (e) => {
+        if (pos.status === 'removed') return;
+        // Source error: a positional error that does NOT close the source.
+        pos.status = 'error';
+        pos.error = e;
+        this.#finished = true; // never call it.return() after a source error.
+        this.#process();
+      }
     );
-  }
-
-  #settlePull(pos, result) {
-    if (pos.status === 'removed') return; // discarded
-    if (result && result.done) {
-      this.#handleDone(pos);
-    } else {
-      this.#invokePred(pos, result ? result.value : undefined);
-    }
-  }
-
-  #rejectPull(pos, err) {
-    if (pos.status === 'removed') return; // discarded
-    // Source error: positional error, does not close the source.
-    pos.status = 'error';
-    pos.error = err;
-    this.#finished = true; // never call it.return() after a source error.
-    this.#process();
   }
 
   // ---- predicate --------------------------------------------------------

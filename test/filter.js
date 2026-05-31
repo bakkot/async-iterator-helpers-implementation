@@ -988,19 +988,18 @@ tests.push(['filter: a head predicate-error close delivers the value behind it i
   t.expectLog('the held error surfaces once the close settles', ['r0 rejected boom']);
 }]);
 
-// A late `done` must not act as a terminal wall. Once the result is already
-// finished (a terminal event has happened), a `done` arriving from a still-in-flight
-// earlier pull is not a new wall that discards later positions — it just empties its
-// own slot, like a drop. The three tests below cover the three terminal events.
+// A `done` is always a terminal wall, even after the result has already finished by
+// some other terminal event: a `done` arriving from a still-in-flight earlier pull
+// discards its position and every later one, including a later position that already
+// settled with a value or an error. The three tests below land a `done` after each of
+// the other three terminal events.
 
 // Predicate error: it closes the source via it.return(), and *this* upstream reacts
 // to return() by settling the still-outstanding earlier pull #0 with { done: true }.
-// That done arrives after the predicate error has already finished the result, so it
-// must NOT discard the erroring position — otherwise the error is swallowed and the
-// consumer never learns the predicate threw. Instead it empties pull #0's slot: the
-// error compacts forward to r0 and r1 drains to done. (The error still waits for
-// it.return() to settle, so r1's done is observed first.)
-tests.push(['filter: a return()-triggered upstream done surfaces the predicate error, not swallows it', async function (t) {
+// That done lands after the predicate error has finished the result, but it is still a
+// wall: it discards the later erroring position, so the predicate error is swallowed
+// and never surfaces. Both calls drain to done.
+tests.push(['filter: a return()-triggered upstream done walls away the predicate error', async function (t) {
   // Hand-rolled so return() can settle the outstanding pull #0 with done.
   let nextId = 0;
   const pulls = [];
@@ -1035,25 +1034,23 @@ tests.push(['filter: a return()-triggered upstream done surfaces the predicate e
   await flushMicrotasks();
   t.expectLog('the second value runs the predicate', ['pred(2) #0']);
 
-  // The predicate throws. it.return() settles pull #0 with done, but that late done
-  // must not bury the error: r1 drains done, then r0 gets the error once the close
-  // settles.
+  // The predicate throws. it.return() settles pull #0 with done, and that late done
+  // walls away the later erroring position: the error is swallowed and both calls
+  // drain to done.
   pred.reject(0, new Error('boom'));
   await flushMicrotasks();
-  t.expectLog('the late done empties pull #0; the error still reaches r0', [
+  t.expectLog('the late done walls away the error; both calls drain to done', [
     'src.return() #0',
+    'r0 resolved {"done":true}',
     'r1 resolved {"done":true}',
-    'r0 rejected boom',
   ]);
 }]);
 
-// Contrast case: a source *error* does NOT close the source, so a `done` that
-// arrives afterward is still a genuine source signal — a real terminal wall. The
-// later pull rejects (source error); then the earlier pull #0 resolves done. Because
-// we never closed the source, that done legitimately ends the sequence at #0, making
-// the error at #1 a speculative over-pull beyond the end: it is capped, and both
+// A source *error* does NOT close the source. The later pull rejects (source error);
+// then the earlier pull #0 resolves done. That done ends the sequence at #0, making
+// the error at #1 a speculative over-pull beyond the end: it is walled away, and both
 // calls resolve done. (Same family as "a source done retroactively caps a later
-// already-observed error" — only a done from a source *we* closed is not a wall.)
+// already-observed error".)
 tests.push(['filter: a source done after a source error still caps the over-pulled error', async function (t) {
   const src = controlledSource(t.log, 'src');
   const pred = controlledFn(t.log, 'pred');
@@ -1084,9 +1081,9 @@ tests.push(['filter: a source done after a source error still caps the over-pull
 
 // return(): the buried outcome here is a *value*. After return() closes the source,
 // pull #1 yields a value that passes; the still-pending earlier pull #0 then resolves
-// done. That late done must not discard pull #1's value — return() does not cancel
-// already-requested values — so the value compacts forward to r0 and r1 drains done.
-tests.push(['filter: a late source done after return() does not lose an already-requested value', async function (t) {
+// done. That late done is still a wall: it discards pull #1's already-determined value
+// along with its own slot, so both calls drain to done and the value never surfaces.
+tests.push(['filter: a late source done after return() walls away an already-requested value', async function (t) {
   const src = controlledSource(t.log, 'src');
   const pred = controlledFn(t.log, 'pred');
   const f = filter(src.iterator, pred.fn);
@@ -1112,11 +1109,11 @@ tests.push(['filter: a late source done after return() does not lose an already-
   await flushMicrotasks();
   t.expectLog('the value is buffered behind the pending head', []);
 
-  // The earlier pull resolves done. This late done must not discard pull #1's value.
+  // The earlier pull resolves done. This late done walls away pull #1's value.
   src.finish(0);
   await flushMicrotasks();
-  t.expectLog('the late done empties pull #0; the value reaches r0', [
-    'r0 resolved {"value":20,"done":false}',
+  t.expectLog('the late done walls away the buffered value; both calls drain to done', [
+    'r0 resolved {"done":true}',
     'r1 resolved {"done":true}',
   ]);
 }]);

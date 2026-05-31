@@ -19,11 +19,11 @@
 //     in place; it lingers in the array until the head reaches it and is then
 //     shifted away. While live, a drop also issues a fresh replacement pull at
 //     the back of the queue.
-//   * A source `done` received while the source is still open is the terminal
-//     wall: its position and every later one are discarded by popping from the back
-//     until the done record itself is popped. A `done` received after we have
-//     closed the source (it.return()) is not a wall — it just empties its own slot,
-//     like a drop, so it cannot swallow an already-determined later outcome.
+//   * A source `done` is the terminal wall: its position and every later one are
+//     discarded by popping from the back until the done record itself is popped.
+//     This holds unconditionally — whether the source finished on its own or is
+//     draining an it.return() we issued — so a `done` always wins over every later
+//     position, even one that has already settled with a value or an error.
 //   * `#calls` is a plain array used as a FIFO of outstanding consumer `next()`
 //     calls, in call order; each entry is `{ resolve, reject }`.
 //   * `#liveCount` is the number of still-deliverable positions (pending / value
@@ -70,35 +70,18 @@ class FilterHelper {
   // error). Excludes tombstoned drops and discarded positions.
   #liveCount = 0;
 
-  // Lifecycle. Two booleans, but only THREE of the four combinations are
-  // reachable: #weClosedTheSource is only ever set on the same synchronous step that sets
-  // #finished (see #closeSource), so a closed-but-not-finished state never exists.
+  // Lifecycle. A single boolean: true once a terminal event has occurred (source
+  // done, source error, predicate error, or return()). No further source pulls are
+  // issued. While not finished the source is necessarily live, and every terminal
+  // transition flips this true in the same synchronous step.
   //
-  //   #finished  #weClosedTheSource   state
-  //   ---------  -------   -----------------------------------------------------
-  //   false      false     live — source open, still pulling
-  //   true       false     finished WITHOUT closing — source done or source error
-  //   true       true      finished BY closing — return() or a predicate error
-  //   false      true      (impossible)
-  //
-  // The open/closed distinction only matters after finishing: it tells a source
-  // `done` whether it is a genuine terminal wall (open: caps speculative
-  // over-pulls) or merely the source draining our it.return() (closed: empties
-  // one slot like a drop, never a wall).
-
-  // True once a terminal event has occurred (source done, source error,
-  // predicate error, or return()). No further source pulls are issued. While not
-  // finished the source is necessarily live, and every terminal transition flips
-  // this true in the same synchronous step.
+  // We do not track whether WE closed the source (via it.return()) versus the
+  // source finishing on its own, because it makes no difference: a source `done`
+  // is a terminal wall regardless, discarding every later position. The "close
+  // exactly once, only while live" rule is enforced by the #finished guards on the
+  // two closing callers (return() and the predicate-error path), not by a separate
+  // closed flag.
   #finished = false;
-
-  // True once we have closed the source via it.return() (a predicate error or a
-  // return() call).
-  // We need this because if the source finishes on its own we assume we can
-  // discard everything past that point, whereas if WE close it values which
-  // are still in flight (even if they are past a { done: true }) still get
-  // treated as viable. This is mostly so we don't swallow our own errors.
-  #weClosedTheSource = false;
 
   constructor(it, pred) {
     this.#it = it;
@@ -114,9 +97,6 @@ class FilterHelper {
   // transition (return() guards on #finished; a predicate error guards on
   // wasLive), so it is never reached after a source done/error or a prior close.
   #closeSource() {
-    // We have entered the closing path; a source `done` from here on is just the
-    // source draining the close, not a sequence-ending wall.
-    this.#weClosedTheSource = true;
     return this.#it?.return();
   }
 
@@ -155,24 +135,14 @@ class FilterHelper {
         if (pos.status === 'removed') return;
         // TODO handle errors from reading `done`/`value` properties
         if (r.done) {
-          if (this.#weClosedTheSource) {
-            // We already closed the source, so this done is not a sequence-ending wall —
-            // it is just the source draining our it.return(). It must not discard an
-            // already-determined later position (e.g. a value, or a predicate error that
-            // triggered the close), which would silently swallow that outcome. Empty just
-            // this one slot, like a drop (no replacement, since we are finished), so a
-            // later value/error still compacts forward to its call.
-            pos.status = 'dropped';
-            this.#liveCount--;
-            this.#process();
-            return;
-          }
-          // The source is still open, so this done is the genuine terminal wall: discard
-          // its position and every later one (overriding any later error or later done) —
-          // those later positions are speculative over-pulls beyond the sequence's end.
-          // Pop from the back until the done record itself is popped. `pos` is still
-          // pending here (a pending head blocks delivery), so it has not been shifted off
-          // the front and the pop-loop reaches it; earlier positions are left untouched.
+          // A done is the terminal wall: discard its position and every later one
+          // (overriding any later value, later error, or later done). While the source
+          // was open those later positions are speculative over-pulls beyond the
+          // sequence's end; once we have closed the source they are in-flight pulls the
+          // close has now superseded. Either way the done wins. Pop from the back until
+          // the done record itself is popped. `pos` is still pending here (a pending head
+          // blocks delivery), so it has not been shifted off the front and the pop-loop
+          // reaches it; earlier positions are left untouched.
           let discarded;
           do {
             discarded = this.#positions.pop();

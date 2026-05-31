@@ -8,7 +8,8 @@
 // Internal model (per the spec):
 //
 //   * `#positions` is a plain array used as a queue, one entry per in-flight
-//     source pull, in pull order. Each entry is a record discriminated on
+//     source pull, in pull order (plus tombstones).
+//     Each entry is a record discriminated on
 //     `status` (one of 'pending' | 'value' | 'error' | 'dropped' | 'removed';
 //     see the #positions declaration for the full shape). Delivery happens
 //     strictly at the head (index 0), in call order: a head `value` resolves the
@@ -59,8 +60,6 @@ class FilterHelper {
   //     | 'ready'      // no wait: no close, or the close has already settled
   //     | 'awaiting'   // close pending, error not yet at the head of the queue
   //     | ((e: Error) => void) // close pending, error committed to its call — invoke to reject it
-  //
-  // See #predErrored.
   #positions = [];
 
   // Outstanding consumer next() calls in call order; each entry is
@@ -224,41 +223,39 @@ class FilterHelper {
           this.#process();
         }
       },
-      (e) => this.#predErrored(pos, e)
+      (err) => {
+        if (pos.status === 'removed') return;
+        pos.status = 'error';
+        pos.error = err;
+        const wasLive = !this.#finished; // is this error the terminal event?
+        this.#finished = true;
+        if (wasLive) {
+          // This error is the terminal event, so it closes the source. Its rejection
+          // must wait for the it.return() to settle, so while that close is pending the
+          // position is 'awaiting'. #process commits the error to its call by leaving a
+          // rejector in closeState (without blocking the values behind it); the single
+          // reaction below then either invokes that rejector or, if the error has not
+          // reached the head yet, flips closeState to 'ready' so it rejects in order
+          // once it does. A missing it.return(), a synchronous throw, or a non-thenable
+          // result is already settled — closeState stays 'ready' and there is no delay.
+          let r;
+          try {
+            r = this.#closeSource();
+          } catch {
+            // synchronous throw from it.return(): already settled, swallowed
+          }
+          if (r && typeof r.then === 'function') {
+            pos.closeState = 'awaiting';
+            const onClosed = () => {
+              if (typeof pos.closeState === 'function') pos.closeState(err);
+              else pos.closeState = 'ready';
+            };
+            r.then(onClosed, onClosed); // react once the close settles, swallowing it
+          }
+        }
+        this.#process();
+      }
     );
-  }
-
-  #predErrored(pos, err) {
-    if (pos.status === 'removed') return; // discarded
-    pos.status = 'error';
-    pos.error = err;
-    const wasLive = !this.#finished; // is this error the terminal event?
-    this.#finished = true;
-    if (wasLive) {
-      // This error is the terminal event, so it closes the source. Its rejection
-      // must wait for the it.return() to settle, so while that close is pending the
-      // position is 'awaiting'. #process commits the error to its call by leaving a
-      // rejector in closeState (without blocking the values behind it); the single
-      // reaction below then either invokes that rejector or, if the error has not
-      // reached the head yet, flips closeState to 'ready' so it rejects in order
-      // once it does. A missing it.return(), a synchronous throw, or a non-thenable
-      // result is already settled — closeState stays 'ready' and there is no delay.
-      let r;
-      try {
-        r = this.#closeSource();
-      } catch {
-        // synchronous throw from it.return(): already settled, swallowed
-      }
-      if (r && typeof r.then === 'function') {
-        pos.closeState = 'awaiting';
-        const onClosed = () => {
-          if (typeof pos.closeState === 'function') pos.closeState(err);
-          else pos.closeState = 'ready';
-        };
-        r.then(onClosed, onClosed); // react once the close settles, swallowing it
-      }
-    }
-    this.#process();
   }
 
   // ---- delivery ---------------------------------------------------------

@@ -7,71 +7,67 @@
 //
 // Internal model (per the spec):
 //
-//   * `#positions` is a plain array used as a queue, one entry per in-flight
-//     source pull, in pull order (plus tombstones).
-//     Each entry is a record discriminated on
-//     `status` (one of 'pending' | 'value' | 'error' | 'dropped' | 'removed';
-//     see the #positions declaration for the full shape). Delivery happens
-//     strictly at the head (index 0), in call order: a head `value` resolves the
-//     front call, a head `error` rejects it, a pending head blocks everything
-//     behind it.
-//     'removed' items are never actually present in the array; entries attain
-//     this status when being removed from the queue (because an earlier entry
-//     resolved with { done: true }).
-//   * A drop is recorded as a TOMBSTONE (status 'dropped') rather than removed
-//     in place; it lingers in the array until the head reaches it and is then
-//     shifted away. While live, a drop also issues a fresh replacement pull at
-//     the back of the queue.
+//   * `#positions` is a Set used as an ordered queue, one entry per in-flight
+//     source pull, in pull order (= insertion order). Each entry is a record
+//     discriminated on `status` (one of 'awaiting' | 'value' | 'error'; see the
+//     #positions declaration for the full shape). Delivery happens strictly at
+//     the head (the first-inserted entry), in call order: a head `value` resolves
+//     the front call, a head `error` rejects it, an `awaiting` head blocks
+//     everything behind it.
+//   * A drop deletes its position from the Set immediately. While live, a drop
+//     also issues a fresh replacement pull at the back of the queue.
 //   * A source `done` is the terminal wall: its position and every later one are
-//     discarded by popping from the back until the done record itself is popped.
-//     This holds unconditionally — whether the source finished on its own or is
-//     draining an it.return() we issued — so a `done` always wins over every later
-//     position, even one that has already settled with a value or an error.
+//     deleted from the Set. This holds unconditionally — whether the source
+//     finished on its own or is draining an it.return() we issued — so a `done`
+//     always wins over every later position, even one that has already settled
+//     with a value or an error.
+//   * Because positions leave the Set only by being delivered, dropped, or
+//     discarded, a pull/predicate settlement that arrives for a position no
+//     longer in the Set is stale (it was discarded by a `done` wall) and is
+//     ignored — that is the sole purpose of the #isIgnored membership check.
 //   * `#calls` is a plain array used as a FIFO of outstanding consumer `next()`
 //     calls, in call order; each entry is `{ resolve, reject }`.
-//   * `#liveCount` is the number of still-deliverable positions (pending / value
-//     / error — neither tombstoned nor discarded). It is the "value ceiling" V:
-//     once finished, whenever there are more outstanding calls than that, the
-//     trailing (most-recently made) surplus calls are released to `{done:true}`.
-//     The raw array length is not the ceiling because it still includes
-//     not-yet-skipped tombstones, so V is tracked as a counter instead.
+//   * `#positions.size` is the "value ceiling" V: the count of still-deliverable
+//     positions. Once finished, whenever there are more outstanding calls than
+//     that, the trailing (most-recently made) surplus calls are released to
+//     `{done:true}`.
 //
 // The collections are only ever as large as the concurrency window (the number
-// of simultaneously-outstanding `next()` calls), so plain-array push/shift/pop
-// are the right primitives — no auxiliary list structure is needed.
+// of simultaneously-outstanding `next()` calls). A Set gives ordered iteration
+// for head delivery together with O(1) deletion of an arbitrary dropped
+// position, and membership doubles as the "not yet discarded" test.
 
 class FilterHelper {
   // The source async iterator and the predicate.
   #it;
   #pred;
 
-  // Positions in pull order (see the model comment above). Each entry is one of:
+  // Positions in pull order (see the model comment above), held in a Set used as
+  // an ordered queue: insertion order is pull order, so the head is the
+  // first-inserted entry (`#head()`). Membership means "still live": a position
+  // is in the Set from when its pull is issued until it is delivered, dropped, or
+  // discarded by a terminal `done`. Each entry is one of:
   //
   //   type Position =
-  //     | { status: 'pending' }
+  //     | { status: 'awaiting' }
   //     | { status: 'value'; value: unknown }
-  //     | { status: 'dropped' }
   //     | { status: 'error'; error: unknown; closeState: CloseState }
-  //     | { status: 'removed' }
   //
-  // 'removed' is the terminal state of a position discarded by a terminal `done`
-  // wall: it is popped from the queue, and a later in-flight pull/predicate
-  // settlement for it is ignored. For a predicate-error position, the it.return()
-  // close must settle before the error is surfaced; `closeState` tracks that wait:
+  // A dropped value, and a position discarded by a terminal `done` wall, are both
+  // deleted from the Set; a pull/predicate settlement that later arrives for a
+  // discarded position finds it absent (#isIgnored) and is dropped on the floor.
+  // For a predicate-error position, the it.return() close must settle before the
+  // error is surfaced; `closeState` tracks that wait:
   //
   //   type CloseState =
   //     | 'ready'      // no wait: no close, or the close has already settled
-  //     | 'awaiting'   // close pending, error not yet at the head of the queue
+  //     | 'awaiting-return'   // close pending, error not yet at the head of the queue
   //     | ((e: Error) => void) // close pending, error committed to its call — invoke to reject it
-  #positions = [];
+  #positions = new Set();
 
   // Outstanding consumer next() calls in call order; each entry is
   // { resolve, reject }.
   #calls = [];
-
-  // The value ceiling V: count of still-deliverable positions (pending / value /
-  // error). Excludes tombstoned drops and discarded positions.
-  #liveCount = 0;
 
   // Lifecycle. A single boolean: true once a terminal event has occurred (source
   // done, source error, predicate error, or return()). No further source pulls are
@@ -97,13 +93,12 @@ class FilterHelper {
   // A synchronous throw from it.next() is a source error at that position.
   #issuePull() {
     const pos = {
-      status: 'pending',
+      status: 'awaiting',
       value: undefined,
       error: undefined,
       closeState: 'ready',
     };
-    this.#positions.push(pos);
-    this.#liveCount++;
+    this.#positions.add(pos);
     let result;
     try {
       result = this.#it.next();
@@ -120,24 +115,22 @@ class FilterHelper {
 
     Promise.resolve(result).then(
       (r) => {
-        if (pos.status === 'removed') return;
+        if (this.#isIgnored(pos)) return;
         // TODO handle errors from reading `done`/`value` properties
         if (r.done) {
           // A done is the terminal wall: discard its position and every later one
           // (overriding any later value, later error, or later done). While the source
           // was open those later positions are speculative over-pulls beyond the
           // sequence's end; once we have closed the source they are in-flight pulls the
-          // close has now superseded. Either way the done wins. Pop from the back until
-          // the done record itself is popped. `pos` is still pending here (a pending head
-          // blocks delivery), so it has not been shifted off the front and the pop-loop
-          // reaches it; earlier positions are left untouched.
-          let discarded;
-          do {
-            discarded = this.#positions.pop();
-            // Tombstoned drops were already counted out of #liveCount.
-            if (discarded.status !== 'dropped') this.#liveCount--;
-            discarded.status = 'removed';
-          } while (discarded !== pos);
+          // close has now superseded. Either way the done wins. `pos` is still awaiting
+          // here (an awaiting head blocks delivery), so it has not been delivered off the
+          // front; iterate in insertion (= pull) order and, from `pos` onward, delete.
+          // Earlier positions are left untouched.
+          let discarding = false;
+          for (const n of this.#positions) {
+            if (n === pos) discarding = true;
+            if (discarding) this.#positions.delete(n);
+          }
           this.#finished = true; // a clean done does not close the source.
           this.#processQueue();
         } else {
@@ -145,7 +138,7 @@ class FilterHelper {
         }
       },
       (e) => {
-        if (pos.status === 'removed') return;
+        if (this.#isIgnored(pos)) return;
         // Source error: a positional error that does NOT close the source.
         pos.status = 'error';
         pos.error = e;
@@ -175,13 +168,13 @@ class FilterHelper {
     }
     Promise.resolve(res).then(
       (keep) => {
-        if (pos.status === 'removed') return;
+        if (this.#isIgnored(pos)) return;
         if (keep) {
           pos.status = 'value';
           this.#processQueue();
         } else {
-          pos.status = 'dropped';
-          this.#liveCount--;
+          // A dropped value is deleted from the queue outright.
+          this.#positions.delete(pos);
           if (!this.#finished) {
             this.#issuePull();
           }
@@ -189,7 +182,7 @@ class FilterHelper {
         }
       },
       (err) => {
-        if (pos.status === 'removed') return;
+        if (this.#isIgnored(pos)) return;
         pos.status = 'error';
         pos.error = err;
         const wasLive = !this.#finished;
@@ -197,7 +190,7 @@ class FilterHelper {
         if (wasLive) {
           // This error is the terminal event, so it closes the source. Its rejection
           // must wait for the it.return() to settle, so while that close is pending the
-          // position is 'awaiting'. #processQueue commits the error to its call by leaving a
+          // position is 'awaiting-return'. #processQueue commits the error to its call by leaving a
           // rejector in closeState (without blocking the values behind it); the single
           // reaction below then either invokes that rejector or, if the error has not
           // reached the head yet, flips closeState to 'ready' so it rejects in order
@@ -210,7 +203,7 @@ class FilterHelper {
             // synchronous throw from it.return() gets swallowed
           }
           if (r && typeof r.then === 'function') {
-            pos.closeState = 'awaiting';
+            pos.closeState = 'awaiting-return';
             const onClosed = () => {
               if (typeof pos.closeState === 'function') pos.closeState(err);
               else pos.closeState = 'ready';
@@ -228,24 +221,18 @@ class FilterHelper {
   // ---- delivery ---------------------------------------------------------
 
   #processQueue() {
-    // 1) Compact leading tombstones (already out of #liveCount), so the head is
-    //    a real outcome or a pending position.
-    while (this.#positions.length > 0 && this.#positions[0].status === 'dropped') {
-      this.#positions.shift();
-    }
-
-    // 2) Deliver no-longer-pending values from the head, in order.
-    while (this.#calls.length > 0 && this.#positions.length > 0) {
-      const pos = this.#positions[0];
+    // 1) Deliver no-longer-awaiting values from the head, in order. Drops and
+    //    discarded positions have already been deleted from #positions, so the
+    //    head is always a real outcome or an awaiting position.
+    while (this.#calls.length > 0 && this.#positions.size > 0) {
+      const pos = this.#head();
       if (pos.status === 'value') {
-        this.#positions.shift();
-        this.#liveCount--;
+        this.#positions.delete(pos);
         this.#calls.shift().resolve({ value: pos.value, done: false });
       } else if (pos.status === 'error') {
-        this.#positions.shift();
-        this.#liveCount--;
+        this.#positions.delete(pos);
         const call = this.#calls.shift();
-        if (pos.closeState === 'awaiting') {
+        if (pos.closeState === 'awaiting-return') {
           // This error triggered `#it.return()`, and the result has not yet settled.
           // Since this is the head of the queue, we can commit it to this call by leaving a rejector for
           // the close reaction to invoke, and can still drop `pos` from `#positions`.
@@ -254,24 +241,33 @@ class FilterHelper {
           // assert: pos.closeState === 'ready'
           call.reject(pos.error);
         }
-      } else if (pos.status === 'dropped') {
-        this.#positions.shift();
       } else {
-        // assert: pos.status === 'pending'
+        // assert: pos.status === 'awaiting'
         break;
       }
     }
 
-    // 3) Once finished, the value ceiling (#liveCount) releases the trailing
+    // 2) Once finished, the value ceiling (#positions.size) releases the trailing
     //    (most-recently made) calls that exceed it to done. They are settled in
     //    call order, even though it is the latest calls being retired.
-    if (this.#finished && this.#calls.length > this.#liveCount) {
+    if (this.#finished && this.#calls.length > this.#positions.size) {
       // Release the trailing (most-recently-made) surplus calls to done.
-      const drained = this.#calls.splice(this.#liveCount);
+      const drained = this.#calls.splice(this.#positions.size);
       for (const call of drained) {
         call.resolve({ value: undefined, done: true });
       }
     }
+  }
+
+  // The head of the queue: the first-inserted (oldest) live position.
+  #head() {
+    return this.#positions.values().next().value;
+  }
+
+  // A settlement is stale if its position is no longer in the queue, which can
+  // only mean a terminal `done` wall discarded it.
+  #isIgnored(pos) {
+    return !this.#positions.has(pos);
   }
 
   // ---- consumer-facing iterator ----------------------------------------

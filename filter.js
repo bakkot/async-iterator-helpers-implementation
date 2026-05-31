@@ -85,7 +85,7 @@ class FilterHelper {
   // The open/closed distinction only matters after finishing: it tells a source
   // `done` whether it is a genuine terminal wall (open: caps speculative
   // over-pulls) or merely the source draining our it.return() (closed: empties
-  // one slot like a drop, never a wall). See #handleDone.
+  // one slot like a drop, never a wall).
 
   // True once a terminal event has occurred (source done, source error,
   // predicate error, or return()). No further source pulls are issued. While not
@@ -113,7 +113,7 @@ class FilterHelper {
   // wasLive), so it is never reached after a source done/error or a prior close.
   #closeSource() {
     // We have entered the closing path; a source `done` from here on is just the
-    // source draining the close, not a sequence-ending wall (see #handleDone).
+    // source draining the close, not a sequence-ending wall.
     this.#closed = true;
     if (typeof this.#it.return !== 'function') return undefined;
     return this.#it.return();
@@ -138,7 +138,7 @@ class FilterHelper {
     } catch (e) {
       // Synchronous throw: a source error at this position. Like the async paths,
       // #issuePull only records the outcome; delivery is driven by the caller's
-      // #process() (in next() or #handleDrop), so we do not process here.
+      // #process() (in next() or the predicate-false case), so we do not process here.
       pos.status = 'error';
       pos.error = e;
       this.#finished = true; // source faulted; never call it.return().
@@ -151,8 +151,37 @@ class FilterHelper {
     Promise.resolve(result).then(
       (r) => {
         if (pos.status === 'removed') return;
-        if (r && r.done) this.#handleDone(pos);
-        else this.#invokePred(pos, r ? r.value : undefined);
+        if (r && r.done) {
+          if (this.#closed) {
+            // We already closed the source, so this done is not a sequence-ending wall —
+            // it is just the source draining our it.return(). It must not discard an
+            // already-determined later position (e.g. a value, or a predicate error that
+            // triggered the close), which would silently swallow that outcome. Empty just
+            // this one slot, like a drop (no replacement, since we are finished), so a
+            // later value/error still compacts forward to its call.
+            pos.status = 'dropped';
+            this.#liveCount--;
+            this.#process();
+            return;
+          }
+          // The source is still open, so this done is the genuine terminal wall: discard
+          // its position and every later one (overriding any later error or later done) —
+          // those later positions are speculative over-pulls beyond the sequence's end.
+          // Pop from the back until the done record itself is popped. `pos` is still
+          // pending here (a pending head blocks delivery), so it has not been shifted off
+          // the front and the pop-loop reaches it; earlier positions are left untouched.
+          let discarded;
+          do {
+            discarded = this.#positions.pop();
+            // Tombstoned drops were already counted out of #liveCount.
+            if (discarded.status !== 'dropped') this.#liveCount--;
+            discarded.status = 'removed';
+          } while (discarded !== pos);
+          this.#finished = true; // a clean done does not close the source.
+          this.#process();
+        } else {
+          this.#invokePred(pos, r ? r.value : undefined);
+        }
       },
       (e) => {
         if (pos.status === 'removed') return;
@@ -187,7 +216,12 @@ class FilterHelper {
           pos.status = 'value';
           this.#process();
         } else {
-          this.#handleDrop(pos);
+          pos.status = 'dropped';
+          this.#liveCount--;
+          if (!this.#finished) {
+            this.#issuePull();
+          }
+          this.#process();
         }
       },
       (e) => this.#predErrored(pos, e)
@@ -224,60 +258,6 @@ class FilterHelper {
         r.then(onClosed, onClosed); // react once the close settles, swallowing it
       }
     }
-    this.#process();
-  }
-
-  // ---- drops and done ---------------------------------------------------
-
-  // Precondition: pos is not 'removed'. The sole caller (#invokePred's predicate
-  // reaction) checks that and reaches here synchronously, so no re-check is needed.
-  #handleDrop(pos) {
-    // Tombstone the dropped position: it stays in #positions until the head
-    // reaches it (then it is shifted away), but no longer counts toward the
-    // value ceiling. Surviving values still deliver strictly in pull order, so
-    // an already-known later value shifts forward to the earliest waiting call.
-    pos.status = 'dropped';
-    this.#liveCount--;
-    if (!this.#finished) {
-      // Still live: the outstanding call still needs a value, so issue a fresh
-      // pull at the BACK of the queue. It does not take the dropped slot — its
-      // value is just another candidate, behind everything already pulled.
-      this.#issuePull();
-    }
-    // If finished, the position is simply gone; the value ceiling in #process()
-    // will release a trailing call to done.
-    this.#process();
-  }
-
-  // Precondition: pos is not 'removed'. The sole caller (#issuePull's pull
-  // reaction) checks that and reaches here synchronously, so no re-check is needed.
-  #handleDone(pos) {
-    if (this.#closed) {
-      // We already closed the source, so this done is not a sequence-ending wall —
-      // it is just the source draining our it.return(). It must not discard an
-      // already-determined later position (e.g. a value, or a predicate error that
-      // triggered the close), which would silently swallow that outcome. Empty just
-      // this one slot, like a drop (no replacement, since we are finished), so a
-      // later value/error still compacts forward to its call.
-      pos.status = 'dropped';
-      this.#liveCount--;
-      this.#process();
-      return;
-    }
-    // The source is still open, so this done is the genuine terminal wall: discard
-    // its position and every later one (overriding any later error or later done) —
-    // those later positions are speculative over-pulls beyond the sequence's end.
-    // Pop from the back until the done record itself is popped. `pos` is still
-    // pending here (a pending head blocks delivery), so it has not been shifted off
-    // the front and the pop-loop reaches it; earlier positions are left untouched.
-    let discarded;
-    do {
-      discarded = this.#positions.pop();
-      // Tombstoned drops were already counted out of #liveCount.
-      if (discarded.status !== 'dropped') this.#liveCount--;
-      discarded.status = 'removed';
-    } while (discarded !== pos);
-    this.#finished = true; // a clean done does not close the source.
     this.#process();
   }
 

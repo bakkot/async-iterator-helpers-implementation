@@ -228,8 +228,9 @@ class FilterHelper {
 
   // ---- drops and done ---------------------------------------------------
 
+  // Precondition: pos is not 'removed'. The sole caller (#invokePred's predicate
+  // reaction) checks that and reaches here synchronously, so no re-check is needed.
   #handleDrop(pos) {
-    if (pos.status === 'removed') return;
     // Tombstone the dropped position: it stays in #positions until the head
     // reaches it (then it is shifted away), but no longer counts toward the
     // value ceiling. Surviving values still deliver strictly in pull order, so
@@ -247,8 +248,9 @@ class FilterHelper {
     this.#process();
   }
 
+  // Precondition: pos is not 'removed'. The sole caller (#issuePull's pull
+  // reaction) checks that and reaches here synchronously, so no re-check is needed.
   #handleDone(pos) {
-    if (pos.status === 'removed') return;
     if (this.#closed) {
       // We already closed the source, so this done is not a sequence-ending wall —
       // it is just the source draining our it.return(). It must not discard an

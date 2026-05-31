@@ -1,49 +1,9 @@
-// filter(it, pred) — see filter-spec.md
-//
-// Returns a new async iterator (a FilterHelper) that yields the values of the
-// async iterator `it` for which the (possibly async) predicate `pred` returns a
-// truthy value, dropping the rest. The result supports concurrent `next()`
-// calls.
-//
-// Internal model (per the spec):
-//
-//   * `#positions` is a Set used as an ordered queue, one entry per in-flight
-//     source pull, in pull order (= insertion order). Each entry is a record
-//     discriminated on `status` (one of 'awaiting' | 'value' | 'error'; see the
-//     #positions declaration for the full shape). Delivery happens strictly at
-//     the head (the first-inserted entry), in call order: a head `value` resolves
-//     the front call, a head `error` rejects it, an `awaiting` head blocks
-//     everything behind it.
-//   * A drop deletes its position from the Set immediately. While live, a drop
-//     also issues a fresh replacement pull at the back of the queue.
-//   * A source `done` is the terminal wall: its position and every later one are
-//     deleted from the Set. This holds unconditionally — whether the source
-//     finished on its own or is draining an it.return() we issued — so a `done`
-//     always wins over every later position, even one that has already settled
-//     with a value or an error.
-//   * Because positions leave the Set only by being delivered, dropped, or
-//     discarded, a pull/predicate settlement that arrives for a position no
-//     longer in the Set is stale (it was discarded by a `done` wall) and is
-//     ignored — that is the sole purpose of the #isIgnored membership check.
-//   * `#calls` is a plain array used as a FIFO of outstanding consumer `next()`
-//     calls, in call order; each entry is `{ resolve, reject }`.
-//   * `#positions.size` is the "value ceiling" V: the count of still-deliverable
-//     positions. Once finished, whenever there are more outstanding calls than
-//     that, the trailing (most-recently made) surplus calls are released to
-//     `{done:true}`.
-//
-// The collections are only ever as large as the concurrency window (the number
-// of simultaneously-outstanding `next()` calls). A Set gives ordered iteration
-// for head delivery together with O(1) deletion of an arbitrary dropped
-// position, and membership doubles as the "not yet discarded" test.
-
 class FilterHelper {
-  // The source async iterator and the predicate.
   #it;
   #pred;
 
-  // Positions in pull order (see the model comment above), held in a Set used as
-  // an ordered queue: insertion order is pull order, so the head is the
+  // Positions is an ordered queue of results or placeholders for results,
+  // held in a Set: insertion order is pull order, so the head is the
   // first-inserted entry (`#head()`). Membership means "still live": a position
   // is in the Set from when its pull is issued until it is delivered, dropped, or
   // discarded by a terminal `done`. Each entry is one of:
@@ -69,17 +29,6 @@ class FilterHelper {
   // { resolve, reject }.
   #calls = [];
 
-  // Lifecycle. A single boolean: true once a terminal event has occurred (source
-  // done, source error, predicate error, or return()). No further source pulls are
-  // issued. While not finished the source is necessarily live, and every terminal
-  // transition flips this true in the same synchronous step.
-  //
-  // We do not track whether WE closed the source (via it.return()) versus the
-  // source finishing on its own, because it makes no difference: a source `done`
-  // is a terminal wall regardless, discarding every later position. The "close
-  // exactly once, only while live" rule is enforced by the #finished guards on the
-  // two closing callers (return() and the predicate-error path), not by a separate
-  // closed flag.
   #finished = false;
 
   constructor(it, pred) {
@@ -87,10 +36,6 @@ class FilterHelper {
     this.#pred = pred;
   }
 
-  // ---- pulling ----------------------------------------------------------
-
-  // Issue one source pull, appended as a new position at the back of the queue.
-  // A synchronous throw from it.next() is a source error at that position.
   #issuePull() {
     const pos = {
       status: 'awaiting',
@@ -103,13 +48,12 @@ class FilterHelper {
     try {
       result = this.#it.next();
     } catch (e) {
-      // Synchronous throw: a source error at this position. Like the async paths,
-      // #issuePull only records the outcome; delivery is driven by the caller's
-      // #processQueue() (in next() or the predicate-false case), so we do not process here.
       pos.status = 'error';
       pos.error = e;
       pos.closeState = 'ready'
-      this.#finished = true; // source faulted; never call it.return().
+      this.#finished = true;
+      // source faulted so we do not call it.return().
+      // don't need to call #processQueue because callers are about to anyway.
       return;
     }
 
@@ -119,13 +63,7 @@ class FilterHelper {
         // TODO handle errors from reading `done`/`value` properties
         if (r.done) {
           // A done is the terminal wall: discard its position and every later one
-          // (overriding any later value, later error, or later done). While the source
-          // was open those later positions are speculative over-pulls beyond the
-          // sequence's end; once we have closed the source they are in-flight pulls the
-          // close has now superseded. Either way the done wins. `pos` is still awaiting
-          // here (an awaiting head blocks delivery), so it has not been delivered off the
-          // front; iterate in insertion (= pull) order and, from `pos` onward, delete.
-          // Earlier positions are left untouched.
+          // (overriding any later value, later error, or later done).
           //
           // This is theoretically quadratic in the degree of concurrency: if we issue
           // N pulls and they all settle with { done: true } back-to-front, then
@@ -145,17 +83,15 @@ class FilterHelper {
       },
       (e) => {
         if (this.#isIgnored(pos)) return;
-        // Source error: a positional error that does NOT close the source.
         pos.status = 'error';
         pos.error = e;
         pos.closeState = 'ready';
-        this.#finished = true; // never call it.return() after a source error.
+        this.#finished = true;
+        // source faulted so we do not call it.return().
         this.#processQueue();
       }
     );
   }
-
-  // ---- predicate --------------------------------------------------------
 
   #invokePred(pos, value) {
     pos.value = value;
@@ -164,6 +100,7 @@ class FilterHelper {
     // synchronous throw is funneled through a rejected promise so it takes the
     // exact same deferred path as an asynchronous rejection — the source close
     // it triggers then lands after any delivery this same step unblocked.
+    //
     // TODO reconsider: maybe we shouldn't have to pay a microtask tick if the
     // predicate synchronously returns true or false.
     let res;
@@ -179,7 +116,6 @@ class FilterHelper {
           pos.status = 'value';
           this.#processQueue();
         } else {
-          // A dropped value is deleted from the queue outright.
           this.#positions.delete(pos);
           if (!this.#finished) {
             this.#issuePull();
@@ -223,8 +159,6 @@ class FilterHelper {
       }
     );
   }
-
-  // ---- delivery ---------------------------------------------------------
 
   #processQueue() {
     // 1) Deliver no-longer-awaiting values from the head, in order. Drops and
@@ -284,7 +218,7 @@ class FilterHelper {
     }
     const { resolve, reject, promise } = Promise.withResolvers();
     this.#calls.push({ resolve, reject });
-    this.#issuePull(); // one pull per next().
+    this.#issuePull();
     this.#processQueue();
     return promise;
   }
@@ -304,7 +238,6 @@ class FilterHelper {
       return Promise.reject(e);
     }
 
-    // Outstanding calls keep their in-flight pulls; the ceiling governs them.
     this.#processQueue();
 
     return Promise.resolve(r).then(() => ({ value, done: true }));

@@ -1747,4 +1747,56 @@ tests.push(['filter: a compacted source error rejects before the tail done', asy
   ]);
 }]);
 
+// Directly targets the worry that #issuePull's *synchronous* error branch does
+// not call #processQueue itself: if a buried synchronous source error needs no
+// subsequent next() to surface, then the only thing that drives the queue
+// forward is the earlier blocking position settling on its own. Here pull #1's
+// value is dropped, issuing replacement pull #2 which throws synchronously while
+// pull #0 is still pending — so the error sits buried, and NO further next() is
+// ever called. When pull #0 finally yields a passing value, r0 takes it and the
+// buried error must then reach r1. If the synchronous branch truly stranded the
+// error, r1 would stay pending forever and the final assertion would fail.
+tests.push(['filter: a buried synchronous source error surfaces with no subsequent next()', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  const r1 = f.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  // Arm the replacement pull to throw synchronously.
+  src.throwNext(new Error('replacement throw'));
+
+  // Pull #1 yields out of order while pull #0 is still pending; its predicate runs.
+  src.yield(1, 20);
+  await flushMicrotasks();
+  t.expectLog('the later value runs the predicate', ['pred(20) #0']);
+
+  // Dropping it issues replacement pull #2, which throws synchronously. The error
+  // is buried behind the still-pending pull #0, so nothing settles — and from here
+  // on no further next() is ever called.
+  pred.resolve(0, false);
+  await flushMicrotasks();
+  t.expectLog('replacement throws but the error is buried behind the pending head', [
+    'src.next() #2 (throws)',
+  ]);
+
+  // The earlier pull finally yields a passing value: r0 takes it, then the buried
+  // error must reach r1 — driven only by this settlement, not by any new next().
+  src.yield(0, 10);
+  await flushMicrotasks();
+  t.expectLog('the earlier value runs the predicate', ['pred(10) #1']);
+
+  pred.resolve(1, true);
+  await flushMicrotasks();
+  t.expectLog('earlier value delivered, then the buried error reaches r1', [
+    'r0 resolved {"value":10,"done":false}',
+    'r1 rejected replacement throw',
+  ]);
+}]);
+
 runTests(tests);

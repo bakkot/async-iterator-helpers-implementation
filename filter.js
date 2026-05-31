@@ -46,9 +46,9 @@ class FilterHelper {
   //
   //   type Position =
   //     | { status: 'pending' }
-  //     | { status: 'value';   value: unknown }
+  //     | { status: 'value'; value: unknown }
   //     | { status: 'dropped' }
-  //     | { status: 'error';   error: unknown; closeState: CloseState }
+  //     | { status: 'error'; error: unknown; closeState: CloseState }
   //     | { status: 'removed' }
   //
   // 'removed' is the terminal state of a position discarded by a terminal `done`
@@ -71,10 +71,10 @@ class FilterHelper {
   #liveCount = 0;
 
   // Lifecycle. Two booleans, but only THREE of the four combinations are
-  // reachable: #closed is only ever set on the same synchronous step that sets
+  // reachable: #weClosedTheSource is only ever set on the same synchronous step that sets
   // #finished (see #closeSource), so a closed-but-not-finished state never exists.
   //
-  //   #finished  #closed   state
+  //   #finished  #weClosedTheSource   state
   //   ---------  -------   -----------------------------------------------------
   //   false      false     live — source open, still pulling
   //   true       false     finished WITHOUT closing — source done or source error
@@ -93,9 +93,12 @@ class FilterHelper {
   #finished = false;
 
   // True once we have closed the source via it.return() (a predicate error or a
-  // return() call) — but NOT for a source done or source error, which finish
-  // without closing.
-  #closed = false;
+  // return() call).
+  // We need this because if the source finishes on its own we assume we can
+  // discard everything past that point, whereas if WE close it values which
+  // are still in flight (even if they are past a { done: true }) still get
+  // treated as viable. This is mostly so we don't swallow our own errors.
+  #weClosedTheSource = false;
 
   constructor(it, pred) {
     this.#it = it;
@@ -113,9 +116,8 @@ class FilterHelper {
   #closeSource() {
     // We have entered the closing path; a source `done` from here on is just the
     // source draining the close, not a sequence-ending wall.
-    this.#closed = true;
-    if (typeof this.#it.return !== 'function') return undefined;
-    return this.#it.return();
+    this.#weClosedTheSource = true;
+    return this.#it?.return();
   }
 
   // ---- pulling ----------------------------------------------------------
@@ -140,6 +142,7 @@ class FilterHelper {
       // #process() (in next() or the predicate-false case), so we do not process here.
       pos.status = 'error';
       pos.error = e;
+      pos.closeState = 'ready'
       this.#finished = true; // source faulted; never call it.return().
       return;
     }
@@ -150,8 +153,9 @@ class FilterHelper {
     Promise.resolve(result).then(
       (r) => {
         if (pos.status === 'removed') return;
-        if (r && r.done) {
-          if (this.#closed) {
+        // TODO handle errors from reading `done`/`value` properties
+        if (r.done) {
+          if (this.#weClosedTheSource) {
             // We already closed the source, so this done is not a sequence-ending wall —
             // it is just the source draining our it.return(). It must not discard an
             // already-determined later position (e.g. a value, or a predicate error that
@@ -179,7 +183,7 @@ class FilterHelper {
           this.#finished = true; // a clean done does not close the source.
           this.#process();
         } else {
-          this.#invokePred(pos, r ? r.value : undefined);
+          this.#invokePred(pos, r.value);
         }
       },
       (e) => {
@@ -187,6 +191,7 @@ class FilterHelper {
         // Source error: a positional error that does NOT close the source.
         pos.status = 'error';
         pos.error = e;
+        pos.closeState = 'ready';
         this.#finished = true; // never call it.return() after a source error.
         this.#process();
       }
@@ -242,7 +247,7 @@ class FilterHelper {
           try {
             r = this.#closeSource();
           } catch {
-            // synchronous throw from it.return(): already settled, swallowed
+            // synchronous throw from it.return() gets swallowed
           }
           if (r && typeof r.then === 'function') {
             pos.closeState = 'awaiting';
@@ -250,7 +255,9 @@ class FilterHelper {
               if (typeof pos.closeState === 'function') pos.closeState(err);
               else pos.closeState = 'ready';
             };
-            r.then(onClosed, onClosed); // react once the close settles, swallowing it
+            r.then(onClosed, onClosed);
+          } else {
+            pos.closeState = 'ready';
           }
         }
         this.#process();
@@ -267,11 +274,7 @@ class FilterHelper {
       this.#positions.shift();
     }
 
-    // 2) Deliver from the head, in order. A pending head blocks everything
-    //    behind it (its outcome could still be a drop, which would shift later
-    //    values forward). A head error never blocks: even one still awaiting its
-    //    source close is committed to the head call and deferred (below), letting
-    //    the values behind it flow on.
+    // 2) Deliver no-longer-pending values from the head, in order.
     while (this.#calls.length > 0 && this.#positions.length > 0) {
       const pos = this.#positions[0];
       if (pos.status === 'value') {
@@ -283,19 +286,19 @@ class FilterHelper {
         this.#liveCount--;
         const call = this.#calls.shift();
         if (pos.closeState === 'awaiting') {
-          // The predicate-error close has not settled yet. Unlike a pending
-          // position, a head error has a fixed recipient (it cannot be dropped onto
-          // an earlier call), so commit it to this call by leaving a rejector for
-          // the close reaction to invoke — without blocking the values behind it,
-          // which keep flowing to the later calls below.
+          // This error triggered `#it.return()`, and the result has not yet settled.
+          // Since this is the head of the queue, we can commit it to this call by leaving a rejector for
+          // the close reaction to invoke, and can still drop `pos` from `#positions`.
           pos.closeState = call.reject;
         } else {
-          call.reject(pos.error); // 'ready': no close pending
+          // assert: pos.closeState === 'ready'
+          call.reject(pos.error);
         }
       } else if (pos.status === 'dropped') {
-        this.#positions.shift(); // a tombstone exposed mid-loop
+        this.#positions.shift();
       } else {
-        break; // pending
+        // assert: pos.status === 'pending'
+        break;
       }
     }
 
@@ -317,31 +320,25 @@ class FilterHelper {
     if (this.#finished) {
       return Promise.resolve({ value: undefined, done: true });
     }
-    let resolve, reject;
-    const p = new Promise((res, rej) => {
-      resolve = res;
-      reject = rej;
-    });
+    const { resolve, reject, promise } = Promise.withResolvers();
     this.#calls.push({ resolve, reject });
     this.#issuePull(); // one pull per next().
     this.#process();
-    return p;
+    return promise;
   }
 
   return(value) {
     if (this.#finished) {
+      // TODO do we await this value?
       return Promise.resolve({ value, done: true });
     }
     this.#finished = true;
 
-    // Close the source before resolving. We were not yet finished (guarded
-    // above), so the source is necessarily still live and this is the single
-    // live -> finished transition that closes it. A synchronous throw from
-    // it.return() rejects this return() call.
     let r;
     try {
       r = this.#closeSource();
     } catch (e) {
+      // i.e. calling .return threw
       this.#process();
       return Promise.reject(e);
     }
@@ -351,14 +348,8 @@ class FilterHelper {
 
     return Promise.resolve(r).then(() => ({ value, done: true }));
   }
-
-  [Symbol.asyncIterator]() {
-    return this;
-  }
 }
 
-export default function filter(it, pred) {
+export function filter(it, pred) {
   return new FilterHelper(it, pred);
 }
-
-export { filter, FilterHelper };

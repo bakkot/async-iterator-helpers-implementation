@@ -1,3 +1,7 @@
+export function filter(it, pred) {
+  return new FilterHelper(it, pred);
+}
+
 class FilterHelper {
   #it;
   #pred;
@@ -48,6 +52,8 @@ class FilterHelper {
     try {
       result = this.#it.next();
     } catch (e) {
+      // TODO reconsider whether this really needs to happen same-tick
+      // we could instead fold it into the rejection case
       pos.status = 'error';
       pos.error = e;
       pos.closeState = 'ready'
@@ -157,6 +163,7 @@ class FilterHelper {
           } catch {
             // synchronous throw from it.return() gets swallowed
           }
+          // TODO Promise.resolve? if not, handle errors from .then
           if (r && typeof r.then === 'function') {
             pos.closeState = 'awaiting-return';
             const onClosed = () => {
@@ -219,6 +226,9 @@ class FilterHelper {
     const { resolve, reject, promise } = Promise.withResolvers();
     this.#calls.push({ resolve, reject });
     this.#issuePull();
+
+    // TODO reconsider whether this is the appropriate place for this
+    // as opposed to triggering when the head of queue changes state
     this.#processQueue();
     return promise;
   }
@@ -242,8 +252,4 @@ class FilterHelper {
 
     return Promise.resolve(r).then(() => ({ value, done: true }));
   }
-}
-
-export function filter(it, pred) {
-  return new FilterHelper(it, pred);
 }

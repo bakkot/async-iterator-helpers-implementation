@@ -159,7 +159,7 @@ class FilterHelper {
           // result is already settled — closeState stays 'ready' and there is no delay.
           let r;
           try {
-            r = this.#it?.return();
+            r = this.#it.return?.();
           } catch {
             // synchronous throw from it.return() gets swallowed
           }
@@ -242,7 +242,7 @@ class FilterHelper {
 
     let r;
     try {
-      r = this.#it?.return();
+      r = this.#it.return?.();
     } catch (e) {
       this.#processQueue();
       return Promise.reject(e);

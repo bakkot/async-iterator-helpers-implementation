@@ -35,7 +35,7 @@ class MapHelper {
         // errors from calling .return() are swallowed, as in IteratorClose,
         // whether .return() throws synchronously or returns a rejected promise
         try {
-          return Promise.resolve(this.#it?.return()).finally(() => Promise.reject(err));
+          return Promise.resolve(this.#it.return?.()).finally(() => Promise.reject(err));
         } catch {
           return Promise.reject(err);
         }
@@ -52,7 +52,7 @@ class MapHelper {
       return { value: undefined, done: true };
     }
     this.#done = true;
-    await this.#it?.return();
+    await this.#it.return?.();
     return { value: undefined, done: true };
   }
 }

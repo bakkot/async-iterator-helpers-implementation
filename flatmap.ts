@@ -48,9 +48,11 @@ type Nextable = { next: () => unknown };
 type MaybeReturnable = { return?: () => unknown };
 
 class FlatMapHelper {
-  #it: unknown;
+  #underlying: unknown;
   #fn: unknown;
 
+  // TODO this should just be the .values, so we don't prevent the iterators from being GC'd
+  // invariant: index [0] is non-empty
   readonly #closedButStillHaveValuesInFlight: InFlight[] = [];
 
   #active: ActiveState = { type: 'unstarted' };
@@ -62,8 +64,8 @@ class FlatMapHelper {
 
   #calls: { resolve: (v: unknown) => void, reject: (v: unknown) => void }[] = [];
 
-  constructor(it: unknown, fn: unknown) {
-    this.#it = it;
+  constructor(underlying: unknown, fn: unknown) {
+    this.#underlying = underlying;
     this.#fn = fn;
   }
 
@@ -81,8 +83,10 @@ class FlatMapHelper {
   }
 
   #isHeadOfQueue(slot: Slot) {
-    return this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0].values.length > 0 && this.#closedButStillHaveValuesInFlight[0].values[0] === slot
-      || this.#active.type === 'iter' && this.#active.values.length > 0 && this.#active.values[0] === slot; // TODO think about whether this.#active.values can ever be empty
+    return this.#closedButStillHaveValuesInFlight.length === 0
+      ? this.#active.type === 'iter' && this.#active.values.length > 0 && this.#active.values[0] === slot // TODO think about whether this.#active.values can ever be empty
+        ||this.#active.type === 'error' && this.#active === slot
+      : this.#closedButStillHaveValuesInFlight[0].values[0] === slot; // assert: this.#closedButStillHaveValuesInFlight[0].values.length > 0
   }
 
   #truncateInFlightFrom(inFlight: InFlight, index: number) {
@@ -99,6 +103,13 @@ class FlatMapHelper {
       slot.type = 'removed';
     }
     inFlight.values.length = index;
+    if (index === 0) {
+      if (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight) {
+        do {
+          this.#closedButStillHaveValuesInFlight.shift();
+        } while (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0].values.length === 0);
+      }
+    }
   }
 
   #issuePullFromCurrentActive() {
@@ -122,14 +133,10 @@ class FlatMapHelper {
         if ((iterResult as { done: boolean }).done) {
           const removedCount = thisIterValues.length - thisSlotIndex;
           // assert removedCount > 0: we have not already truncated this value
-          this.#truncateInFlightFrom(inFlight, thisSlotIndex + 1);
-          --thisIterValues.length; // also remove this slot
-          if (thisIterValues.length === 0) {
-            inFlight.iter = null; // for memory reasons
-          }
+          this.#truncateInFlightFrom(inFlight, thisSlotIndex);
 
           if (this.#active.type === 'iter') {
-            if (this.#active.iter === actualIter) { // in real life this is a spec-internal IteratorRecord, so we don't have to worry about the case where the same iterator is returned twice
+            if (this.#active === inFlight) {
               if (thisIterValues.length > 0) {
                 this.#closedButStillHaveValuesInFlight.push(this.#active);
               }
@@ -145,8 +152,7 @@ class FlatMapHelper {
                 this.#issuePullFromCurrentActive();
               }
 
-              // head-of-queue case:
-              if (this.#closedButStillHaveValuesInFlight[0] === inFlight && thisIterValues.length === 0) {
+              if (this.#isHeadOfQueue(slot)) { // strictly speaking this does a redundant `this.#active.type === 'iter' && this.#active.values[0] === slot`, but whatever
                 this.#processQueue();
               }
             }
@@ -178,24 +184,6 @@ class FlatMapHelper {
         slotButWithTypeScript.error = error;
         slotButWithTypeScript.closeState = 'awaiting-return';
 
-        // TODO account for the case that one of the values being dropped has the return-promise in it
-        // and... I guess promote it?
-        // or reconsider this design; maybe that Promise doesn't live on error
-        let dropped = thisIterValues.length - thisSlotIndex - 1; // -1 because we aren't dropping this slot
-        this.#truncateInFlightFrom(inFlight, thisSlotIndex + 1);
-
-        if (this.#active !== inFlight) {
-          const indexOfThisInFlight = this.#closedButStillHaveValuesInFlight.indexOf(inFlight);
-          // assert idx >= 0
-          for (let i = indexOfThisInFlight + 1; i < this.#closedButStillHaveValuesInFlight.length; ++i) {
-            const thatInFlight = this.#closedButStillHaveValuesInFlight[i];
-            dropped += thatInFlight.values.length;
-            this.#truncateInFlightFrom(thatInFlight, 0);
-          }
-        }
-        // TODO consider order for this vs resolving with the error, in the case that slot is head-of-queue and we don't need to block on a .return call
-        this.#markSomeCallsAsNoLongerGettingValues(dropped);
-
         if (this.#active.type === 'iter') {
           const active = this.#active;
           this.#closedButStillHaveValuesInFlight.push(this.#active);
@@ -216,7 +204,7 @@ class FlatMapHelper {
             }
             let returnPromise2;
             try {
-              returnPromise2 = (this.#it as MaybeReturnable).return?.();
+              returnPromise2 = (this.#underlying as MaybeReturnable).return?.();
             } catch {
               // synchronous throw from return() gets swallowed
             }
@@ -261,39 +249,52 @@ class FlatMapHelper {
           return;
         }
         if (this.#active.type === 'reading underlying') {
+          // TODO if we have already invoked #fn, the result might be an iterator, which we would need to close... which also means waiting for it...
+          // also means distinguish 'reading underlying' vs 'waiting for mapper'
+          // maybe we can make _the subsequent { done: true }_ wait??? it must exist b/c it was waiting for this value. need to think more / about other cases / effects on filter etc.
+
           this.#active = { type: 'finished' };
           this.#closeUnderlyingForError(slotButWithTypeScript as Error);
           return;
           // TODO do exceptions from the fn call at this point go into unhandled promise rejection
         }
-        if (this.#active.type === 'error') {
-          // we are going to squash this error
+        // assert this.#active.type === 'error' || this.#active.type === 'finished'
+        if (this.#isHeadOfQueue(slot)) {
+          this.#processQueue();
         }
-        // assert this.#active.type === 'error' || this.
-        // TODO processQueue, if this error was at head
       },
     );
+  }
+
+  #markUnderlyingAsFinished() {
+    // assert this.#active.type === 'reading underlying'
+    const maxLive = Math.sumPrecise(this.#closedButStillHaveValuesInFlight.map(x => x.values.length));
+    this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - maxLive);
+    this.#active = { type: 'finished' };
   }
 
   #issuePullFromUnderlying(requested: number) {
     // assert: this.#active.type === 'unstarted' || this.#active.type === 'iter'; // latter case is when we just got { done: true } from previous active
     this.#active = { type: 'reading underlying', requested };
 
-    fastPromiseTry(() => (this.#it as Nextable).next()).then(
+    fastPromiseTry(() => (this.#underlying as Nextable).next()).then(
       r => {
         if (this.#finished) return;
+        // assert this.#active.type === 'reading underlying'
+        if ((r as { done: boolean }).done) {
+          this.#markUnderlyingAsFinished();
+          return;
+        }
 
-        // TODO handle done case
-
-
+        // NB we don't await value; contract is non-promise here
         fastPromiseTry(() => (this.#fn as (r: unknown) => AsyncIterable<unknown>)((r as { value: unknown }).value)).then(
           iter => {
             if (this.#finished) return;
+            // assert this.#active.type === 'reading underlying'
 
             // TODO handle sync iterators / iterables
             // TODO consider how to deal with distinguishing sync iterator from async iterator
             try {
-              // assert this.#active.type === 'reading underlying';
               const actualIter = iter[Symbol.asyncIterator]();
 
               const { requested } = (this.#active as ReadingUnderlyingState);
@@ -310,16 +311,26 @@ class FlatMapHelper {
           },
           error => {
             if (this.#finished) return;
-            this.#closeUnderlyingForErrorInMapper(error);
+            // assert this.#active.type === 'reading underlying'
+            this.#active = { type: 'error', error, closeState: 'ready' };
+            if (this.#closedButStillHaveValuesInFlight.length === 0) {
+              this.#processQueue();
+            }
+            this.#markUnderlyingAsFinished();
+            // TODO think about order of truncation vs processQueue call (mostly just needs to be consistent w/ elsewhere)
           }
         );
       },
       error => {
         if (this.#finished) return;
+        // assert this.#active.type === 'reading underlying'
 
         this.#active = { type: 'error', error, closeState: 'ready' };
-        // TODO only do this if #maxLiveInClosedButStillHaveValuesInFlight === 0?
-        this.#processQueue();
+        if (this.#closedButStillHaveValuesInFlight.length === 0) {
+          this.#processQueue();
+        }
+        this.#markUnderlyingAsFinished();
+        // TODO think about order of truncation vs processQueue call (mostly just needs to be consistent w/ elsewhere)
         return;
       }
     );
@@ -332,17 +343,16 @@ class FlatMapHelper {
     const slot = { type: 'error', error, closeState: 'awaiting-return', reject: null, count: 1 } as const;
     this.#active = slot;
     this.#closeUnderlyingForError(slot);
+    // TODO truncation
   }
 
   #closeUnderlyingForError(slot: Error) {
     // assert: slot.type === 'error'
     // assert: slot.closeState === 'awaiting-return';
 
-    // TODO truncate #calls at all callers
-
     let returnPromise;
     try {
-      returnPromise = (this.#it as MaybeReturnable).return?.();
+      returnPromise = (this.#underlying as MaybeReturnable).return?.();
     } catch {
       // synchronous throw from it.return() gets swallowed
     }
@@ -370,6 +380,36 @@ class FlatMapHelper {
 
   #processQueue() {
     // TODO
+    // assert: we are going to do at least one unit of work
+    while (this.#closedButStillHaveValuesInFlight.length > 0) {
+      const head = this.#closedButStillHaveValuesInFlight[0];
+      while (head.values.length > 0) {
+        const headHead = head.values[0];
+        if (headHead.type === 'awaiting') {
+          return;
+        }
+        head.values.shift();
+        if (headHead.type === 'value') {
+          this.#calls.shift()!.resolve({ done: false, value: headHead.value });
+        } else if (headHead.type === 'error') {
+          const call = this.#calls.shift()!;
+          if (headHead.closeState === 'awaiting-return') {
+            // This error triggered `.return()`, and the result has not yet settled.
+            // Since this is the head of the queue, we can commit it to this call by leaving a rejector for
+            // the close reaction to invoke, and can still drop `headHead` from the inFlight values.
+            headHead.reject = call.reject;
+          } else {
+            // assert: headHead.closeState === 'ready'
+            call.reject(headHead.error);
+          }
+        } else {
+          // unreachable
+          console.error('unreachable');
+          throw new Error('unreachable');
+        }
+      }
+      this.#closedButStillHaveValuesInFlight.shift();
+    }
   }
 
   next() {
@@ -388,5 +428,9 @@ class FlatMapHelper {
       // TODO
     }
     return promise;
+  }
+
+  return() {
+    // TODO
   }
 }

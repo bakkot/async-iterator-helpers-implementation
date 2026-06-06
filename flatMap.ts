@@ -236,7 +236,7 @@ class FlatMapHelper {
                   }
                 };
                 Promise.resolve(returnPromise1).then(onClosed, onClosed);
-                Promise.resolve(returnPromise1).then(onClosed, onClosed);
+                Promise.resolve(returnPromise2).then(onClosed, onClosed);
               }
             }
           }

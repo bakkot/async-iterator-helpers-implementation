@@ -773,9 +773,10 @@ tests.push(['flatMap: a later inner error does not lose an earlier in-flight inn
 // iterator is being closed, so those values arguably cannot be delivered) and is
 // deliberately NOT asserted here — see the no-in-flight-call setups below.
 
-// return() before anything has started: nothing was ever pulled, so nothing is
-// closed; it simply resolves done and future calls are done.
-tests.push(['flatMap: return() before starting resolves done without pulling or closing', async function (t) {
+// return() before anything has started: nothing was ever pulled, but the
+// underlying is still closed (matching map/filter, which call .return()
+// unconditionally). No src.next() happens; future calls are done.
+tests.push(['flatMap: return() before starting closes the underlying without pulling', async function (t) {
   const src = controlledSource(t.log, 'src');
   const m = controlledFn(t.log, 'm');
   const fm = flatMap(src.iterator, m.fn);
@@ -784,8 +785,11 @@ tests.push(['flatMap: return() before starting resolves done without pulling or 
   t.check('return() returns a promise', ret instanceof Promise, true);
   if (ret instanceof Promise) track(t.log, 'ret', ret);
   await flushMicrotasks();
-  // No src.next() and no src.return(): the source was never touched.
-  t.expectLog('return() resolves done having touched nothing', ['ret resolved {"done":true}']);
+  // No src.next() (nothing was ever pulled), but the underlying is still closed.
+  t.expectLog('return() closes the underlying without pulling, then resolves done', [
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
 
   const r0 = fm.next();
   track(t.log, 'r0', r0);

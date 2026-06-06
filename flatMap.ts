@@ -461,7 +461,12 @@ class FlatMapHelper {
 
   return() {
     if (this.#active.type === 'unstarted') {
+      // Nothing has been pulled yet, but — as in map and filter — return() still
+      // closes the underlying. (No outstanding calls exist: the first next() would
+      // have moved us out of 'unstarted'.)
       this.#active = { type: 'finished' };
+      return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
+        .then(() => ({ value: undefined, done: true }));
     }
     if (this.#finished) {
       return Promise.resolve({ value: undefined, done: true });

@@ -476,10 +476,11 @@ function checkInvariants(rec) {
   // (Whether flatMap WRONGLY closes a self-finished iterator is caught live as a
   // return-after-finish violation, so we only check the leak direction here.)
   if (rec.finishedNaturally) {
-    // The underlying only needs closing if it was ever pulled (return() before
-    // the first pull correctly touches nothing).
-    if (rec.underlying.pulls.length > 0 && !rec.underlying.naturalFinished && rec.underlying.returnCalls === 0) {
-      add(`underlying was left open at termination (pulled, not finished, not .return()'d): leak`);
+    // The underlying must be closed once the helper terminates unless it finished
+    // on its own -- including a return() before the first pull (map/filter close
+    // it unconditionally), so this is NOT exempted for the never-pulled case.
+    if (!rec.underlying.naturalFinished && rec.underlying.returnCalls === 0) {
+      add(`underlying was left open at termination (not finished, not .return()'d): leak`);
     }
     for (const inner of rec.inners) {
       if (inner.pulls.length === 0) {

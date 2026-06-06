@@ -2,6 +2,15 @@ export function flatMap(it: unknown, fn: unknown) {
   return new FlatMapHelper(it, fn);
 }
 
+function ASSERT(condition: boolean, message: string) {
+  if (!condition) {
+    console.error('assert failed: ' + message, (new Error).stack);
+    setTimeout(() => {
+      throw new Error('an assertion failed, see stderr');
+    }, 0); // do in a timeout so nothing can swallow it
+  }
+}
+
 function fastPromiseTry<T>(cb: () => T): Promise<Awaited<T>> {
   try {
     return Promise.resolve(cb());
@@ -65,7 +74,7 @@ class FlatMapHelper {
   }
 
   #markSomeCallsAsNoLongerGettingValues(removedCount: number) {
-    // assert count < this.#calls.length
+    ASSERT(removedCount <= this.#calls.length, 'removedCount <= calls.length');
     const mightStillGetValues = this.#calls.length - removedCount;
     for (let i = 0; i < removedCount; ++i) {
       this.#calls[mightStillGetValues + i].resolve({ value: undefined, done: true });
@@ -81,7 +90,7 @@ class FlatMapHelper {
   }
 
   #truncateInFlightFrom(inFlight: InFlight, index: number) {
-    // assert index >= 0; index < inFlight.values.length
+    ASSERT(index >= 0 && index < inFlight.values.length, 'index in range');
     for (let i = index; i < inFlight.values.length; ++i) {
       const slot = inFlight.values[i];
       if (slot.type === 'value') {
@@ -89,7 +98,7 @@ class FlatMapHelper {
       } else if (slot.type === 'error') {
         slot.error = null; // for memory reasons
       } else {
-        // assert slot.type === 'awaiting';
+        ASSERT(slot.type === 'awaiting', 'slot awaiting');
       }
       slot.type = 'removed';
     }
@@ -104,7 +113,7 @@ class FlatMapHelper {
   }
 
   #issuePullFromCurrentActive() {
-    // assert this.#active.type === 'iter'
+    ASSERT(this.#active.type === 'iter', 'active is iter');
 
     const slot: Slot = { type: 'awaiting' } as Slot; // the cast is not a no-op
     const inFlight = this.#active as InFlight;
@@ -118,7 +127,7 @@ class FlatMapHelper {
         // got iterator result from non-underlying iterator
 
         if (slot.type === 'removed') return;
-        // assert slot.type === 'awaiting'
+        ASSERT(slot.type === 'awaiting', 'slot awaiting');
 
         if ((iterResult as { done: boolean }).done) {
           // Find the current index: earlier slots of this iterator may have been
@@ -126,7 +135,7 @@ class FlatMapHelper {
           // captured at issue time would be stale.
           const currentIndex = thisIterValues.indexOf(slot);
           const removedCount = thisIterValues.length - currentIndex;
-          // assert removedCount > 0: we have not already truncated this value
+          ASSERT(removedCount > 0, 'have not already truncated this value');
 
           // Does removing these slots change the head of the queue (revealing
           // something that was buffered behind this iterator)? Only if this pull was
@@ -137,6 +146,8 @@ class FlatMapHelper {
           // behind the active iterator anyway.) Capture before truncating pops it.
           const exposedNewHead = currentIndex === 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight;
 
+          ASSERT(this.#closedButStillHaveValuesInFlight.includes(inFlight) || this.#active === inFlight, 'inFlight is still tracked');
+
           this.#truncateInFlightFrom(inFlight, currentIndex);
 
           if (this.#active.type === 'iter') {
@@ -146,7 +157,6 @@ class FlatMapHelper {
               }
               this.#issuePullFromUnderlying(removedCount);
             } else {
-              // assert: this.#closedButStillHaveValuesInFlight.includes(inFlight)
               // strictly speaking, if thisIterValues is now empty we could remove it
               // but, no real reason to; we'll pop when it gets to the head of the queue
 
@@ -157,7 +167,7 @@ class FlatMapHelper {
           } else if (this.#active.type === 'reading underlying') {
             this.#active.requested += removedCount;
           } else {
-            // assert this.#active.type === 'error || this.#active.type === 'finished'
+            ASSERT(this.#active.type === 'error' || this.#active.type === 'finished', 'active is error or finished');
 
             this.#markSomeCallsAsNoLongerGettingValues(removedCount);
           }
@@ -181,7 +191,7 @@ class FlatMapHelper {
         // got error from non-underlying iterator
 
         if (slot.type === 'removed') return;
-        // assert slot.type === 'awaiting'
+        ASSERT(slot.type === 'awaiting', 'slot awaiting');
         slot.type = 'error';
         const slotButWithTypeScript = slot as Extract<Error, { closeState: 'awaiting-return' }>;
         slotButWithTypeScript.error = error;
@@ -216,12 +226,12 @@ class FlatMapHelper {
             const onClosed = () => {
               // runs on either settlement of underlying.return(), swallowing its error
               if (slotButWithTypeScript.reject) {
-                // assert slot.type !== 'removed'
+                ASSERT((slot as Slot).type !== 'removed', 'slot not removed');
                 slotButWithTypeScript.reject(error);
               } else {
                 if ((slot as Slot).type === 'removed') return; // TODO make sure this is really what we want
                 (slot as Error).closeState = 'ready';
-                // assert: not head of queue
+                ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
               }
             };
             const closeUnderlying = () => {
@@ -246,7 +256,7 @@ class FlatMapHelper {
           return;
           // TODO do exceptions from the fn call at this point go into unhandled promise rejection
         }
-        // assert this.#active.type === 'error' || this.#active.type === 'finished'
+        ASSERT(this.#active.type === 'error' || this.#active.type === 'finished', 'active is error or finished');
         // nothing to close in this case
         (slot as Error).closeState = 'ready';
         if (this.#isHeadOfQueue(slot)) {
@@ -257,7 +267,7 @@ class FlatMapHelper {
   }
 
   #markUnderlyingAsFinished() {
-    // assert this.#active.type === 'reading underlying' || 'iter' (latter only via return())
+    ASSERT(this.#active.type === 'reading underlying' || this.#active.type === 'iter', 'active is reading underlying or iter'); // latter only via return()
     if (this.#active.type === 'iter' && this.#active.values.length > 0) {
       this.#closedButStillHaveValuesInFlight.push(this.#active);
     }
@@ -267,13 +277,13 @@ class FlatMapHelper {
   }
 
   #issuePullFromUnderlying(requested: number) {
-    // assert: this.#active.type === 'unstarted' || this.#active.type === 'iter'; // latter case is when we just got { done: true } from previous active
+    ASSERT(this.#active.type === 'unstarted' || this.#active.type === 'iter', 'active is unstarted or iter'); // latter case is when we just got { done: true } from previous active
     this.#active = { type: 'reading underlying', requested };
 
     fastPromiseTry(() => (this.#underlying as Nextable).next()).then(
       r => {
         if (this.#finished) return;
-        // assert this.#active.type === 'reading underlying'
+        ASSERT(this.#active.type === 'reading underlying', 'active is reading underlying');
         if ((r as { done: boolean }).done) {
           this.#markUnderlyingAsFinished();
           return;
@@ -283,7 +293,7 @@ class FlatMapHelper {
         fastPromiseTry(() => (this.#fn as (r: unknown) => AsyncIterable<unknown>)((r as { value: unknown }).value)).then(
           iter => {
             if (this.#finished) return;
-            // assert this.#active.type === 'reading underlying'
+            ASSERT(this.#active.type === 'reading underlying', 'active is reading underlying');
 
             // TODO handle sync iterators / iterables
             // TODO consider how to deal with distinguishing sync iterator from async iterator
@@ -304,14 +314,14 @@ class FlatMapHelper {
           },
           error => {
             if (this.#finished) return;
-            // assert this.#active.type === 'reading underlying'
+            ASSERT(this.#active.type === 'reading underlying', 'active is reading underlying');
             this.#closeUnderlyingForErrorInMapper(error);
           }
         );
       },
       error => {
         if (this.#finished) return;
-        // assert this.#active.type === 'reading underlying'
+        ASSERT(this.#active.type === 'reading underlying', 'active is reading underlying');
 
         // The underlying errored while fetching the next inner iterator. It is NOT
         // closed (it reported the error itself). Values buffered in already-parked
@@ -332,7 +342,7 @@ class FlatMapHelper {
   }
 
   #closeUnderlyingForErrorInMapper(error: unknown) {
-    // assert: this.#active.type === 'reading underlying'
+    ASSERT(this.#active.type === 'reading underlying', 'active is reading underlying');
     const requested = this.#active.type === 'reading underlying' ? this.#active.requested : 1;
     const slot = { type: 'error', error, closeState: 'awaiting-return', reject: null } as const;
     this.#markSomeCallsAsNoLongerGettingValues(requested - 1);
@@ -341,8 +351,8 @@ class FlatMapHelper {
   }
 
   #closeUnderlyingForError(slot: Error) {
-    // assert: slot.type === 'error'
-    // assert: slot.closeState === 'awaiting-return';
+    ASSERT(slot.type === 'error', 'slot is error');
+    ASSERT(slot.closeState === 'awaiting-return', 'slot awaiting-return');
 
     let returnPromise;
     try {
@@ -361,13 +371,13 @@ class FlatMapHelper {
       this.#processQueue();
     }
     const onClosed = () => {
-      // assert: slot.closeState === 'awaiting-return'
+      ASSERT(slot.closeState === 'awaiting-return', 'slot awaiting-return');
       const slotButWithTypeScript = slot as Extract<Error, { closeState: 'awaiting-return' }>;
       if (slotButWithTypeScript.reject) {
         slotButWithTypeScript.reject(slot.error);
       } else {
         slot.closeState = 'ready';
-        // assert: not head of queue
+        ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
       }
     };
     // TODO fast path for non-promise?
@@ -391,7 +401,7 @@ class FlatMapHelper {
         // the close reaction to invoke, and can still drop `headHead` from the inFlight values.
         head.reject = call.reject;
       } else {
-        // assert: headHead.closeState === 'ready'
+        ASSERT(head.closeState === 'ready', 'closeState ready');
         call.reject(head.error);
       }
     } else {
@@ -443,7 +453,7 @@ class FlatMapHelper {
     } else if (this.#active.type === 'reading underlying') {
       ++this.#active.requested;
     } else {
-      // assert this.#active.type === 'iter'
+      ASSERT(this.#active.type === 'iter', 'active is iter');
       // cannot be error because we guarded on this.#finished above
       this.#issuePullFromCurrentActive();
     }
@@ -485,7 +495,7 @@ class FlatMapHelper {
       );
     }
 
-    // assert active.type === 'reading underlying'
+    ASSERT(active.type === 'reading underlying', 'active is reading underlying');
     // TODO if we're actually blocked on the mapper here, we probably need to handle closing the result
     return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
       .then(() => ({ value: undefined, done: true }));

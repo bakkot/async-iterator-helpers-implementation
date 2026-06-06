@@ -1180,4 +1180,141 @@ tests.push(['flatMap: after return(), an inner done settles only its own outstan
   ]);
 }]);
 
+// --- the two-close error path -----------------------------------------------
+//
+// When an inner iterator's *in-flight* pull rejects while a DIFFERENT inner
+// iterator is still live, two things are open and must be closed: the live
+// active iterator and the underlying. (The iterator whose pull rejected is
+// already exhausted by that rejection, so it is not closed.) The two closes are
+// done SEQUENTIALLY — active iterator first, then the underlying, matching the
+// order return() uses — and the rejection is surfaced only once BOTH closes have
+// settled. Any error from either .return() is swallowed; the original error wins.
+//
+// Setup for both tests below: inner A reports done with pull #0 still in flight
+// (A is parked in the closed queue), the freed demand produces a live inner B,
+// and then A's lingering pull #0 rejects.
+
+tests.push(['flatMap: a mid-stream inner error closes the active iterator then the underlying, sequentially', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  // A reports done at pull #1 with pull #0 still in flight: A is parked in the
+  // closed queue (keeping #0), and the freed demand (1) redirects to a new
+  // underlying pull -> iterator B.
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A done redirects the freed demand to another underlying pull', ['src.next() #1']);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked again', ['m(2) #1']);
+
+  const B = controlledSource(t.log, 'B');
+  m.resolve(1, B.iterator);
+  await flushMicrotasks();
+  t.expectLog('the redirected demand pulls the live inner B', ['B.next() #0']);
+
+  // Hold both .return()s so we can observe their ordering and confirm the
+  // rejection is withheld until both settle.
+  src.holdReturn();
+  B.holdReturn();
+
+  // A's lingering pull #0 rejects. B is the live active iterator, so it is closed
+  // FIRST; the underlying is not touched yet, and nothing is surfaced.
+  A.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the active inner iterator is closed first, alone', ['B.return() #0']);
+
+  // Once B's close settles, the underlying is closed next — still no rejection.
+  B.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('only then is the underlying closed', ['src.return() #0']);
+
+  // Only after BOTH closes settle does the error reach the call scanning into A.
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('the rejection surfaces after both closes settle', ['r0 rejected boom']);
+
+  // r1 was committed to B's still-pending pull; it remains open (B was closed,
+  // but its already-requested pull is never settled here) and is left untracked.
+  void r1;
+}]);
+
+tests.push(['flatMap: the two-close error path swallows an error from closing the active iterator', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A done redirects the freed demand to another underlying pull', ['src.next() #1']);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked again', ['m(2) #1']);
+
+  // Hand-roll B so its .return() rejects, to prove that close error is swallowed.
+  const bReturn = Promise.withResolvers();
+  const B = {
+    next() { t.log('B.next() #0'); return Promise.withResolvers().promise; },
+    return() { t.log('B.return() #0'); return bReturn.promise; },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  m.resolve(1, B);
+  await flushMicrotasks();
+  t.expectLog('the redirected demand pulls the live inner B', ['B.next() #0']);
+
+  // Hold the underlying close so its ordering after B is observable.
+  src.holdReturn();
+
+  A.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the active inner iterator is closed first, alone', ['B.return() #0']);
+
+  // B's close FAILS. The failure is swallowed; the underlying is still closed.
+  bReturn.reject(new Error('inner-close-fail'));
+  await flushMicrotasks();
+  t.expectLog('the close failure is swallowed and the underlying is still closed', ['src.return() #0']);
+
+  // The original error (not the close failure) surfaces once both closes settle.
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('the original error wins once both closes settle', ['r0 rejected boom']);
+
+  void r1;
+}]);
+
 runTests(tests);

@@ -13,20 +13,17 @@ function fastPromiseTry<T>(cb: () => T): Promise<Awaited<T>> {
 type Slot =
   | { type: 'awaiting' }
   | { type: 'value', value: unknown }
-  | ErrorWithPossiblyTwoCloses
+  | Error
   | { type: 'removed' }
 
 type InFlight = { type: 'iter', iter: unknown, readonly values: Slot[] }
 
-// For errors from the mapper or from result iterators, we invoke underlying.return()
-// This call must settle before the error is surfaced.
+// For errors from the mapper or from result iterators, we invoke .return() on
+// whatever is still open (the underlying, and possibly an active inner iterator).
+// Those calls must settle before the error is surfaced.
 type Error =
   | { type: 'error', error: unknown, closeState: 'ready', reject?: null }
-  | { type: 'error', error: unknown, closeState: 'awaiting-return', reject: null | ((e: unknown) => void), count: 1 }
-
-type ErrorWithPossiblyTwoCloses =
-  | Error
-  | { type: 'error', error: unknown, closeState: 'awaiting-return', reject: null | ((e: unknown) => void), count: 2 }
+  | { type: 'error', error: unknown, closeState: 'awaiting-return', reject: null | ((e: unknown) => void) }
 
 type ReadingUnderlyingState = { type: 'reading underlying', requested: number /* integer > 0 */ };
 
@@ -174,7 +171,7 @@ class FlatMapHelper {
         if (slot.type === 'removed') return;
         // assert slot.type === 'awaiting'
         slot.type = 'error';
-        const slotButWithTypeScript = slot as Extract<ErrorWithPossiblyTwoCloses, { closeState: 'awaiting-return' }>;
+        const slotButWithTypeScript = slot as Extract<Error, { closeState: 'awaiting-return' }>;
         slotButWithTypeScript.error = error;
         slotButWithTypeScript.closeState = 'awaiting-return';
 
@@ -187,58 +184,34 @@ class FlatMapHelper {
             // just gotta close underlying
             this.#closeUnderlyingForError(slotButWithTypeScript as Error);
           } else {
-            // gotta close both underlying and active, ugh
-            // TODO consider whether to block on closing active before closing underlying
-
-            let returnPromise1;
-            try {
-              returnPromise1 = (active as MaybeReturnable).return?.();
-            } catch {
-              // synchronous throw from return() gets swallowed
+            // The errored slot lives in an iterator that already reported done (it's
+            // parked in the closed queue); a *different* iterator (`active`) is still
+            // live. Two things are open: `active` and the underlying. Close them
+            // sequentially — the active inner iterator first, then the underlying,
+            // matching the order return() uses — and surface the error only once both
+            // closes have settled. Errors from either .return() are swallowed.
+            const activeIter = active.iter;
+            slotButWithTypeScript.closeState = 'awaiting-return';
+            // Commit the call (if any) waiting on this slot before the closes settle,
+            // so onClosed has a rejector to invoke; otherwise we mark it ready.
+            if (this.#isHeadOfQueue(slot)) {
+              this.#processQueue();
             }
-            let returnPromise2;
-            try {
-              returnPromise2 = (this.#underlying as MaybeReturnable).return?.();
-            } catch {
-              // synchronous throw from return() gets swallowed
-            }
-            if (returnPromise1 === undefined && returnPromise2 === undefined) {
-              (slotButWithTypeScript as Error).closeState = 'ready';
-              if (this.#isHeadOfQueue(slot)) {
-                this.#processQueue();
-              }
-            } else {
-              slotButWithTypeScript.closeState = 'awaiting-return';
-              if (returnPromise1 == undefined || returnPromise2 == undefined) {
-                const onClosed = () => {
-                  if (slotButWithTypeScript.reject) {
-                    // assert slot.type !== 'removed'
-                    slotButWithTypeScript.reject(error);
-                  } else {
-                    if ((slot as Slot).type === 'removed') return; // TODO make sure this is really what we want
-                    (slot as Error).closeState = 'ready';
-                    // assert: not head of queue
-                  }
-                };
-                Promise.resolve(returnPromise1 ?? returnPromise2).then(onClosed, onClosed);
+            const onClosed = () => {
+              if (slotButWithTypeScript.reject) {
+                // assert slot.type !== 'removed'
+                slotButWithTypeScript.reject(error);
               } else {
-                slotButWithTypeScript.count = 2;
-                const onClosed = () => {
-                  if (slotButWithTypeScript.count === 2) {
-                    --slotButWithTypeScript.count;
-                  } else if (slotButWithTypeScript.reject) {
-                    // assert slot.type !== 'removed'
-                    slotButWithTypeScript.reject(error);
-                  } else {
-                    if ((slot as Slot).type === 'removed') return; // TODO make sure this is really what we want
-                    (slot as Error).closeState = 'ready';
-                    // assert: not head of queue
-                  }
-                };
-                Promise.resolve(returnPromise1).then(onClosed, onClosed);
-                Promise.resolve(returnPromise2).then(onClosed, onClosed);
+                if ((slot as Slot).type === 'removed') return; // TODO make sure this is really what we want
+                (slot as Error).closeState = 'ready';
+                // assert: not head of queue
               }
-            }
+            };
+            const swallow = () => {};
+            fastPromiseTry(() => (activeIter as MaybeReturnable).return?.())
+              .then(swallow, swallow)
+              .then(() => fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.()).then(swallow, swallow))
+              .then(onClosed);
           }
           return;
         }
@@ -333,7 +306,7 @@ class FlatMapHelper {
   #closeUnderlyingForErrorInMapper(error: unknown) {
     // assert: this.#active.type === 'reading underlying'
     const requested = this.#active.type === 'reading underlying' ? this.#active.requested : 1;
-    const slot = { type: 'error', error, closeState: 'awaiting-return', reject: null, count: 1 } as const;
+    const slot = { type: 'error', error, closeState: 'awaiting-return', reject: null } as const;
     this.#markSomeCallsAsNoLongerGettingValues(requested - 1);
     this.#active = slot;
     this.#closeUnderlyingForError(slot);

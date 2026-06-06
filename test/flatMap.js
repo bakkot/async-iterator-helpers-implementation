@@ -554,4 +554,371 @@ tests.push(['flatMap: next() returns a promise', async function (t) {
   t.expectLog('the settled call resolves done', ['rDone resolved {"done":true}']);
 }]);
 
+// --- Errors -----------------------------------------------------------------
+//
+// The error model mirrors map/filter:
+//   * An error *from* the underlying iterator (a rejected `.next()`) is surfaced
+//     to the dependent call but does NOT close the underlying — there is never a
+//     `src.return()` after observing an underlying error.
+//   * An error *in* the mapper, or *from* an inner (result) iterator, DOES close
+//     the underlying via `src.return()`; per the async-iteration model the close
+//     must settle before the error is surfaced to the consumer (though the close
+//     result itself is swallowed).
+// A rejected inner `.next()` exhausts that inner iterator, so we never call
+// `.return()` on the erroring inner iterator itself — only on the underlying.
+
+// An error from the underlying `.next()` is surfaced without closing the source.
+tests.push(['flatMap: an error from the underlying iterator does not close it', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls the underlying', ['src.next() #0']);
+
+  src.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  // No `src.return()`: the underlying error is surfaced without closing.
+  t.expectLog('underlying error rejects, source left open', ['r0 rejected boom']);
+
+  const r1 = fm.next();
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('a subsequent next() is done', ['r1 resolved {"done":true}']);
+}]);
+
+// A synchronous throw from the mapper closes the underlying (like a map/filter
+// predicate throw) and the result rejects.
+tests.push(['flatMap: a synchronous throw from the mapper closes the underlying iterator', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const fm = flatMap(src.iterator, () => { throw new Error('boom'); });
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls the underlying', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper throw closes the source, then rejects', [
+    'src.return() #0',
+    'r0 rejected boom',
+  ]);
+
+  const r1 = fm.next();
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('a subsequent next() is done', ['r1 resolved {"done":true}']);
+}]);
+
+// An asynchronous mapper rejection behaves the same as a synchronous throw: it
+// closes the underlying and the result rejects.
+tests.push(['flatMap: an async mapper rejection closes the underlying iterator', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls the underlying', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked', ['m(1) #0']);
+
+  m.reject(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the mapper rejection closes the source, then rejects', [
+    'src.return() #0',
+    'r0 rejected boom',
+  ]);
+
+  const r1 = fm.next();
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('a subsequent next() is done', ['r1 resolved {"done":true}']);
+}]);
+
+// An error from an inner (result) iterator's `.next()` closes the UNDERLYING
+// (but not the erroring inner iterator, which a rejected next has exhausted), and
+// the result rejects.
+tests.push(['flatMap: an error from an inner iterator closes the underlying iterator', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls the underlying', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('the inner iterator is pulled', ['A.next() #0']);
+
+  // The inner iterator's pull rejects. That closes the underlying (only — not the
+  // already-exhausted inner iterator), then the rejection surfaces.
+  A.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the inner error closes the underlying, then rejects', [
+    'src.return() #0',
+    'r0 rejected boom',
+  ]);
+
+  const r1 = fm.next();
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('a subsequent next() is done', ['r1 resolved {"done":true}']);
+}]);
+
+// When a mapper error closes the underlying via `src.return()`, the rejection
+// must not surface until that `src.return()` settles. Hand-rolled so `.return()`
+// returns a promise the test settles on demand (the controlled source settles
+// `.return()` synchronously).
+tests.push(['flatMap: a mapper error waits for underlying.return() to settle before rejecting', async function (t) {
+  let nextId = 0;
+  const pulls = [];
+  const returnDeferred = Promise.withResolvers();
+  const source = {
+    next() {
+      const i = nextId++;
+      t.log(`src.next() #${i}`);
+      const d = Promise.withResolvers();
+      pulls[i] = d;
+      return d.promise;
+    },
+    return() {
+      t.log('src.return() #0');
+      return returnDeferred.promise; // deliberately not settled yet
+    },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  const fm = flatMap(source, () => { throw new Error('boom'); });
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls the underlying', ['src.next() #0']);
+
+  pulls[0].resolve({ value: 1, done: false });
+  await flushMicrotasks();
+  // The mapper throws, so the underlying is closed — but the rejection is
+  // withheld because `src.return()` has not settled.
+  t.expectLog('the mapper error closes the source but withholds the rejection', [
+    'src.return() #0',
+  ]);
+
+  returnDeferred.resolve({ value: undefined, done: true });
+  await flushMicrotasks();
+  t.expectLog('the rejection surfaces only after the close settles', [
+    'r0 rejected boom',
+  ]);
+}]);
+
+// Values are not lost: a later inner pull errors first (closing the underlying),
+// but an earlier in-flight inner value still reaches its call before the error is
+// surfaced to the call scanning into it. Mirrors the map/filter invariant.
+tests.push(['flatMap: a later inner error does not lose an earlier in-flight inner value', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('two concurrent inner pulls', ['A.next() #0', 'A.next() #1']);
+
+  // The later inner pull (#1) errors first. It closes the underlying, but it sits
+  // behind the still-pending pull #0, so nothing is surfaced yet.
+  A.throw(1, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the later inner error closes the source but waits behind the earlier pull', [
+    'src.return() #0',
+  ]);
+
+  // Pull #0 yields: its value reaches r0 (not lost), then the error reaches r1.
+  A.yield(0, 'a0');
+  await flushMicrotasks();
+  t.expectLog('the earlier value is delivered, then the error reaches the later call', [
+    'r0 resolved {"value":"a0","done":false}',
+    'r1 rejected boom',
+  ]);
+}]);
+
+// --- return() ---------------------------------------------------------------
+//
+// return() means "no more demand". It closes whatever is still open — the active
+// inner iterator (if any) and the underlying — and resolves to a done result.
+// Future next() calls are done. As in map/filter, a source that has already
+// finished (clean done) or errored is NOT closed again.
+//
+// NOTE: the disposition of calls that are *already in flight* on the active inner
+// iterator when return() lands is a genuine open design question (the active
+// iterator is being closed, so those values arguably cannot be delivered) and is
+// deliberately NOT asserted here — see the no-in-flight-call setups below.
+
+// return() before anything has started: nothing was ever pulled, so nothing is
+// closed; it simply resolves done and future calls are done.
+tests.push(['flatMap: return() before starting resolves done without pulling or closing', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const ret = fm.return();
+  t.check('return() returns a promise', ret instanceof Promise, true);
+  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  // No src.next() and no src.return(): the source was never touched.
+  t.expectLog('return() resolves done having touched nothing', ['ret resolved {"done":true}']);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('a next() after return() is done', ['r0 resolved {"done":true}']);
+}]);
+
+// return() while still reading the underlying (a pull is in flight, no inner
+// iterator yet) closes the underlying and resolves done.
+tests.push(['flatMap: return() while reading the underlying closes the source', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  // Not tracked: whether this in-flight call settles done is the open question
+  // noted above; intended behavior is that it is done.
+  const r0 = fm.next();
+  await flushMicrotasks();
+  t.expectLog('a pull is in flight', ['src.next() #0']);
+
+  const ret = fm.return();
+  t.check('return() returns a promise', ret instanceof Promise, true);
+  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes the underlying and resolves done', [
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+
+  const r1 = fm.next();
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('a next() after return() is done', ['r1 resolved {"done":true}']);
+}]);
+
+// return() while an inner iterator is active (and quiescent — its one delivered
+// value left no pull in flight) closes BOTH the inner iterator and the
+// underlying, in that order, and resolves done. A second return() is a no-op.
+tests.push(['flatMap: return() closes the active inner iterator and the underlying, and is idempotent', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls the underlying', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('the inner iterator is pulled', ['A.next() #0']);
+
+  // Deliver the one value so the active iterator has no pull in flight.
+  A.yield(0, 'a0');
+  await flushMicrotasks();
+  t.expectLog('the value is delivered, leaving the inner iterator active but idle', [
+    'r0 resolved {"value":"a0","done":false}',
+  ]);
+
+  const ret = fm.return();
+  t.check('return() returns a promise', ret instanceof Promise, true);
+  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  // The active inner iterator is closed first, then the underlying.
+  t.expectLog('return() closes the inner iterator then the underlying', [
+    'A.return() #0',
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+
+  const ret2 = fm.return();
+  t.check('a second return() returns a promise', ret2 instanceof Promise, true);
+  if (ret2 instanceof Promise) track(t.log, 'ret2', ret2);
+  await flushMicrotasks();
+  t.expectLog('a second return() closes nothing again', ['ret2 resolved {"done":true}']);
+}]);
+
+// return() after the underlying has cleanly finished must not close it.
+tests.push(['flatMap: return() after a clean done does not close the source', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls the underlying', ['src.next() #0']);
+
+  src.finish(0);
+  await flushMicrotasks();
+  t.expectLog('the underlying is exhausted', ['r0 resolved {"done":true}']);
+
+  const ret = fm.return();
+  t.check('return() returns a promise', ret instanceof Promise, true);
+  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  // No src.return(): a finished source is not closed again.
+  t.expectLog('return() after a clean done does not close the source', [
+    'ret resolved {"done":true}',
+  ]);
+}]);
+
+// return() after the underlying has errored must not close it.
+tests.push(['flatMap: return() after an underlying error does not close the source', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls the underlying', ['src.next() #0']);
+
+  src.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the underlying error rejects the call', ['r0 rejected boom']);
+
+  const ret = fm.return();
+  t.check('return() returns a promise', ret instanceof Promise, true);
+  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  // No src.return(): the source faulted, so it is not closed.
+  t.expectLog('return() after an underlying error does not close the source', [
+    'ret resolved {"done":true}',
+  ]);
+}]);
+
 runTests(tests);

@@ -352,7 +352,6 @@ class FlatMapHelper {
     }
     if (returnPromise === undefined) {
       slot.closeState = 'ready';
-      // TODO process head-of-queue
       if (this.#isHeadOfQueue(slot)) {
         this.#processQueue();
       }

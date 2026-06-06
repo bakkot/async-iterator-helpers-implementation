@@ -109,7 +109,6 @@ class FlatMapHelper {
     const slot: Slot = { type: 'awaiting' } as Slot; // the cast is not a no-op
     const inFlight = this.#active as InFlight;
     const thisIterValues = inFlight.values;
-    const thisSlotIndex = thisIterValues.length;
     thisIterValues.push(slot);
 
     const actualIter = inFlight.iter as Nextable;
@@ -122,9 +121,13 @@ class FlatMapHelper {
         // assert slot.type === 'awaiting'
 
         if ((iterResult as { done: boolean }).done) {
-          const removedCount = thisIterValues.length - thisSlotIndex;
+          // Find the current index: earlier slots of this iterator may have been
+          // delivered (and shifted off) since this pull was issued, so an index
+          // captured at issue time would be stale.
+          const currentIndex = thisIterValues.indexOf(slot);
+          const removedCount = thisIterValues.length - currentIndex;
           // assert removedCount > 0: we have not already truncated this value
-          this.#truncateInFlightFrom(inFlight, thisSlotIndex);
+          this.#truncateInFlightFrom(inFlight, currentIndex);
 
           if (this.#active.type === 'iter') {
             if (this.#active === inFlight) {
@@ -143,16 +146,24 @@ class FlatMapHelper {
                 this.#issuePullFromCurrentActive();
               }
 
-              if (this.#isHeadOfQueue(slot)) { // strictly speaking this does a redundant `this.#active.type === 'iter' && this.#active.values[0] === slot`, but whatever
-                this.#processQueue();
-              }
+              // Truncating this parked iterator may have emptied it and popped it
+              // off the queue, exposing a value that had settled behind it but could
+              // not be delivered yet. Flush so any such now-head value goes out.
+              // (We can't gate on `slot` being head: it was just truncated away.)
+              this.#processQueue();
             }
           } else if (this.#active.type === 'reading underlying') {
             this.#active.requested += removedCount;
+            // As above: exhausting this parked iterator may have exposed a value
+            // buffered behind it (in a later parked iterator). Flush it.
+            this.#processQueue();
           } else {
             // assert this.#active.type === 'error || this.#active.type === 'finished'
 
             this.#markSomeCallsAsNoLongerGettingValues(removedCount);
+            // As above: a value buffered behind this now-exhausted parked iterator
+            // (or the pending error in #active) may now be deliverable. Flush it.
+            this.#processQueue();
           }
         } else {
           // we got a value! amazing!
@@ -225,6 +236,10 @@ class FlatMapHelper {
           // also means distinguish 'reading underlying' vs 'waiting for mapper'
           // maybe we can make _the subsequent { done: true }_ wait??? it must exist b/c it was waiting for this value. need to think more / about other cases / effects on filter etc.
 
+          // The errored slot belongs to a parked iterator; we were reading the
+          // underlying for the NEXT iterator. That pending demand sits after the
+          // error and was never bound to a pull, so it can never be filled: done it.
+          this.#markSomeCallsAsNoLongerGettingValues(this.#active.requested);
           this.#active = { type: 'finished' };
           this.#closeUnderlyingForError(slotButWithTypeScript as Error);
           return;

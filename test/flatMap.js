@@ -9,10 +9,6 @@ import {
 
 let tests = [];
 
-// NOTE: flatMap.ts is an untested, work-in-progress implementation, so these
-// tests are expected to FAIL for now. They exist to pin down the intended
-// concurrent *happy-path* semantics — no error handling and no return() yet.
-//
 // What makes flatMap distinctive among map/filter/flatMap:
 //
 //   * One consumer next() is not 1:1 with an underlying pull. Each underlying
@@ -1434,6 +1430,309 @@ tests.push(['flatMap: an underlying error behind buffered values still surfaces 
   t.expectLog('the last buffered value is delivered, then the error surfaces', [
     'r1 resolved {"value":"a1","done":false}',
     'r2 rejected boom',
+  ]);
+}]);
+
+// --- bookkeeping when an earlier pull is delivered before a later one settles --
+
+// The active iterator yields an early value (which is delivered and shifts off the
+// queue) and only THEN does a later pull of the same iterator report done. The
+// freed demand must still redirect to a fresh underlying pull, so the trailing
+// call is satisfied by the next iterator — it must not be left hanging.
+tests.push(['flatMap: a delivered early value does not corrupt a later same-iterator done', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  const r2 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 3 fans out across A', ['A.next() #0', 'A.next() #1', 'A.next() #2']);
+
+  // Deliver A's first value: it is dispatched and shifts off the head of the queue.
+  A.yield(0, 'a0');
+  await flushMicrotasks();
+  t.expectLog('the first value is delivered', ['r0 resolved {"value":"a0","done":false}']);
+
+  // Now A's LAST pull (#2) reports done while #1 is still in flight. A keeps [a1]
+  // and the freed demand (1, for r2) redirects to a fresh underlying pull.
+  A.finish(2);
+  await flushMicrotasks();
+  t.expectLog('the freed demand redirects to another underlying pull', ['src.next() #1']);
+
+  A.yield(1, 'a1');
+  await flushMicrotasks();
+  t.expectLog('the second value is delivered', ['r1 resolved {"value":"a1","done":false}']);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the second underlying value is mapped', ['m(2) #1']);
+
+  const B = controlledSource(t.log, 'B');
+  m.resolve(1, B.iterator);
+  await flushMicrotasks();
+  t.expectLog('the redirected demand pulls the second iterator once', ['B.next() #0']);
+
+  B.yield(0, 'b0');
+  await flushMicrotasks();
+  t.expectLog('the trailing call is satisfied by the next iterator', [
+    'r2 resolved {"value":"b0","done":false}',
+  ]);
+}]);
+
+// A pull of an ALREADY-PARKED iterator rejects while the helper is between inner
+// iterators (reading the underlying for the next one). The error belongs to the
+// parked iterator's position, so it closes the underlying and reaches that call;
+// the demand that was coalesced for the NEXT iterator sits after the error and can
+// never be filled, so those calls settle done.
+tests.push(['flatMap: a parked-iterator pull error while reading underlying dones the pending demand', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  // A reports done at pull #1 with pull #0 still in flight: A is parked keeping #0,
+  // and the freed demand (1, aimed at the NEXT iterator) reads the underlying again.
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A done redirects the freed demand to another underlying pull', ['src.next() #1']);
+
+  // A's parked pull #0 now rejects. It closes the underlying and its error reaches
+  // r0; the pending demand for the next iterator (r1) can never be filled -> done.
+  A.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the underlying closes, the pending demand is doned, then the error surfaces', [
+    'src.return() #0',
+    'r1 resolved {"done":true}',
+    'r0 rejected boom',
+  ]);
+}]);
+
+// A later iterator's value settles while it is still queued behind an earlier
+// parked iterator (so it is buffered, not delivered). When that parked iterator is
+// then exhausted, the buffered value becomes the head of the queue and must be
+// flushed to its call — removing the parked iterator cannot leave it stranded.
+tests.push(['flatMap: exhausting a parked iterator flushes a value already buffered behind it', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  // A reports done at pull #1 with pull #0 still in flight: A is parked keeping #0,
+  // and the freed demand (1) redirects to a fresh underlying pull -> iterator B.
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A done redirects the freed demand to another underlying pull', ['src.next() #1']);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the second underlying value is mapped', ['m(2) #1']);
+
+  const B = controlledSource(t.log, 'B');
+  m.resolve(1, B.iterator);
+  await flushMicrotasks();
+  t.expectLog('the redirected demand pulls B once', ['B.next() #0']);
+
+  // B's value settles, but it sits behind A's still-pending pull #0, so it waits.
+  B.yield(0, 'b0');
+  await flushMicrotasks();
+  t.expectLog('the later value is buffered behind the parked iterator', []);
+
+  // A's pull #0 now reports done, exhausting A entirely. b0 becomes the head and
+  // must flush to r0; the freed demand redirects to a fresh pull of B.
+  A.finish(0);
+  await flushMicrotasks();
+  t.expectLog('exhausting the parked iterator flushes the buffered value', [
+    'B.next() #1',
+    'r0 resolved {"value":"b0","done":false}',
+  ]);
+
+  B.yield(1, 'b1');
+  await flushMicrotasks();
+  t.expectLog('the next value is delivered too', ['r1 resolved {"value":"b1","done":false}']);
+}]);
+
+// Same flush hazard, but the parked iterator is exhausted while the helper is
+// READING THE UNDERLYING (not while another iterator is active). Two iterators are
+// parked; the second already has a buffered value; exhausting the first must flush
+// that value even though the active state is "reading underlying".
+tests.push(['flatMap: exhausting a parked iterator while reading underlying flushes a buffered value', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked', ['m(1) #0']);
+
+  // Iterator A: pulled twice, reports done on #1 -> parked keeping #0 in flight.
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A parks; freed demand reads the underlying', ['src.next() #1']);
+
+  // Iterator B becomes active; a third call gives it a second pull so it too can be
+  // parked, with its first value buffered behind A.
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked again', ['m(2) #1']);
+
+  const B = controlledSource(t.log, 'B');
+  m.resolve(1, B.iterator);
+  await flushMicrotasks();
+  t.expectLog('B is pulled once for the outstanding call', ['B.next() #0']);
+
+  const r2 = fm.next();
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('a third call gives B a second pull', ['B.next() #1']);
+
+  // B reports done on #1 -> parked keeping #0 in flight; freed demand reads the
+  // underlying again. Now BOTH A and B are parked, and the helper is reading.
+  B.finish(1);
+  await flushMicrotasks();
+  t.expectLog('B parks; freed demand reads the underlying again', ['src.next() #2']);
+
+  // B's pull #0 settles, but it sits behind A, so it is buffered, not delivered.
+  B.yield(0, 'b0');
+  await flushMicrotasks();
+  t.expectLog('B0 is buffered behind A', []);
+
+  // A is exhausted (its only remaining pull reports done) while reading underlying.
+  // b0 becomes the head and must flush to r0.
+  A.finish(0);
+  await flushMicrotasks();
+  t.expectLog('exhausting A flushes the value buffered behind it', [
+    'r0 resolved {"value":"b0","done":false}',
+  ]);
+}]);
+
+// Same flush hazard once the helper is FINISHED (here via return()): a value is
+// buffered in a parked iterator behind another parked iterator; exhausting the
+// front one must flush that buffered value, even though no more pulls will happen.
+tests.push(['flatMap: exhausting a parked iterator after return() flushes a buffered value', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked', ['m(1) #0']);
+
+  // A: pulled twice, done on #1 -> parked keeping #0 in flight.
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A parks; freed demand reads the underlying', ['src.next() #1']);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked again', ['m(2) #1']);
+
+  const B = controlledSource(t.log, 'B');
+  m.resolve(1, B.iterator);
+  await flushMicrotasks();
+  t.expectLog('B is pulled once', ['B.next() #0']);
+
+  // A third call gives B a second in-flight pull (so both calls are bound to it).
+  const r2 = fm.next();
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('a third call gives B a second pull', ['B.next() #1']);
+
+  // B's first value settles, buffered behind A's still-pending pull #0.
+  B.yield(0, 'B0');
+  await flushMicrotasks();
+  t.expectLog('B0 is buffered behind A', []);
+
+  // return() closes B and the underlying; already-requested pulls stay deliverable.
+  const ret = fm.return();
+  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes the active iterator and the underlying', [
+    'B.return() #0',
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+
+  // A's last pull reports done, exhausting A while the helper is already finished.
+  // A contributed nothing, so its surplus call is doned and B0 flushes forward.
+  A.finish(0);
+  await flushMicrotasks();
+  t.expectLog('exhausting A dones the surplus and flushes the buffered value', [
+    'r2 resolved {"done":true}',
+    'r0 resolved {"value":"B0","done":false}',
+  ]);
+
+  B.yield(1, 'B1');
+  await flushMicrotasks();
+  t.expectLog('the remaining buffered value is delivered', [
+    'r1 resolved {"value":"B1","done":false}',
   ]);
 }]);
 

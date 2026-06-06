@@ -58,11 +58,7 @@ class FlatMapHelper {
 
   #active: ActiveState = { type: 'unstarted' };
 
-  // we need this to tell us how many trailing { done: true }s to issue in case of error / finish in active iterator
-  // invariant: calls.length == maxLive + [active.requested | active.values.length]
-  // is this just the sum of the lengths of the values array?
-  // #maxLiveInClosedButStillHaveValuesInFlight = 0; // 0 iff #closedButStillHaveValuesInFlight.length === 0
-
+  // invariant: calls.length == [sum of lengths of closedButStillHaveValuesInFlight] + [active.requested | active.values.length]
   #calls: { resolve: (v: unknown) => void, reject: (v: unknown) => void }[] = [];
 
   constructor(underlying: unknown, fn: unknown) {

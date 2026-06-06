@@ -1916,6 +1916,259 @@ tests.push(['flatMap: two concurrent inner pulls that both reject surface both e
   ]);
 }]);
 
+// Same as above but the pulls reject in the OTHER order: the LATER pull (#1)
+// rejects first (it is the active iterator's error, so it closes the underlying)
+// but sits behind the still-pending head pull. When the head pull then rejects,
+// both errors drain in call order, each call getting its own pull's error.
+tests.push(['flatMap: two concurrent inner pulls that both reject (later first) still surface both in order', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across the active iterator', ['A.next() #0', 'A.next() #1']);
+
+  // The later pull rejects first: closes the underlying, but waits behind #0.
+  A.throw(1, new Error('boom1'));
+  await flushMicrotasks();
+  t.expectLog('the later error closes the underlying but waits behind the head pull', [
+    'src.return() #0',
+  ]);
+
+  // The head pull rejects: both errors drain in call order.
+  A.throw(0, new Error('boom0'));
+  await flushMicrotasks();
+  t.expectLog('both errors drain in call order', [
+    'r0 rejected boom0',
+    'r1 rejected boom1',
+  ]);
+}]);
+
+// Errors from DIFFERENT inner iterators. A reports done with pull #0 still in
+// flight (parked, feeding r0); the freed demand yields a live iterator B (its
+// pull #0 feeds r1). A's parked pull rejects FIRST while B is still live: the
+// active iterator B is closed first, then the underlying, then A's error reaches
+// r0. B's already-issued pull then rejects and reaches r1.
+tests.push(['flatMap: errors from two different inner iterators (parked first) surface both in order', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A parks keeping pull #0; freed demand reads the underlying', ['src.next() #1']);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked again', ['m(2) #1']);
+
+  const B = controlledSource(t.log, 'B');
+  m.resolve(1, B.iterator);
+  await flushMicrotasks();
+  t.expectLog('the live inner B is pulled once', ['B.next() #0']);
+
+  // A's parked pull rejects while B is live: close active B first, then the
+  // underlying, then A's error reaches r0.
+  A.throw(0, new Error('boomA'));
+  await flushMicrotasks();
+  t.expectLog('the active iterator and underlying are closed, then A errors to r0', [
+    'B.return() #0',
+    'src.return() #0',
+    'r0 rejected boomA',
+  ]);
+
+  // B's already-issued pull rejects and reaches r1 (no further close).
+  B.throw(0, new Error('boomB'));
+  await flushMicrotasks();
+  t.expectLog('B errors to the second call', ['r1 rejected boomB']);
+}]);
+
+// Same two-iterator setup, OTHER order: the live iterator B rejects FIRST. B is
+// exhausted by its own error and A is already done, so only the underlying is
+// closed (no B.return()). The error waits behind A's still-pending parked pull;
+// when A then rejects, both errors drain in call order: r0 <- A, r1 <- B.
+tests.push(['flatMap: errors from two different inner iterators (active first) surface both in order', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A parks keeping pull #0; freed demand reads the underlying', ['src.next() #1']);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked again', ['m(2) #1']);
+
+  const B = controlledSource(t.log, 'B');
+  m.resolve(1, B.iterator);
+  await flushMicrotasks();
+  t.expectLog('the live inner B is pulled once', ['B.next() #0']);
+
+  // B (the live active iterator) rejects first: exhausted by its own error, and A
+  // is already done, so only the underlying is closed. The error waits behind A.
+  B.throw(0, new Error('boomB'));
+  await flushMicrotasks();
+  t.expectLog('only the underlying is closed; nothing surfaces yet', ['src.return() #0']);
+
+  // A's parked pull rejects: both errors drain in call order.
+  A.throw(0, new Error('boomA'));
+  await flushMicrotasks();
+  t.expectLog('both errors drain in call order', [
+    'r0 rejected boomA',
+    'r1 rejected boomB',
+  ]);
+}]);
+
+// One error from an inner iterator, one from the mapper. A is parked with pull #0
+// in flight (feeding r0); the freed demand is mid-mapper for the NEXT iterator
+// (feeding r1). The parked inner rejects FIRST: while "reading underlying" that
+// closes the underlying, dones the pending demand (r1), and A's error reaches r0.
+// The still-pending mapper then rejecting is harmlessly ignored (already finished).
+tests.push(['flatMap: an inner error then a mapper error (inner first) ignores the late mapper error', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A parks keeping pull #0; freed demand reads the underlying', ['src.next() #1']);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked again, now pending', ['m(2) #1']);
+
+  // A's parked pull rejects while the mapper is pending: close the underlying,
+  // done the pending demand (r1), and surface A's error to r0.
+  A.throw(0, new Error('boomA'));
+  await flushMicrotasks();
+  t.expectLog('the underlying closes, the pending demand is doned, then A errors to r0', [
+    'src.return() #0',
+    'r1 resolved {"done":true}',
+    'r0 rejected boomA',
+  ]);
+
+  // The still-pending mapper now rejects: the helper is already finished, so it is
+  // ignored (no extra close, no surfaced error).
+  m.reject(1, new Error('boomM'));
+  await flushMicrotasks();
+  t.expectLog('the late mapper rejection is ignored', []);
+}]);
+
+// TODO it is kind of weird that this is observably different than previous case.
+// Maybe that'll be fixed if/when we start waiting for mapper results.
+// Same setup, OTHER order: the mapper rejects FIRST. While "reading underlying"
+// the mapper error closes the underlying and takes the position the next iterator
+// would have filled (r1), but waits behind A's still-pending parked pull. When A
+// then rejects, both errors drain in call order: r0 <- A's inner error, r1 <- the
+// mapper error.
+tests.push(['flatMap: a mapper error then an inner error (mapper first) surfaces both in order', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A parks keeping pull #0; freed demand reads the underlying', ['src.next() #1']);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked again, now pending', ['m(2) #1']);
+
+  // The mapper rejects first: it closes the underlying and takes r1's position,
+  // but waits behind A's still-pending parked pull.
+  m.reject(1, new Error('boomM'));
+  await flushMicrotasks();
+  t.expectLog('the mapper error closes the underlying but waits behind the parked pull', [
+    'src.return() #0',
+  ]);
+
+  // A's parked pull rejects: both errors drain in call order.
+  A.throw(0, new Error('boomA'));
+  await flushMicrotasks();
+  t.expectLog('both errors drain in call order', [
+    'r0 rejected boomA',
+    'r1 rejected boomM',
+  ]);
+}]);
+
 // --- multiple parked iterators + a clean underlying done --------------------
 //
 // Two iterators are parked (each keeping one in-flight pull) when the underlying

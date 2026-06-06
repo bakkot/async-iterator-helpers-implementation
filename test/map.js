@@ -8,6 +8,7 @@ import {
 } from './utils.js';
 
 let tests = [];
+let xfailed = [];
 
 // The simple, sequential case. Pull one at a time, settle, observe. Establishes
 // the basic protocol: each consumer next() pulls the source once, the mapper
@@ -524,4 +525,4 @@ tests.push(['map: predicate error does not close the source after an underlying 
   t.expectLog('predicate error rejects r1 with no close', ['r1 rejected predicate']);
 }]);
 
-runTests(tests);
+runTests(tests, xfailed);

@@ -8,6 +8,7 @@ import {
 } from './utils.js';
 
 let tests = [];
+let xfailed = [];
 
 // NOTE: filter.js is still a placeholder, so these tests are expected to FAIL
 // for now. They exist to pin down the intended concurrent semantics. They are a
@@ -1799,4 +1800,4 @@ tests.push(['filter: a buried synchronous source error surfaces with no subseque
   ]);
 }]);
 
-runTests(tests);
+runTests(tests, xfailed);

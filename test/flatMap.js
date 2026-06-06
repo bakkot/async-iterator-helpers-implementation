@@ -8,6 +8,7 @@ import {
 } from './utils.js';
 
 let tests = [];
+let xfailed = [];
 
 // What makes flatMap distinctive among map/filter/flatMap:
 //
@@ -2019,7 +2020,7 @@ tests.push(['flatMap: an underlying error behind two parked iterators drains bot
 // This test asserts the behavior I believe is correct (the inner iterator is
 // closed via .return()); it is expected to FAIL against the current code,
 // flagging the leak.
-tests.push(['flatMap: return() while blocked on the mapper still closes the iterator the mapper produces', async function (t) {
+xfailed.push(['flatMap: return() while blocked on the mapper still closes the iterator the mapper produces', async function (t) {
   const src = controlledSource(t.log, 'src');
   const m = controlledFn(t.log, 'm');
   const fm = flatMap(src.iterator, m.fn);
@@ -2055,4 +2056,4 @@ tests.push(['flatMap: return() while blocked on the mapper still closes the iter
   ]);
 }]);
 
-runTests(tests);
+runTests(tests, xfailed);

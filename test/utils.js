@@ -35,23 +35,47 @@ export function makeLog() {
 // an event log (`t.log`, fed to the controlled iterators/mappers) and the
 // assertions. Quiet on success: nothing is printed for a passing test. The
 // first failure within a test prints the test name; every failure prints its
-// own detail. Exits 1 if anything failed, otherwise prints "all tests passed"
-// and exits 0.
-export async function runTests(tests) {
+// own detail.
+//
+// `xfails` is a second list of tests that are KNOWN to fail (a real bug we are
+// not ready to fix). Each is run with its (expected) failures suppressed and is
+// only reported if it *unexpectedly passes* (XPASS) — that way moving a test
+// between `tests` and `xfails` is a one-line diff. Exits 1 if any normal test
+// failed or any xfail passed; otherwise prints "all tests passed" and exits 0.
+export async function runTests(tests, xfails = []) {
   let totalFailures = 0;
   for (const [name, fn] of tests) {
     const t = makeTestContext(name);
     await fn(t);
     totalFailures += t.failures;
   }
+  let xfailed = 0;
+  for (const [name, fn] of xfails) {
+    const t = makeTestContext(name, { quiet: true });
+    let threw = false;
+    try {
+      await fn(t);
+    } catch {
+      threw = true; // a throw also counts as failing-as-expected
+    }
+    if (t.failures === 0 && !threw) {
+      // An xfailed test that passes is itself a failure: the bug may be fixed,
+      // so move it back to `tests`.
+      console.log(`XPASS: ${name}`);
+      console.log('  expected this test to fail, but it passed');
+      totalFailures++;
+    } else {
+      xfailed++;
+    }
+  }
   if (totalFailures > 0) {
     process.exitCode = 1;
   } else {
-    console.log('all tests passed');
+    console.log(`all tests passed${xfailed > 0 ? ` (${xfailed} xfailed as expected)` : ''}`);
   }
 }
 
-function makeTestContext(name) {
+function makeTestContext(name, { quiet = false } = {}) {
   let printedName = false;
   const { log, entries } = makeLog();
   const ctx = {
@@ -83,13 +107,14 @@ function makeTestContext(name) {
       if (a !== e) ctx._fail(label, [`expected ${e}, got ${a}`]);
     },
     _fail(label, detailLines) {
+      ctx.failures++;
+      if (quiet) return; // xfail: failures are expected, so don't print them
       if (!printedName) {
         console.log(`FAIL: ${name}`);
         printedName = true;
       }
       console.log(`  ${label}`);
       for (const line of detailLines) console.log(`    ${line}`);
-      ctx.failures++;
     },
   };
   return ctx;

@@ -51,9 +51,10 @@ class FlatMapHelper {
   #underlying: unknown;
   #fn: unknown;
 
-  // TODO this should just be the .values, so we don't prevent the iterators from being GC'd
+  // holds the .values arrays of closed iterators (not the InFlight objects, so the
+  // iterators themselves can be GC'd)
   // invariant: index [0] is non-empty
-  readonly #closedButStillHaveValuesInFlight: InFlight[] = [];
+  readonly #closedButStillHaveValuesInFlight: Slot[][] = [];
 
   #active: ActiveState = { type: 'unstarted' };
 
@@ -86,7 +87,7 @@ class FlatMapHelper {
     return this.#closedButStillHaveValuesInFlight.length === 0
       ? this.#active.type === 'iter' && this.#active.values.length > 0 && this.#active.values[0] === slot // TODO think about whether this.#active.values can ever be empty
         ||this.#active.type === 'error' && this.#active === slot
-      : this.#closedButStillHaveValuesInFlight[0].values[0] === slot; // assert: this.#closedButStillHaveValuesInFlight[0].values.length > 0
+      : this.#closedButStillHaveValuesInFlight[0][0] === slot; // assert: this.#closedButStillHaveValuesInFlight[0].length > 0
   }
 
   #truncateInFlightFrom(inFlight: InFlight, index: number) {
@@ -104,10 +105,10 @@ class FlatMapHelper {
     }
     inFlight.values.length = index;
     if (index === 0) {
-      if (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight) {
+      if (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight.values) {
         do {
           this.#closedButStillHaveValuesInFlight.shift();
-        } while (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0].values.length === 0);
+        } while (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0].length === 0);
       }
     }
   }
@@ -144,16 +145,16 @@ class FlatMapHelper {
           // entry becomes the head. (While `inFlight` is still the active iterator it
           // isn't in the closed queue, so this is false; and nothing is buffered
           // behind the active iterator anyway.) Capture before truncating pops it.
-          const exposedNewHead = currentIndex === 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight;
+          const exposedNewHead = currentIndex === 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight.values;
 
-          ASSERT(this.#closedButStillHaveValuesInFlight.includes(inFlight) || this.#active === inFlight, 'inFlight is still tracked');
+          ASSERT(this.#closedButStillHaveValuesInFlight.includes(inFlight.values) || this.#active === inFlight, 'inFlight is still tracked');
 
           this.#truncateInFlightFrom(inFlight, currentIndex);
 
           if (this.#active.type === 'iter') {
             if (this.#active === inFlight) {
               if (thisIterValues.length > 0) {
-                this.#closedButStillHaveValuesInFlight.push(this.#active);
+                this.#closedButStillHaveValuesInFlight.push(this.#active.values);
               }
               this.#issuePullFromUnderlying(removedCount);
             } else {
@@ -199,7 +200,7 @@ class FlatMapHelper {
 
         if (this.#active.type === 'iter') {
           const active = this.#active;
-          this.#closedButStillHaveValuesInFlight.push(this.#active);
+          this.#closedButStillHaveValuesInFlight.push(this.#active.values);
           this.#active = { type: 'finished' };
 
           if (active === inFlight) {
@@ -269,9 +270,9 @@ class FlatMapHelper {
   #markUnderlyingAsFinished() {
     ASSERT(this.#active.type === 'reading underlying' || this.#active.type === 'iter', 'active is reading underlying or iter'); // latter only via return()
     if (this.#active.type === 'iter' && this.#active.values.length > 0) {
-      this.#closedButStillHaveValuesInFlight.push(this.#active);
+      this.#closedButStillHaveValuesInFlight.push(this.#active.values);
     }
-    const maxLive = this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.values.length, 0);
+    const maxLive = this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.length, 0);
     this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - maxLive);
     this.#active = { type: 'finished' };
   }
@@ -330,7 +331,7 @@ class FlatMapHelper {
         // keep the error live in #active so it surfaces only once those buffered
         // values have drained — overwriting it with a clean finish would swallow it.
         this.#active = { type: 'error', error, closeState: 'ready' };
-        const maxLive = this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.values.length, 0);
+        const maxLive = this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.length, 0);
         // keep maxLive calls for the buffered values and one more for the error
         this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - maxLive - 1);
         if (this.#closedButStillHaveValuesInFlight.length === 0) {
@@ -385,12 +386,12 @@ class FlatMapHelper {
   }
 
   // returns false if was awaiting
-  #dispatchHeadOfInFlight(inFlight: InFlight): boolean {
-    const head = inFlight.values[0];
+  #dispatchHeadOfInFlight(values: Slot[]): boolean {
+    const head = values[0];
     if (head.type === 'awaiting') {
       return false;
     }
-    inFlight.values.shift();
+    values.shift();
     if (head.type === 'value') {
       this.#calls.shift()!.resolve({ value: head.value, done: false });
     } else if (head.type === 'error') {
@@ -416,7 +417,7 @@ class FlatMapHelper {
     // assert: we are going to do at least one unit of work
     while (this.#closedButStillHaveValuesInFlight.length > 0) {
       const head = this.#closedButStillHaveValuesInFlight[0];
-      while (head.values.length > 0) {
+      while (head.length > 0) {
         if (!this.#dispatchHeadOfInFlight(head)) {
           return;
         }
@@ -435,7 +436,7 @@ class FlatMapHelper {
     }
     if (this.#active.type === 'iter') {
       while (this.#active.values.length > 0) {
-        if (!this.#dispatchHeadOfInFlight(this.#active)) {
+        if (!this.#dispatchHeadOfInFlight(this.#active.values)) {
           return;
         }
       }

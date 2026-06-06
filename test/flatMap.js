@@ -1236,16 +1236,13 @@ tests.push(['flatMap: a mid-stream inner error closes the active iterator then t
   src.holdReturn();
   B.holdReturn();
 
-  // A's lingering pull #0 rejects. B sits entirely AFTER A's errored slot in
-  // concatenation order, so B's pull can never deliver: r1 (committed to it) is
-  // settled done at once. B is then closed FIRST; the underlying is not touched
-  // yet, and the rejection for r0 is not surfaced.
+  // A's lingering pull #0 rejects. B is the live active iterator, so it is closed
+  // FIRST; the underlying is not touched yet, and nothing is surfaced. B's
+  // already-requested pull #0 is NOT discarded (the error stops new pulls, not
+  // already-issued ones): it stays bound to r1.
   A.throw(0, new Error('boom'));
   await flushMicrotasks();
-  t.expectLog('the dead call is doned and the active inner iterator is closed first', [
-    'B.return() #0',
-    'r1 resolved {"done":true}',
-  ]);
+  t.expectLog('the active inner iterator is closed first, alone', ['B.return() #0']);
 
   // Once B's close settles, the underlying is closed next — still no rejection.
   B.settleReturn(0);
@@ -1257,11 +1254,13 @@ tests.push(['flatMap: a mid-stream inner error closes the active iterator then t
   await flushMicrotasks();
   t.expectLog('the rejection surfaces after both closes settle', ['r0 rejected boom']);
 
-  // B's already-requested pull was truncated, so settling it now is ignored: no
-  // late value reaches the (already done) r1.
-  B.yield(0, 'late');
+  // B's already-requested pull settles after the close: its value still reaches
+  // r1, exactly as an in-flight pull survives an explicit return().
+  B.yield(0, 'b0');
   await flushMicrotasks();
-  t.expectLog('a late settlement of the closed iterator pull is ignored', []);
+  t.expectLog('the already-requested inner value still reaches its call', [
+    'r1 resolved {"value":"b0","done":false}',
+  ]);
 }]);
 
 tests.push(['flatMap: the two-close error path swallows an error from closing the active iterator', async function (t) {
@@ -1293,10 +1292,13 @@ tests.push(['flatMap: the two-close error path swallows an error from closing th
   await flushMicrotasks();
   t.expectLog('the mapper is invoked again', ['m(2) #1']);
 
-  // Hand-roll B so its .return() rejects, to prove that close error is swallowed.
+  // Hand-roll B so its .return() rejects (to prove that close error is swallowed)
+  // while its already-issued pull #0 stays settleable (to prove its value still
+  // reaches the call).
   const bReturn = Promise.withResolvers();
+  const bPull = Promise.withResolvers();
   const B = {
-    next() { t.log('B.next() #0'); return Promise.withResolvers().promise; },
+    next() { t.log('B.next() #0'); return bPull.promise; },
     return() { t.log('B.return() #0'); return bReturn.promise; },
     [Symbol.asyncIterator]() { return this; },
   };
@@ -1309,10 +1311,7 @@ tests.push(['flatMap: the two-close error path swallows an error from closing th
 
   A.throw(0, new Error('boom'));
   await flushMicrotasks();
-  t.expectLog('the dead call is doned and the active inner iterator is closed first', [
-    'B.return() #0',
-    'r1 resolved {"done":true}',
-  ]);
+  t.expectLog('the active inner iterator is closed first, alone', ['B.return() #0']);
 
   // B's close FAILS. The failure is swallowed; the underlying is still closed.
   bReturn.reject(new Error('inner-close-fail'));
@@ -1323,22 +1322,29 @@ tests.push(['flatMap: the two-close error path swallows an error from closing th
   src.settleReturn(0);
   await flushMicrotasks();
   t.expectLog('the original error wins once both closes settle', ['r0 rejected boom']);
+
+  // B's already-issued pull #0 still delivers its value to r1.
+  bPull.resolve({ value: 'b0', done: false });
+  await flushMicrotasks();
+  t.expectLog('the already-requested inner value still reaches its call', [
+    'r1 resolved {"value":"b0","done":false}',
+  ]);
 }]);
 
-// --- "calls that can no longer settle are doned + truncated" ----------------
+// --- what an error does (and does not do) to other in-flight calls ----------
 //
-// The general rule: once a position in the flattened stream is known to be dead
-// (an error terminates the stream there), every call committed to a position at
-// or after it can never receive a value/error, so it must settle done and its
-// in-flight pull must be truncated (its eventual settlement ignored). The two
-// tests above cover this for the two-close path; the two below cover the other
-// inner-error path and the underlying-error path.
+// An error stops NEW pulls (the active inner iterator and the underlying are
+// closed) but does not discard work already in flight: a call already bound to an
+// issued pull still receives that pull's value when it settles, exactly as in
+// map and as an explicit return() leaves already-requested values deliverable.
+// (The two two-close tests above show this for a separate active iterator.) The
+// "settle done" rule applies only to calls that were never bound to a pull —
+// coalesced surplus demand — which is the underlying-error case further below.
 
 // Single-close path: an EARLIER pull of the active iterator errors while a LATER
-// pull of the same iterator is still in flight. The later pull's call sits after
-// the error, so it must be doned (not left to receive a value), and its eventual
-// settlement must be ignored.
-tests.push(['flatMap: an inner error dones a later in-flight call on the same iterator and ignores its late pull', async function (t) {
+// pull of the same iterator is still in flight. The later pull was already issued,
+// so its value still reaches its call after the error — it is not discarded.
+tests.push(['flatMap: an inner error still delivers a later already-issued pull on the same iterator', async function (t) {
   const src = controlledSource(t.log, 'src');
   const m = controlledFn(t.log, 'm');
   const fm = flatMap(src.iterator, m.fn);
@@ -1360,21 +1366,21 @@ tests.push(['flatMap: an inner error dones a later in-flight call on the same it
   t.expectLog('demand 2 fans out across the active iterator', ['A.next() #0', 'A.next() #1']);
 
   // A's earlier pull (#0) rejects while pull #1 is still in flight. #0 is the head,
-  // so it closes the underlying and its error is committed to r0; #1 is past the
-  // error, so r1 is doned immediately. The error for r0 waits for src.return().
+  // so it closes the underlying and its error is committed to r0 (surfacing once
+  // src.return() settles). Pull #1 was already issued, so it stays bound to r1.
   A.throw(0, new Error('boom'));
   await flushMicrotasks();
-  t.expectLog('the underlying closes, the later call is doned, then the error surfaces', [
+  t.expectLog('the underlying closes, then the error reaches the first call', [
     'src.return() #0',
-    'r1 resolved {"done":true}',
     'r0 rejected boom',
   ]);
 
-  // A's pull #1 was truncated, so settling it now is ignored: no late value
-  // reaches the (already done) r1.
-  A.yield(1, 'late');
+  // A's already-issued pull #1 settles after the error: its value still reaches r1.
+  A.yield(1, 'a1');
   await flushMicrotasks();
-  t.expectLog('a late settlement of the truncated pull is ignored', []);
+  t.expectLog('the already-requested inner value still reaches its call', [
+    'r1 resolved {"value":"a1","done":false}',
+  ]);
 }]);
 
 // Underlying-error path with buffered values ahead of the error. An earlier inner

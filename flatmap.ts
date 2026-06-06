@@ -261,7 +261,10 @@ class FlatMapHelper {
   }
 
   #markUnderlyingAsFinished() {
-    // assert this.#active.type === 'reading underlying' (or this is the call to .return)
+    // assert this.#active.type === 'reading underlying' || 'iter' (latter only via return())
+    if (this.#active.type === 'iter' && this.#active.values.length > 0) {
+      this.#closedButStillHaveValuesInFlight.push(this.#active);
+    }
     const maxLive = this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.values.length, 0);
     this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - maxLive);
     this.#active = { type: 'finished' };
@@ -306,12 +309,7 @@ class FlatMapHelper {
           error => {
             if (this.#finished) return;
             // assert this.#active.type === 'reading underlying'
-            this.#active = { type: 'error', error, closeState: 'ready' };
-            if (this.#closedButStillHaveValuesInFlight.length === 0) {
-              this.#processQueue();
-            }
-            this.#markUnderlyingAsFinished();
-            // TODO think about order of truncation vs processQueue call (mostly just needs to be consistent w/ elsewhere)
+            this.#closeUnderlyingForErrorInMapper(error);
           }
         );
       },
@@ -329,8 +327,6 @@ class FlatMapHelper {
       }
     );
   }
-
-  // TODO: "is slot head of queue" helper
 
   #closeUnderlyingForErrorInMapper(error: unknown) {
     // assert: this.#active.type === 'reading underlying'
@@ -356,6 +352,9 @@ class FlatMapHelper {
         this.#processQueue();
       }
       return;
+    }
+    if (this.#isHeadOfQueue(slot)) {
+      this.#processQueue();
     }
     const onClosed = () => {
       // assert: slot.closeState === 'awaiting-return'
@@ -455,14 +454,16 @@ class FlatMapHelper {
       return Promise.resolve({ value: undefined, done: true });
     }
     // TODO order of truncation vs resolving this Promise
+    // Capture #active before #markUnderlyingAsFinished resets it to 'finished'.
+    const active = this.#active;
     this.#markUnderlyingAsFinished();
 
-    if (this.#active.type === 'iter') {
+    if (active.type === 'iter') {
       // TODO consider whether to block on closing active before closing underlying
       // probably yes?
       // TODO make this match above
       // TODO check against iterator sync flatmap
-      const activeIter = this.#active.iter;
+      const activeIter = active.iter;
 
       // todo fast path for missing returns
       return fastPromiseTry(() => (activeIter as MaybeReturnable).return?.()).then(
@@ -479,5 +480,10 @@ class FlatMapHelper {
         },
       );
     }
+
+    // assert active.type === 'reading underlying'
+    // TODO if we're actually blocked on the mapper here, we probably need to handle closing the result
+    return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
+      .then(() => ({ value: undefined, done: true }));
   }
 }

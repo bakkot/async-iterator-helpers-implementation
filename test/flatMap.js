@@ -921,4 +921,106 @@ tests.push(['flatMap: return() after an underlying error does not close the sour
   ]);
 }]);
 
+// return() means "no more demand", but — as in map/filter — it does NOT cancel
+// values that were already requested. Pulls already in flight on the active inner
+// iterator when return() lands still deliver their values; closing the inner
+// iterator (.return()) does not discard its outstanding .next() results.
+tests.push(['flatMap: return() still delivers values already requested from the active inner iterator', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('two inner pulls are in flight', ['A.next() #0', 'A.next() #1']);
+
+  // return() closes the inner iterator and the underlying, but the two in-flight
+  // inner pulls are NOT cancelled.
+  const ret = fm.return();
+  t.check('return() returns a promise', ret instanceof Promise, true);
+  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes both iterators without settling the in-flight calls', [
+    'A.return() #0',
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+
+  // The already-requested values still arrive, in call order.
+  A.yield(0, 'a0');
+  await flushMicrotasks();
+  t.expectLog('the first already-requested value is delivered', [
+    'r0 resolved {"value":"a0","done":false}',
+  ]);
+
+  A.yield(1, 'a1');
+  await flushMicrotasks();
+  t.expectLog('the second already-requested value is delivered', [
+    'r1 resolved {"value":"a1","done":false}',
+  ]);
+
+  const r2 = fm.next();
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('a call made after return() is done', ['r2 resolved {"done":true}']);
+}]);
+
+// The in-order delivery guarantee survives return(): an already-requested value
+// that settles out of order still waits for the earlier one.
+tests.push(['flatMap: after return(), already-requested values are still delivered in order', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('two inner pulls are in flight', ['A.next() #0', 'A.next() #1']);
+
+  const ret = fm.return();
+  t.check('return() returns a promise', ret instanceof Promise, true);
+  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes both iterators', [
+    'A.return() #0',
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+
+  // The second pull settles first; it must still wait for the first.
+  A.yield(1, 'a1');
+  await flushMicrotasks();
+  t.expectLog('a later value cannot settle ahead of the earlier one', []);
+
+  A.yield(0, 'a0');
+  await flushMicrotasks();
+  t.expectLog('both already-requested values settle in call order', [
+    'r0 resolved {"value":"a0","done":false}',
+    'r1 resolved {"value":"a1","done":false}',
+  ]);
+}]);
+
 runTests(tests);

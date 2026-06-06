@@ -1236,11 +1236,16 @@ tests.push(['flatMap: a mid-stream inner error closes the active iterator then t
   src.holdReturn();
   B.holdReturn();
 
-  // A's lingering pull #0 rejects. B is the live active iterator, so it is closed
-  // FIRST; the underlying is not touched yet, and nothing is surfaced.
+  // A's lingering pull #0 rejects. B sits entirely AFTER A's errored slot in
+  // concatenation order, so B's pull can never deliver: r1 (committed to it) is
+  // settled done at once. B is then closed FIRST; the underlying is not touched
+  // yet, and the rejection for r0 is not surfaced.
   A.throw(0, new Error('boom'));
   await flushMicrotasks();
-  t.expectLog('the active inner iterator is closed first, alone', ['B.return() #0']);
+  t.expectLog('the dead call is doned and the active inner iterator is closed first', [
+    'B.return() #0',
+    'r1 resolved {"done":true}',
+  ]);
 
   // Once B's close settles, the underlying is closed next — still no rejection.
   B.settleReturn(0);
@@ -1252,9 +1257,11 @@ tests.push(['flatMap: a mid-stream inner error closes the active iterator then t
   await flushMicrotasks();
   t.expectLog('the rejection surfaces after both closes settle', ['r0 rejected boom']);
 
-  // r1 was committed to B's still-pending pull; it remains open (B was closed,
-  // but its already-requested pull is never settled here) and is left untracked.
-  void r1;
+  // B's already-requested pull was truncated, so settling it now is ignored: no
+  // late value reaches the (already done) r1.
+  B.yield(0, 'late');
+  await flushMicrotasks();
+  t.expectLog('a late settlement of the closed iterator pull is ignored', []);
 }]);
 
 tests.push(['flatMap: the two-close error path swallows an error from closing the active iterator', async function (t) {
@@ -1302,7 +1309,10 @@ tests.push(['flatMap: the two-close error path swallows an error from closing th
 
   A.throw(0, new Error('boom'));
   await flushMicrotasks();
-  t.expectLog('the active inner iterator is closed first, alone', ['B.return() #0']);
+  t.expectLog('the dead call is doned and the active inner iterator is closed first', [
+    'B.return() #0',
+    'r1 resolved {"done":true}',
+  ]);
 
   // B's close FAILS. The failure is swallowed; the underlying is still closed.
   bReturn.reject(new Error('inner-close-fail'));
@@ -1313,8 +1323,112 @@ tests.push(['flatMap: the two-close error path swallows an error from closing th
   src.settleReturn(0);
   await flushMicrotasks();
   t.expectLog('the original error wins once both closes settle', ['r0 rejected boom']);
+}]);
 
-  void r1;
+// --- "calls that can no longer settle are doned + truncated" ----------------
+//
+// The general rule: once a position in the flattened stream is known to be dead
+// (an error terminates the stream there), every call committed to a position at
+// or after it can never receive a value/error, so it must settle done and its
+// in-flight pull must be truncated (its eventual settlement ignored). The two
+// tests above cover this for the two-close path; the two below cover the other
+// inner-error path and the underlying-error path.
+
+// Single-close path: an EARLIER pull of the active iterator errors while a LATER
+// pull of the same iterator is still in flight. The later pull's call sits after
+// the error, so it must be doned (not left to receive a value), and its eventual
+// settlement must be ignored.
+tests.push(['flatMap: an inner error dones a later in-flight call on the same iterator and ignores its late pull', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across the active iterator', ['A.next() #0', 'A.next() #1']);
+
+  // A's earlier pull (#0) rejects while pull #1 is still in flight. #0 is the head,
+  // so it closes the underlying and its error is committed to r0; #1 is past the
+  // error, so r1 is doned immediately. The error for r0 waits for src.return().
+  A.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the underlying closes, the later call is doned, then the error surfaces', [
+    'src.return() #0',
+    'r1 resolved {"done":true}',
+    'r0 rejected boom',
+  ]);
+
+  // A's pull #1 was truncated, so settling it now is ignored: no late value
+  // reaches the (already done) r1.
+  A.yield(1, 'late');
+  await flushMicrotasks();
+  t.expectLog('a late settlement of the truncated pull is ignored', []);
+}]);
+
+// Underlying-error path with buffered values ahead of the error. An earlier inner
+// iterator is parked with in-flight pulls (buffered, ahead in the stream) when the
+// underlying errors fetching the NEXT iterator. The buffered values must still
+// deliver, the error must reach the call at that position, and any surplus is
+// doned — the error must NOT be swallowed into a clean done.
+tests.push(['flatMap: an underlying error behind buffered values still surfaces after them', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  const r2 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  await flushMicrotasks();
+  t.expectLog('three coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 3 fans out across A', ['A.next() #0', 'A.next() #1', 'A.next() #2']);
+
+  // A reports done at pull #2 with #0/#1 still in flight: A is parked keeping
+  // [a0, a1], and the freed demand (1) redirects to a second underlying pull.
+  A.finish(2);
+  await flushMicrotasks();
+  t.expectLog('A done redirects the freed demand to another underlying pull', ['src.next() #1']);
+
+  // The underlying errors fetching the next iterator. It is NOT closed (it errored
+  // itself), and nothing surfaces yet: the error sits behind A's buffered values.
+  src.throw(1, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the underlying error is buffered behind the parked values', []);
+
+  // A's buffered values deliver in order; draining A then exposes the error to the
+  // call at that position.
+  A.yield(0, 'a0');
+  await flushMicrotasks();
+  t.expectLog('the first buffered value is delivered', ['r0 resolved {"value":"a0","done":false}']);
+
+  A.yield(1, 'a1');
+  await flushMicrotasks();
+  t.expectLog('the last buffered value is delivered, then the error surfaces', [
+    'r1 resolved {"value":"a1","done":false}',
+    'r2 rejected boom',
+  ]);
 }]);
 
 runTests(tests);

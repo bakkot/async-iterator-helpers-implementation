@@ -177,16 +177,52 @@ class FlatMapHelper {
 
         if (this.#active.type === 'iter') {
           const active = this.#active;
-          this.#closedButStillHaveValuesInFlight.push(this.#active);
+
+          // The errored slot is the last position that can deliver; everything
+          // strictly after it in concatenation order is now dead. Drop those slots
+          // (so their pending pulls are ignored when they settle) and, below, settle
+          // the calls aimed at them with done. What counts as "after" depends on
+          // where the error happened.
+          if (active === inFlight) {
+            // single-close: the error is in the active iterator itself. Park it in
+            // the closed queue, keeping the error slot and any earlier still-pending
+            // slots, but dropping everything this iterator pulled after the error.
+            const errorIndex = active.values.indexOf(slot);
+            if (errorIndex + 1 < active.values.length) {
+              this.#truncateInFlightFrom(active, errorIndex + 1);
+            }
+            this.#closedButStillHaveValuesInFlight.push(active);
+          } else {
+            // two-close: the error is in an already-parked iterator; `active` is a
+            // separate live iterator entirely after it. Drop the errored iterator's
+            // own tail, every parked iterator after it, and `active` itself.
+            const errorIndex = inFlight.values.indexOf(slot);
+            if (errorIndex + 1 < inFlight.values.length) {
+              this.#truncateInFlightFrom(inFlight, errorIndex + 1);
+            }
+            const inFlightIndex = this.#closedButStillHaveValuesInFlight.indexOf(inFlight);
+            for (let i = inFlightIndex + 1; i < this.#closedButStillHaveValuesInFlight.length; ++i) {
+              if (this.#closedButStillHaveValuesInFlight[i].values.length > 0) {
+                this.#truncateInFlightFrom(this.#closedButStillHaveValuesInFlight[i], 0);
+              }
+            }
+            this.#closedButStillHaveValuesInFlight.length = inFlightIndex + 1;
+            if (active.values.length > 0) {
+              this.#truncateInFlightFrom(active, 0);
+            }
+          }
           this.#active = { type: 'finished' };
+
+          // The errored slot is now the last live entry in the queue; settle every
+          // call beyond it with done.
+          const maxLive = this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.values.length, 0);
+          this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - maxLive);
 
           if (active === inFlight) {
             // just gotta close underlying
             this.#closeUnderlyingForError(slotButWithTypeScript as Error);
           } else {
-            // The errored slot lives in an iterator that already reported done (it's
-            // parked in the closed queue); a *different* iterator (`active`) is still
-            // live. Two things are open: `active` and the underlying. Close them
+            // Two things are open: `active` and the underlying. Close them
             // sequentially — the active inner iterator first, then the underlying,
             // matching the order return() uses — and surface the error only once both
             // closes have settled. Errors from either .return() are swallowed.
@@ -293,12 +329,19 @@ class FlatMapHelper {
         if (this.#finished) return;
         // assert this.#active.type === 'reading underlying'
 
+        // The underlying errored while fetching the next inner iterator. It is NOT
+        // closed (it reported the error itself). Values buffered in already-parked
+        // iterators still deliver ahead of the error; the error then goes to the
+        // call at that position, and the rest of the coalesced demand is doned. We
+        // keep the error live in #active so it surfaces only once those buffered
+        // values have drained — overwriting it with a clean finish would swallow it.
         this.#active = { type: 'error', error, closeState: 'ready' };
+        const maxLive = this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.values.length, 0);
+        // keep maxLive calls for the buffered values and one more for the error
+        this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - maxLive - 1);
         if (this.#closedButStillHaveValuesInFlight.length === 0) {
           this.#processQueue();
         }
-        this.#markUnderlyingAsFinished();
-        // TODO think about order of truncation vs processQueue call (mostly just needs to be consistent w/ elsewhere)
         return;
       }
     );

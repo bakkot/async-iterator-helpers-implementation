@@ -5,6 +5,12 @@
 //   node test/flatMap-fuzzer.js [N] --fuzz COUNT [--seed S]   random schedules
 //   node test/flatMap-fuzzer.js [N] --replay '[..]'          replay one decision vector
 //
+// Exhaustive enumeration is only practical for a quick smoke test (N=2 is a few
+// thousand schedules; it blows up fast with N because of flatMap's nested
+// pull/mapper/inner fan-out). Real coverage comes from --fuzz at larger N, which
+// can reach any schedule the enumeration would (every choice has positive
+// probability). A failing fuzz case prints a --replay vector for instant repro.
+//
 // Unlike the map/filter fuzzers, this does NOT compare against a reimplemented
 // oracle. flatMap's concurrent bookkeeping is exactly the thing under test, so a
 // faithful model would be as likely to be wrong as the implementation. Instead we
@@ -118,11 +124,15 @@ async function runSchedule(maxEvents, chooser) {
     violations: [],
   };
 
-  // helperFinished: an over-approximation of "the flattened stream has ended",
-  // used only to mark inner iterators that the mapper produces *after* the helper
-  // is already done (the known mapper-pending leak). An inner done does NOT end
-  // the stream, so it is deliberately excluded here.
-  let helperFinished = false;
+  // Whether the helper has terminated, derived from OBSERVABLE facts rather than
+  // guessed from stub responses: the consumer returned, or the underlying was
+  // seen done/error, or flatMap closed the underlying (which it does exactly when
+  // terminating on a mapper/inner error or a consumer return). Crucially this does
+  // NOT treat a stub's sync-throw as termination -- flatMap may truncate/discard
+  // that pull (e.g. an inner done arrived first), in which case the helper lives
+  // on. An inner *done* never ends the stream, so it is not part of this either.
+  let consumerReturned = false;
+  const isFinished = () => consumerReturned || rec.underlying.finished != null || rec.underlying.returnCalls > 0;
 
   let eventSeq = 0;
   const log = (line) => { rec.events.push(line); eventSeq++; };
@@ -168,8 +178,8 @@ async function runSchedule(maxEvents, chooser) {
       rec.underlying.pulls.push(pull);
       const shape = (finalizing || idx >= maxPulls) ? 'syncDone' : PULL_SHAPES[chooser.choose(PULL_SHAPES.length)];
       if (shape === 'syncValue') { pull.status = 'value'; pull.value = underlyingValue(idx); return { value: pull.value, done: false }; }
-      if (shape === 'syncDone') { pull.status = 'done'; rec.underlying.finished = 'done'; rec.underlying.finishedStep = stepNo; helperFinished = true; return { value: undefined, done: true }; }
-      if (shape === 'syncThrow') { pull.status = 'error'; rec.underlying.finished = 'error'; rec.underlying.finishedStep = stepNo; helperFinished = true; throw new Error(underlyingError(idx)); }
+      if (shape === 'syncDone') { pull.status = 'done'; rec.underlying.finished = 'done'; rec.underlying.finishedStep = stepNo; return { value: undefined, done: true }; }
+      if (shape === 'syncThrow') { pull.status = 'error'; rec.underlying.finished = 'error'; rec.underlying.finishedStep = stepNo; throw new Error(underlyingError(idx)); }
       const d = Promise.withResolvers();
       pendingPulls.push({ id: `U#${idx}`, kind: 'U', idx, d });
       return d.promise;
@@ -194,7 +204,7 @@ async function runSchedule(maxEvents, chooser) {
 
   const createInner = () => {
     const id = rec.inners.length;
-    const inner = { id, pulls: [], returnCalls: 0, finished: null, finishedStep: null, returnStep: null, createdWhileFinished: helperFinished };
+    const inner = { id, pulls: [], returnCalls: 0, finished: null, finishedStep: null, returnStep: null, createdWhileFinished: isFinished() };
     rec.inners.push(inner);
     inner.iterator = {
       next() {
@@ -207,7 +217,7 @@ async function runSchedule(maxEvents, chooser) {
         const shape = (finalizing || idx >= maxPulls) ? 'syncDone' : PULL_SHAPES[chooser.choose(PULL_SHAPES.length)];
         if (shape === 'syncValue') { pull.status = 'value'; pull.value = innerValue(id, idx); return { value: pull.value, done: false }; }
         if (shape === 'syncDone') { pull.status = 'done'; inner.finished = 'done'; inner.finishedStep = stepNo; return { value: undefined, done: true }; }
-        if (shape === 'syncThrow') { pull.status = 'error'; inner.finished = 'error'; inner.finishedStep = stepNo; helperFinished = true; throw new Error(innerError(id, idx)); }
+        if (shape === 'syncThrow') { pull.status = 'error'; inner.finished = 'error'; inner.finishedStep = stepNo; throw new Error(innerError(id, idx)); }
         const d = Promise.withResolvers();
         pendingPulls.push({ id: `I${id}#${idx}`, kind: 'I', innerId: id, idx, d });
         return d.promise;
@@ -240,7 +250,7 @@ async function runSchedule(maxEvents, chooser) {
     rec.mappers.push(m);
     const shape = finalizing ? 'syncIter' : MAPPER_SHAPES[chooser.choose(MAPPER_SHAPES.length)];
     if (shape === 'syncIter') { m.outcome = 'iter'; const inner = createInner(); m.innerId = inner.id; return inner.iterator; }
-    if (shape === 'syncThrow') { m.outcome = 'error'; helperFinished = true; throw new Error(mapperError(id)); }
+    if (shape === 'syncThrow') { m.outcome = 'error'; throw new Error(mapperError(id)); }
     const d = Promise.withResolvers();
     pendingMapper = { id, d };
     return d.promise;
@@ -265,7 +275,7 @@ async function runSchedule(maxEvents, chooser) {
   const doReturn = () => {
     const call = { id: rec.calls.length, kind: 'return', settle: null };
     rec.calls.push(call);
-    helperFinished = true;
+    consumerReturned = true;
     try { trackCall(call, Promise.resolve(fm.return())); }
     catch (e) { call.settle = { type: 'reject', error: e && e.message }; log(`return#${call.id} threw ${e && e.message}`); }
   };
@@ -281,13 +291,13 @@ async function runSchedule(maxEvents, chooser) {
       entry.d.resolve({ value: pull.value, done: false });
     } else if (outcome === 'done') {
       pull.status = 'done';
-      if (entry.kind === 'U') { rec.underlying.finished = 'done'; rec.underlying.finishedStep = stepNo; helperFinished = true; }
+      if (entry.kind === 'U') { rec.underlying.finished = 'done'; rec.underlying.finishedStep = stepNo; }
       else { rec.inners[entry.innerId].finished = 'done'; rec.inners[entry.innerId].finishedStep = stepNo; }
       entry.d.resolve({ value: undefined, done: true });
     } else {
       pull.status = 'error';
-      if (entry.kind === 'U') { rec.underlying.finished = 'error'; rec.underlying.finishedStep = stepNo; helperFinished = true; entry.d.reject(new Error(underlyingError(entry.idx))); }
-      else { rec.inners[entry.innerId].finished = 'error'; rec.inners[entry.innerId].finishedStep = stepNo; helperFinished = true; entry.d.reject(new Error(innerError(entry.innerId, entry.idx))); }
+      if (entry.kind === 'U') { rec.underlying.finished = 'error'; rec.underlying.finishedStep = stepNo; entry.d.reject(new Error(underlyingError(entry.idx))); }
+      else { rec.inners[entry.innerId].finished = 'error'; rec.inners[entry.innerId].finishedStep = stepNo; entry.d.reject(new Error(innerError(entry.innerId, entry.idx))); }
     }
   };
   const settleMapper = (outcome) => {
@@ -295,7 +305,7 @@ async function runSchedule(maxEvents, chooser) {
     const d = pendingMapper.d;
     pendingMapper = null;
     if (outcome === 'iter') { m.outcome = 'iter'; const inner = createInner(); m.innerId = inner.id; d.resolve(inner.iterator); }
-    else { m.outcome = 'error'; helperFinished = true; d.reject(new Error(mapperError(m.id))); }
+    else { m.outcome = 'error'; d.reject(new Error(mapperError(m.id))); }
   };
   const settleReturn = (entry) => {
     pendingReturns.splice(pendingReturns.indexOf(entry), 1);
@@ -350,7 +360,7 @@ async function runSchedule(maxEvents, chooser) {
   // The cleanup/leak invariant reasons about what was open when the helper
   // terminated; finalization (which force-settles leftovers) would otherwise
   // rewrite "open" iterators into "finished" ones.
-  rec.finishedNaturally = helperFinished;
+  rec.finishedNaturally = isFinished();
   rec.underlying.naturalFinished = rec.underlying.finished;
   for (const inner of rec.inners) inner.naturalFinished = inner.finished;
 
@@ -610,7 +620,7 @@ async function main() {
       replay: { type: 'string' },
     },
   });
-  const maxEvents = Number(positionals[0] ?? 4);
+  const maxEvents = Number(positionals[0] ?? (values.fuzz !== undefined ? 5 : 2));
   setFlushChunk(Math.max(16, 3 * maxEvents));
   if (values.replay !== undefined) return runReplay(maxEvents, JSON.parse(values.replay));
   if (values.fuzz !== undefined) return runFuzz(maxEvents, Number(values.fuzz), values.seed);

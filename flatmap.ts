@@ -10,12 +10,6 @@ function fastPromiseTry<T>(cb: () => T): Promise<Awaited<T>> {
   }
 }
 
-declare global {
-  interface Math {
-    sumPrecise(numbers: Iterable<number>): number;
-  }
-}
-
 type Slot =
   | { type: 'awaiting' }
   | { type: 'value', value: unknown }
@@ -268,7 +262,7 @@ class FlatMapHelper {
 
   #markUnderlyingAsFinished() {
     // assert this.#active.type === 'reading underlying' (or this is the call to .return)
-    const maxLive = Math.sumPrecise(this.#closedButStillHaveValuesInFlight.map(x => x.values.length));
+    const maxLive = this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.values.length, 0);
     this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - maxLive);
     this.#active = { type: 'finished' };
   }

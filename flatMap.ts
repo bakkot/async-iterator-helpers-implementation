@@ -198,6 +198,7 @@ class FlatMapHelper {
               this.#processQueue();
             }
             const onClosed = () => {
+              // runs on either settlement of underlying.return(), swallowing its error
               if (slotButWithTypeScript.reject) {
                 // assert slot.type !== 'removed'
                 slotButWithTypeScript.reject(error);
@@ -207,11 +208,11 @@ class FlatMapHelper {
                 // assert: not head of queue
               }
             };
-            const swallow = () => {};
-            fastPromiseTry(() => (activeIter as MaybeReturnable).return?.())
-              .then(swallow, swallow)
-              .then(() => fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.()).then(swallow, swallow))
-              .then(onClosed);
+            const closeUnderlying = () => {
+              // runs on either settlement of activeIter.return(), swallowing its error
+              fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.()).then(onClosed, onClosed);
+            };
+            fastPromiseTry(() => (activeIter as MaybeReturnable).return?.()).then(closeUnderlying, closeUnderlying);
           }
           return;
         }

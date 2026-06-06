@@ -253,6 +253,8 @@ class FlatMapHelper {
           // TODO do exceptions from the fn call at this point go into unhandled promise rejection
         }
         // assert this.#active.type === 'error' || this.#active.type === 'finished'
+        // nothing to close in this case
+        (slot as Error).closeState = 'ready';
         if (this.#isHeadOfQueue(slot)) {
           this.#processQueue();
         }
@@ -330,10 +332,11 @@ class FlatMapHelper {
 
   #closeUnderlyingForErrorInMapper(error: unknown) {
     // assert: this.#active.type === 'reading underlying'
+    const requested = this.#active.type === 'reading underlying' ? this.#active.requested : 1;
     const slot = { type: 'error', error, closeState: 'awaiting-return', reject: null, count: 1 } as const;
+    this.#markSomeCallsAsNoLongerGettingValues(requested - 1);
     this.#active = slot;
     this.#closeUnderlyingForError(slot);
-    // TODO truncation
   }
 
   #closeUnderlyingForError(slot: Error) {

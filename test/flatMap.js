@@ -1023,4 +1023,161 @@ tests.push(['flatMap: after return(), already-requested values are still deliver
   ]);
 }]);
 
+// --- Terminal events with coalesced demand / after return() ----------------
+
+// A mapper error coalesced across several calls: while "reading underlying",
+// concurrent calls share one underlying pull and one mapper invocation. When the
+// mapper fails it closes the underlying, the first position takes the error (after
+// the close settles), and the other coalesced calls — which can never be filled
+// now the source is closing — settle done. (filter's terminal-error shape.)
+tests.push(['flatMap: a mapper error with coalesced demand rejects one call and dones the surplus', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('a single mapper invocation', ['m(1) #0']);
+
+  // The done settles immediately (the source is closing, so the surplus call can
+  // never be filled); the error waits for src.return() to settle.
+  m.reject(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the surplus call is done, then the error reaches the first call', [
+    'src.return() #0',
+    'r1 resolved {"done":true}',
+    'r0 rejected boom',
+  ]);
+}]);
+
+// After return(), an already-requested inner pull that *errors* (instead of
+// yielding) must still reach its call. Everything is already closed, so the error
+// is surfaced directly with no further close.
+tests.push(['flatMap: after return(), an inner error still reaches its already-requested call', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls the underlying', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('the inner iterator is pulled', ['A.next() #0']);
+
+  const ret = fm.return();
+  t.check('return() returns a promise', ret instanceof Promise, true);
+  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes both iterators', [
+    'A.return() #0',
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+
+  // The already-requested pull rejects; the error reaches its call (no new close).
+  A.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the in-flight error reaches its call', ['r0 rejected boom']);
+}]);
+
+// After return(), an inner iterator that reports done settles only as many calls
+// as it had outstanding — NOT every call behind it — because a later inner
+// iterator's already-requested values still deliver, shifting forward to fill in.
+tests.push(['flatMap: after return(), an inner done settles only its own outstanding calls; later values still deliver', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  const r2 = fm.next();
+  const r3 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  track(t.log, 'r2', r2);
+  track(t.log, 'r3', r3);
+  await flushMicrotasks();
+  t.expectLog('four coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 4 fans out across A', [
+    'A.next() #0', 'A.next() #1', 'A.next() #2', 'A.next() #3',
+  ]);
+
+  // A reports done at pull #2 (pulls #0/#1 still in flight): it keeps [a0, a1] and
+  // the freed demand (2) redirects to a second underlying pull -> iterator B.
+  A.finish(2);
+  await flushMicrotasks();
+  t.expectLog('A done redirects the freed demand to another underlying pull', ['src.next() #1']);
+
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked again', ['m(2) #1']);
+
+  const B = controlledSource(t.log, 'B');
+  m.resolve(1, B.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across B', ['B.next() #0', 'B.next() #1']);
+
+  // The flattened stream now stands at [a0, a1, b0, b1]. return() closes the
+  // active iterator B and the underlying; A (already queued) and B keep their
+  // in-flight pulls for delivery.
+  const ret = fm.return();
+  t.check('return() returns a promise', ret instanceof Promise, true);
+  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes the active inner iterator and the underlying', [
+    'B.return() #0',
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+
+  // A reports done at its second outstanding pull (#1), with #0 still pending.
+  // That ends A one value short, so the stream shrinks to [a0, b0, b1]: exactly
+  // ONE call (the surplus tail, r3) settles done — not r1/r2, which B still feeds.
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('only the single surplus call settles done', ['r3 resolved {"done":true}']);
+
+  // The survivors deliver in concatenation order; B's values shift forward.
+  A.yield(0, 'a0');
+  await flushMicrotasks();
+  t.expectLog("A's surviving value goes to the first call", [
+    'r0 resolved {"value":"a0","done":false}',
+  ]);
+
+  B.yield(0, 'b0');
+  await flushMicrotasks();
+  t.expectLog('the later iterator value shifts forward to the next call', [
+    'r1 resolved {"value":"b0","done":false}',
+  ]);
+
+  B.yield(1, 'b1');
+  await flushMicrotasks();
+  t.expectLog('and the last survivor to the call after it', [
+    'r2 resolved {"value":"b1","done":false}',
+  ]);
+}]);
+
 runTests(tests);

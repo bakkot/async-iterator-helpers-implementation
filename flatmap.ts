@@ -422,10 +422,10 @@ class FlatMapHelper {
       return;
     }
     if (this.#active.type === 'iter') {
-      while (true) {
-        // assert this.#active.values.length > 0
-        const didPop = this.#dispatchHeadOfInFlight(this.#active);
-        if (!didPop) return;
+      while (this.#active.values.length > 0) {
+        if (!this.#dispatchHeadOfInFlight(this.#active)) {
+          return;
+        }
       }
     }
   }

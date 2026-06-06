@@ -1868,6 +1868,50 @@ tests.push(['flatMap: a non-head pull of the active iterator errors behind a sti
   ]);
 }]);
 
+// --- two concurrent inner pulls that BOTH error -----------------------------
+//
+// Two concurrent pulls of the same active inner iterator are in flight; both
+// reject. An error is not a wall that swallows later already-issued pulls: each
+// pull delivers its own result in order, so BOTH errors surface (r0 then r1).
+// (Settling a later in-flight pull done instead would be wrong: if a *third*
+// pull had yielded a value, a done at r1 would sit ahead of that real value.)
+tests.push(['flatMap: two concurrent inner pulls that both reject surface both errors in order', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across the active iterator', ['A.next() #0', 'A.next() #1']);
+
+  // The head pull rejects: it closes the underlying and its error reaches r0.
+  A.throw(0, new Error('boom0'));
+  await flushMicrotasks();
+  t.expectLog('the head error closes the underlying, then reaches the first call', [
+    'src.return() #0',
+    'r0 rejected boom0',
+  ]);
+
+  // The second already-issued pull also rejects: its error reaches r1 (not a done).
+  A.throw(1, new Error('boom1'));
+  await flushMicrotasks();
+  t.expectLog('the second already-issued error reaches the second call', [
+    'r1 rejected boom1',
+  ]);
+}]);
+
 // --- multiple parked iterators + a clean underlying done --------------------
 //
 // Two iterators are parked (each keeping one in-flight pull) when the underlying

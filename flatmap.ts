@@ -77,7 +77,7 @@ class FlatMapHelper {
     // assert count < this.#calls.length
     const mightStillGetValues = this.#calls.length - removedCount;
     for (let i = 0; i < removedCount; ++i) {
-      this.#calls[mightStillGetValues + i].resolve({ done: true, value: undefined });
+      this.#calls[mightStillGetValues + i].resolve({ value: undefined, done: true });
     }
     this.#calls.length = mightStillGetValues;
   }
@@ -267,7 +267,7 @@ class FlatMapHelper {
   }
 
   #markUnderlyingAsFinished() {
-    // assert this.#active.type === 'reading underlying'
+    // assert this.#active.type === 'reading underlying' (or this is the call to .return)
     const maxLive = Math.sumPrecise(this.#closedButStillHaveValuesInFlight.map(x => x.values.length));
     this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - maxLive);
     this.#active = { type: 'finished' };
@@ -379,7 +379,6 @@ class FlatMapHelper {
   }
 
   #processQueue() {
-    // TODO
     // assert: we are going to do at least one unit of work
     while (this.#closedButStillHaveValuesInFlight.length > 0) {
       const head = this.#closedButStillHaveValuesInFlight[0];
@@ -390,7 +389,7 @@ class FlatMapHelper {
         }
         head.values.shift();
         if (headHead.type === 'value') {
-          this.#calls.shift()!.resolve({ done: false, value: headHead.value });
+          this.#calls.shift()!.resolve({ value: headHead.value, done: false });
         } else if (headHead.type === 'error') {
           const call = this.#calls.shift()!;
           if (headHead.closeState === 'awaiting-return') {
@@ -425,12 +424,42 @@ class FlatMapHelper {
     } else {
       // assert this.#active.type === 'iter'
       // cannot be error because we guarded on this.#finished above
-      // TODO
+      this.#issuePullFromCurrentActive();
     }
     return promise;
   }
 
   return() {
-    // TODO
+    if (this.#active.type === 'unstarted') {
+      this.#active = { type: 'finished' };
+    }
+    if (this.#finished) {
+      return Promise.resolve({ value: undefined, done: true });
+    }
+    // TODO order of truncation vs resolving this Promise
+    this.#markUnderlyingAsFinished();
+
+    if (this.#active.type === 'iter') {
+      // TODO consider whether to block on closing active before closing underlying
+      // probably yes?
+      // TODO make this match above
+      // TODO check against iterator sync flatmap
+      const activeIter = this.#active.iter;
+
+      // todo fast path for missing returns
+      return fastPromiseTry(() => (activeIter as MaybeReturnable).return?.()).then(
+        () => {
+          // TODO strictly speaking we need to check for object-ness of the return value here
+          // or, change the spec to never do that, because it's dumb
+          return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
+            .then(() => ({ value: undefined, done: true }))
+        },
+        error => {
+          // this error squashes errors from closing underlying
+          return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
+            .finally(() => Promise.reject(error));
+        },
+      );
+    }
   }
 }

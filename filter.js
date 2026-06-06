@@ -245,7 +245,7 @@ class FilterHelper {
     try {
       r = this.#it.return?.();
     } catch (e) {
-      this.#processQueue();
+      this.#processQueue(); // TODO why are we calling this here...
       return Promise.reject(e);
     }
 

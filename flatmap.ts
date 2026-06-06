@@ -378,36 +378,61 @@ class FlatMapHelper {
     Promise.resolve(returnPromise).then(onClosed, onClosed);
   }
 
+  // returns false if was awaiting
+  #dispatchHeadOfInFlight(inFlight: InFlight): boolean {
+    const head = inFlight.values[0];
+    if (head.type === 'awaiting') {
+      return false;
+    }
+    inFlight.values.shift();
+    if (head.type === 'value') {
+      this.#calls.shift()!.resolve({ value: head.value, done: false });
+    } else if (head.type === 'error') {
+      const call = this.#calls.shift()!;
+      if (head.closeState === 'awaiting-return') {
+        // This error triggered `.return()`, and the result has not yet settled.
+        // Since this is the head of the queue, we can commit it to this call by leaving a rejector for
+        // the close reaction to invoke, and can still drop `headHead` from the inFlight values.
+        head.reject = call.reject;
+      } else {
+        // assert: headHead.closeState === 'ready'
+        call.reject(head.error);
+      }
+    } else {
+      // unreachable
+      console.error('unreachable');
+      throw new Error('unreachable');
+    }
+    return true;
+  }
+
   #processQueue() {
     // assert: we are going to do at least one unit of work
     while (this.#closedButStillHaveValuesInFlight.length > 0) {
       const head = this.#closedButStillHaveValuesInFlight[0];
       while (head.values.length > 0) {
-        const headHead = head.values[0];
-        if (headHead.type === 'awaiting') {
+        if (!this.#dispatchHeadOfInFlight(head)) {
           return;
-        }
-        head.values.shift();
-        if (headHead.type === 'value') {
-          this.#calls.shift()!.resolve({ value: headHead.value, done: false });
-        } else if (headHead.type === 'error') {
-          const call = this.#calls.shift()!;
-          if (headHead.closeState === 'awaiting-return') {
-            // This error triggered `.return()`, and the result has not yet settled.
-            // Since this is the head of the queue, we can commit it to this call by leaving a rejector for
-            // the close reaction to invoke, and can still drop `headHead` from the inFlight values.
-            headHead.reject = call.reject;
-          } else {
-            // assert: headHead.closeState === 'ready'
-            call.reject(headHead.error);
-          }
-        } else {
-          // unreachable
-          console.error('unreachable');
-          throw new Error('unreachable');
         }
       }
       this.#closedButStillHaveValuesInFlight.shift();
+    }
+    if (this.#active.type === 'error') {
+      if (this.#active.closeState === 'ready') {
+        this.#calls.shift()!.reject(this.#active.error);
+      } else {
+        this.#active.reject = this.#calls.shift()!.reject;
+      }
+      this.#active = { type: 'finished' };
+      // TODO maybe errors just go as a length-1 entry on top of closedButStillHaveValuesInFlight?
+      return;
+    }
+    if (this.#active.type === 'iter') {
+      while (true) {
+        // assert this.#active.values.length > 0
+        const didPop = this.#dispatchHeadOfInFlight(this.#active);
+        if (!didPop) return;
+      }
     }
   }
 

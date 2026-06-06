@@ -127,6 +127,16 @@ class FlatMapHelper {
           const currentIndex = thisIterValues.indexOf(slot);
           const removedCount = thisIterValues.length - currentIndex;
           // assert removedCount > 0: we have not already truncated this value
+
+          // Does removing these slots change the head of the queue (revealing
+          // something that was buffered behind this iterator)? Only if this pull was
+          // the head of its own iterator (currentIndex === 0) AND that iterator is
+          // the front of the closed queue — then truncation pops it and the next
+          // entry becomes the head. (While `inFlight` is still the active iterator it
+          // isn't in the closed queue, so this is false; and nothing is buffered
+          // behind the active iterator anyway.) Capture before truncating pops it.
+          const exposedNewHead = currentIndex === 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight;
+
           this.#truncateInFlightFrom(inFlight, currentIndex);
 
           if (this.#active.type === 'iter') {
@@ -135,8 +145,6 @@ class FlatMapHelper {
                 this.#closedButStillHaveValuesInFlight.push(this.#active);
               }
               this.#issuePullFromUnderlying(removedCount);
-
-              // no need to process queue here: this cannot have been holding up any values except those from this iterator, which we're just dropping
             } else {
               // assert: this.#closedButStillHaveValuesInFlight.includes(inFlight)
               // strictly speaking, if thisIterValues is now empty we could remove it
@@ -145,24 +153,17 @@ class FlatMapHelper {
               for (let i = 0; i < removedCount; ++i) {
                 this.#issuePullFromCurrentActive();
               }
-
-              // Truncating this parked iterator may have emptied it and popped it
-              // off the queue, exposing a value that had settled behind it but could
-              // not be delivered yet. Flush so any such now-head value goes out.
-              // (We can't gate on `slot` being head: it was just truncated away.)
-              this.#processQueue();
             }
           } else if (this.#active.type === 'reading underlying') {
             this.#active.requested += removedCount;
-            // As above: exhausting this parked iterator may have exposed a value
-            // buffered behind it (in a later parked iterator). Flush it.
-            this.#processQueue();
           } else {
             // assert this.#active.type === 'error || this.#active.type === 'finished'
 
             this.#markSomeCallsAsNoLongerGettingValues(removedCount);
-            // As above: a value buffered behind this now-exhausted parked iterator
-            // (or the pending error in #active) may now be deliverable. Flush it.
+          }
+
+          // If we popped the front of the queue, deliver from whatever it revealed.
+          if (exposedNewHead) {
             this.#processQueue();
           }
         } else {

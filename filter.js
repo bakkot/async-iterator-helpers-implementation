@@ -234,10 +234,11 @@ class FilterHelper {
     return promise;
   }
 
-  return(value) {
+  return() {
+    // Terminal values are ignored: the argument is dropped and the underlying's
+    // .return() value is discarded, matching map/flatMap.
     if (this.#finished) {
-      // TODO do we await this value? do we do anything with it?
-      return Promise.resolve({ value, done: true });
+      return Promise.resolve({ value: undefined, done: true });
     }
     this.#finished = true;
 
@@ -251,6 +252,6 @@ class FilterHelper {
 
     this.#processQueue();
 
-    return Promise.resolve(r).then(() => ({ value, done: true }));
+    return Promise.resolve(r).then(() => ({ value: undefined, done: true }));
   }
 }

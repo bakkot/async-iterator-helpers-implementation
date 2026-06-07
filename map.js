@@ -18,7 +18,7 @@ class MapHelper {
     return (new Promise(resolve => resolve(this.#it.next()))).then(({ value, done }) => {
       if (done) {
         this.#done = true;
-        return { value, done }; // TODO think about `value: undefined`` here
+        return { value: undefined, done: true };
       }
       return (new Promise(res => res(this.#fn(value)))).then(mapped => {
         return { value: mapped, done: false,  };

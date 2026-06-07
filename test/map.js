@@ -525,4 +525,66 @@ tests.push(['map: predicate error does not close the source after an underlying 
   t.expectLog('predicate error rejects r1 with no close', ['r1 rejected predicate']);
 }]);
 
+// --- terminal values are ignored -----------------------------------------
+//
+// Policy: map ignores values attached to terminal results. A `done` from the
+// underlying is normalized to { value: undefined, done: true } (its value is not
+// propagated), the argument passed to map's own return() is dropped, and the
+// value the underlying's .return() resolves with is dropped too.
+
+// A `done` from the underlying carrying a (non-undefined) value must not leak
+// that value through: map normalizes the terminal result.
+tests.push(['map: a done from the underlying does not leak its value', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const mapped = map(src.iterator, (x) => x * 10);
+
+  const r0 = mapped.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls', ['src.next() #0']);
+
+  // The underlying reports done with a value attached; the mapper is not
+  // invoked, and the value must be dropped (not surfaced as the result value).
+  src.yieldResult(0, { value: 'leak', done: true });
+  await flushMicrotasks();
+  t.expectLog('done is normalized; the underlying value is dropped', [
+    'r0 resolved {"done":true}',
+  ]);
+}]);
+
+// The argument passed to map's own return() is ignored; the result is the
+// normalized { value: undefined, done: true }.
+tests.push(['map: return() ignores its argument', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const mapped = map(src.iterator, (x) => x * 10);
+
+  const ret = mapped.return('ignored-arg');
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes the source and resolves a normalized done', [
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+}]);
+
+// The value the underlying's .return() resolves with is ignored; map resolves
+// its own normalized done result. Hand-rolled because the controlled source's
+// .return() only ever echoes the (here absent) argument.
+tests.push(['map: the value from the underlying .return() is ignored', async function (t) {
+  const source = {
+    next() { t.log('src.next() #0'); return Promise.resolve({ value: 1, done: false }); },
+    return() { t.log('src.return() #0'); return Promise.resolve({ value: 'leak', done: true }); },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  const mapped = map(source, (x) => x * 10);
+
+  const ret = mapped.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('the underlying return value is dropped', [
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+}]);
+
 runTests(tests, xfailed);

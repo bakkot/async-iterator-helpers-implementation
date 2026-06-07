@@ -1800,4 +1800,69 @@ tests.push(['filter: a buried synchronous source error surfaces with no subseque
   ]);
 }]);
 
+// --- terminal values are ignored -----------------------------------------
+//
+// Policy (matching map/flatMap): filter ignores values attached to terminal
+// results. The argument passed to filter's own return() is dropped — both on a
+// live helper and on an already-finished one — and the value the underlying's
+// .return() resolves with is dropped too.
+
+// The argument to return() on a live helper is ignored.
+tests.push(['filter: return() ignores its argument', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const ret = f.return('ignored-arg');
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() closes the source and resolves a normalized done', [
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+}]);
+
+// The argument to return() on an already-finished helper is ignored too.
+tests.push(['filter: return() after finishing ignores its argument', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(src.iterator, pred.fn);
+
+  const r0 = f.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('first next() pulls', ['src.next() #0']);
+
+  src.finish(0);
+  await flushMicrotasks();
+  t.expectLog('source done settles the call', ['r0 resolved {"done":true}']);
+
+  const ret = f.return('ignored-arg');
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('return() on a finished helper resolves a normalized done', [
+    'ret resolved {"done":true}',
+  ]);
+}]);
+
+// The value the underlying's .return() resolves with is ignored. Hand-rolled
+// because the controlled source's .return() only ever echoes its argument.
+tests.push(['filter: the value from the underlying .return() is ignored', async function (t) {
+  const source = {
+    next() { t.log('src.next() #0'); return Promise.resolve({ value: 1, done: false }); },
+    return() { t.log('src.return() #0'); return Promise.resolve({ value: 'leak', done: true }); },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  const pred = controlledFn(t.log, 'pred');
+  const f = filter(source, pred.fn);
+
+  const ret = f.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('the underlying return value is dropped', [
+    'src.return() #0',
+    'ret resolved {"done":true}',
+  ]);
+}]);
+
 runTests(tests, xfailed);

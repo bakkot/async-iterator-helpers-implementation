@@ -154,6 +154,7 @@ function errMsg(e) {
 //   holdReturn()     -> make `.return()` return a pending promise (settled later
 //                       by settleReturn) instead of resolving immediately
 //   settleReturn(i)  -> settle the i-th held `.return()` call with { done: true }
+//   settleReturnThrow(i, err) -> reject the i-th held `.return()` call with `err`
 export function controlledSource(log, name = 'src') {
   const pulls = [];
   const heldReturns = []; // deferreds for held .return() calls, by return index
@@ -207,6 +208,7 @@ export function controlledSource(log, name = 'src') {
     throwReturn: (err) => { returnThrow = { err }; },
     holdReturn: () => { holdReturns = true; },
     settleReturn: (i) => heldReturns[i].d.resolve({ value: heldReturns[i].value, done: true }),
+    settleReturnThrow: (i, err) => heldReturns[i].d.reject(err), // reject a held .return()
   };
 }
 

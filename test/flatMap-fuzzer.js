@@ -44,7 +44,11 @@ const setFlushChunk = (n) => { FLUSH_CHUNK = n; };
 
 const PULL_SHAPES = ['syncValue', 'syncDone', 'syncThrow', 'pending'];
 const MAPPER_SHAPES = ['syncIter', 'syncThrow', 'pending'];
-const RETURN_SHAPES = ['sync', 'pending'];
+// A .return() can resolve, throw synchronously, or return a pending promise that
+// later resolves or rejects. (An iterator may also have NO .return() at all; that
+// is decided per-iterator at creation, see hasReturn.)
+const RETURN_SHAPES = ['sync', 'syncThrow', 'pending'];
+const RETURN_OUTCOMES = ['resolve', 'reject']; // for a pending .return()
 const PULL_OUTCOMES = ['value', 'done', 'error'];
 const MAPPER_OUTCOMES = ['iter', 'error'];
 
@@ -59,6 +63,10 @@ const underlyingValue = (u) => `U${u}`;
 const underlyingError = (u) => `Eu${u}`;
 const mapperError = (m) => `Em${m}`;
 const innerError = (k, j) => `Ei${k}.${j}`;
+// Errors produced by a .return() (a close failure) live in a separate namespace
+// from stream errors above: a close failure must never surface as a stream error.
+const underlyingReturnError = 'EretU';
+const innerReturnError = (k) => `EretI${k}`;
 
 function fmtSettle(s) {
   if (s.type === 'value') return `{value:${s.value},done:false}`;
@@ -122,6 +130,7 @@ async function runSchedule(maxEvents, chooser) {
     calls: [],   // { id, kind:'next'|'return', settle: null | {type,value?/error?} }
     events: [],
     violations: [],
+    returnErrors: new Set(), // close-error tags a .return() actually produced
   };
 
   // Whether the helper has terminated, derived from OBSERVABLE facts rather than
@@ -137,6 +146,17 @@ async function runSchedule(maxEvents, chooser) {
   let eventSeq = 0;
   const log = (line) => { rec.events.push(line); eventSeq++; };
   const violation = (msg) => { rec.violations.push(msg); log(`!! VIOLATION: ${msg}`); };
+
+  // Outstanding (unsettled) consumer next() calls -- the live demand.
+  const outstandingNext = () => rec.calls.reduce((a, c) => a + (c.kind === 'next' && c.settle === null ? 1 : 0), 0);
+  // (Laziness) flatMap pulls only to satisfy demand: issuing a pull while no
+  // next() call is outstanding would be speculative/eager buffering. Checked at
+  // ISSUE time (a pull is always created for currently-live demand), which avoids
+  // counting truncation-orphaned pulls. Not checked during finalize (the wind-down
+  // legitimately drives iterators with no remaining consumer).
+  const checkLazyPull = (what) => {
+    if (!finalizing && outstandingNext() === 0) violation(`speculative pull: ${what} issued with no outstanding next() call`);
+  };
 
   // During finalization the stubs respond deterministically (clean wind-down)
   // and never consult the chooser: otherwise flatMap's wind-down pulls would
@@ -165,12 +185,42 @@ async function runSchedule(maxEvents, chooser) {
     }
   };
 
+  // A .return() method shared by the underlying and inner iterators. `entity` is
+  // the record (rec.underlying or an inner) carrying its bookkeeping; `errTag` is
+  // the close-error this iterator's return uses. The "return after this iterator
+  // finished on its own" check is at CALL TIME (not step-gated): flatMap must never
+  // close an iterator it has already seen finish, and a close issued in the same
+  // tick as observing the finish is still a bug. (This cannot false-positive on
+  // "return() then an in-flight pull settles done later", because that later finish
+  // is recorded after this check has already run.)
+  const makeReturn = (entity, label, errTag) => function () {
+    const n = entity.returnCalls;
+    log(`${label}.return#${n}`);
+    if (entity.finished != null) violation(`${label}.return() after ${label} ${entity.finished}`);
+    if (n > 0) violation(`${label}.return() called more than once`);
+    entity.returnCalls++;
+    entity.returnStep = stepNo;
+    const shape = finalizing ? 'sync' : RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
+    if (shape === 'sync') return { value: undefined, done: true };
+    if (shape === 'syncThrow') { rec.returnErrors.add(errTag); throw new Error(errTag); }
+    const d = Promise.withResolvers();
+    pendingReturns.push({ id: `${label}ret#${n}`, errTag, d });
+    return d.promise;
+  };
+
   // --- the underlying source ------------------------------------------------
+
+  // Each iterator independently may or may not even have a .return() method; the
+  // implementation must cope with its absence (it uses `?.()`), and we must not
+  // count a never-pulled / abandoned no-return iterator as a leak.
+  const underlyingHasReturn = chooser.choose(2) === 0;
+  rec.underlying.hasReturn = underlyingHasReturn;
 
   const source = {
     next() {
       const idx = rec.underlying.pulls.length;
       log(`U.next#${idx}`);
+      checkLazyPull(`U.next#${idx}`);
       if (rec.underlying.finishedStep != null && stepNo > rec.underlying.finishedStep) violation(`U.next#${idx} after underlying ${rec.underlying.finished}`);
       if (rec.underlying.returnStep != null && stepNo > rec.underlying.returnStep) violation(`U.next#${idx} after U.return()`);
       if (pendingPulls.some((p) => p.kind === 'U')) violation(`a second concurrent underlying pull at #${idx}`);
@@ -184,32 +234,24 @@ async function runSchedule(maxEvents, chooser) {
       pendingPulls.push({ id: `U#${idx}`, kind: 'U', idx, d });
       return d.promise;
     },
-    return() {
-      const n = rec.underlying.returnCalls;
-      log(`U.return#${n}`);
-      if (rec.underlying.finishedStep != null && stepNo > rec.underlying.finishedStep) violation(`U.return() after underlying ${rec.underlying.finished}`);
-      if (n > 0) violation(`U.return() called more than once`);
-      rec.underlying.returnCalls++;
-      rec.underlying.returnStep = stepNo;
-      const shape = finalizing ? 'sync' : RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
-      if (shape === 'sync') return { value: undefined, done: true };
-      const d = Promise.withResolvers();
-      pendingReturns.push({ id: `Uret#${n}`, kind: 'U', d });
-      return d.promise;
-    },
     [Symbol.asyncIterator]() { return this; },
   };
+  if (underlyingHasReturn) source.return = makeReturn(rec.underlying, 'U', underlyingReturnError);
 
   // --- inner iterators (one per successful mapper call) ----------------------
 
   const createInner = () => {
     const id = rec.inners.length;
-    const inner = { id, pulls: [], returnCalls: 0, finished: null, finishedStep: null, returnStep: null, createdWhileFinished: isFinished() };
+    // No chooser during finalize (it must stay deterministic), so wind-down inners
+    // always have a return.
+    const hasReturn = finalizing ? true : chooser.choose(2) === 0;
+    const inner = { id, pulls: [], returnCalls: 0, finished: null, finishedStep: null, returnStep: null, hasReturn, createdWhileFinished: isFinished() };
     rec.inners.push(inner);
     inner.iterator = {
       next() {
         const idx = inner.pulls.length;
         log(`I${id}.next#${idx}`);
+        checkLazyPull(`I${id}.next#${idx}`);
         if (inner.finishedStep != null && stepNo > inner.finishedStep) violation(`I${id}.next#${idx} after inner ${inner.finished}`);
         if (inner.returnStep != null && stepNo > inner.returnStep) violation(`I${id}.next#${idx} after I${id}.return()`);
         const pull = { idx, status: 'pending' };
@@ -222,21 +264,9 @@ async function runSchedule(maxEvents, chooser) {
         pendingPulls.push({ id: `I${id}#${idx}`, kind: 'I', innerId: id, idx, d });
         return d.promise;
       },
-      return() {
-        const n = inner.returnCalls;
-        log(`I${id}.return#${n}`);
-        if (inner.finishedStep != null && stepNo > inner.finishedStep) violation(`I${id}.return() after inner ${inner.finished}`);
-        if (n > 0) violation(`I${id}.return() called more than once`);
-        inner.returnCalls++;
-        inner.returnStep = stepNo;
-        const shape = finalizing ? 'sync' : RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
-        if (shape === 'sync') return { value: undefined, done: true };
-        const d = Promise.withResolvers();
-        pendingReturns.push({ id: `I${id}ret#${n}`, kind: 'I', innerId: id, d });
-        return d.promise;
-      },
       [Symbol.asyncIterator]() { return this; },
     };
+    if (hasReturn) inner.iterator.return = makeReturn(inner, `I${id}`, innerReturnError(id));
     return inner;
   };
 
@@ -307,9 +337,10 @@ async function runSchedule(maxEvents, chooser) {
     if (outcome === 'iter') { m.outcome = 'iter'; const inner = createInner(); m.innerId = inner.id; d.resolve(inner.iterator); }
     else { m.outcome = 'error'; d.reject(new Error(mapperError(m.id))); }
   };
-  const settleReturn = (entry) => {
+  const settleReturn = (entry, outcome = 'resolve') => {
     pendingReturns.splice(pendingReturns.indexOf(entry), 1);
-    entry.d.resolve({ value: undefined, done: true });
+    if (outcome === 'reject') { rec.returnErrors.add(entry.errTag); entry.d.reject(new Error(entry.errTag)); }
+    else entry.d.resolve({ value: undefined, done: true });
   };
 
   // --- legal action set at the current state --------------------------------
@@ -320,7 +351,7 @@ async function runSchedule(maxEvents, chooser) {
     const legal = [{ t: 'next' }, { t: 'return' }];
     for (const p of pendingPulls) for (const o of PULL_OUTCOMES) legal.push({ t: 'settlePull', entry: p, o });
     if (pendingMapper) for (const o of MAPPER_OUTCOMES) legal.push({ t: 'settleMapper', o });
-    for (const r of pendingReturns) legal.push({ t: 'settleReturn', entry: r });
+    for (const r of pendingReturns) for (const o of RETURN_OUTCOMES) legal.push({ t: 'settleReturn', entry: r, o });
     if (!pendingPulls.length && !pendingMapper && !pendingReturns.length) legal.push({ t: 'stop' });
     return legal;
   };
@@ -330,7 +361,7 @@ async function runSchedule(maxEvents, chooser) {
       case 'return': return 'return()';
       case 'settlePull': return `settle ${a.entry.id}:${a.o}`;
       case 'settleMapper': return `settleMapper:${a.o}`;
-      case 'settleReturn': return `settle ${a.entry.id}`;
+      case 'settleReturn': return `settle ${a.entry.id}:${a.o}`;
       case 'stop': return 'stop';
     }
   };
@@ -340,7 +371,7 @@ async function runSchedule(maxEvents, chooser) {
     else if (a.t === 'return') doReturn();
     else if (a.t === 'settlePull') settlePull(a.entry, a.o);
     else if (a.t === 'settleMapper') settleMapper(a.o);
-    else if (a.t === 'settleReturn') settleReturn(a.entry);
+    else if (a.t === 'settleReturn') settleReturn(a.entry, a.o);
   };
 
   // --- the main schedule ----------------------------------------------------
@@ -422,9 +453,16 @@ function checkInvariants(rec) {
     if (c.settle === null) add(`call ${c.kind}#${c.id} never settled (hang)`);
   }
 
-  // (I8) return() always resolves {done:true}; next() never resolves a non-result.
+  // (I8) return() resolves {done:true}, OR rejects with a real close error (a
+  // .return() that threw/rejected). It never resolves a value, and never rejects
+  // with a fabricated or stream error.
   for (const c of retCalls) {
-    if (c.settle && c.settle.type !== 'done') add(`return#${c.id} settled as ${fmtSettle(c.settle)} (expected {done:true})`);
+    if (!c.settle || c.settle.type === 'done') continue;
+    if (c.settle.type === 'reject') {
+      if (!rec.returnErrors.has(c.settle.error)) add(`return#${c.id} rejected with ${c.settle.error}, which no .return() produced`);
+    } else {
+      add(`return#${c.id} settled as ${fmtSettle(c.settle)} (expected {done:true} or a close rejection)`);
+    }
   }
 
   // (I4) every surfaced rejection carries an error that was actually produced.
@@ -438,33 +476,58 @@ function checkInvariants(rec) {
     }
   }
 
-  // (I5) {done:true} is terminal in CALL order: once a call resolves done, no
-  // later call (by call id) may resolve with a value or an error. A done may
-  // settle earlier in TIME than an in-flight value (e.g. a return() whose done
-  // lands before an already-requested value), but only when the done is later in
-  // call order. Equivalently: dones form a suffix of the call sequence.
+  // (I5) {done:true} is terminal in CALL order for the STREAM: once a next() call
+  // resolves done, no later next() (by call id) may resolve with a value or error.
+  // A done may settle earlier in TIME than an in-flight value (e.g. a value
+  // requested before a done that lands after it), but only when the done is later
+  // in call order. Equivalently: among next() calls, dones form a suffix.
+  // (return() outcomes are excluded -- they are close results, not stream items,
+  // and are validated separately by I8.)
   let sawDone = false;
-  for (const c of rec.calls) {
+  for (const c of nextCalls) {
     if (!c.settle) continue;
     if (c.settle.type === 'done') sawDone = true;
-    else if (sawDone) add(`call ${c.kind}#${c.id} delivered ${fmtSettle(c.settle)} after an earlier-in-call-order {done:true}`);
+    else if (sawDone) add(`next#${c.id} delivered ${fmtSettle(c.settle)} after an earlier-in-call-order {done:true}`);
   }
 
-  // (I1/I3) values delivered, in call order, are strictly increasing in
-  // (innerIterCreationOrder, pullIndex) and were genuinely produced.
+  // (I1/I3) The inner ITEMS delivered (a pull's value, or that pull's own error --
+  // an already-issued inner pull surfaces its own result either way) must, in call
+  // order, be strictly increasing in (innerIterCreationOrder, pullIndex), and each
+  // value must be one genuinely produced. Underlying/mapper errors are terminal
+  // stream errors with no inner coordinate; they are covered by I4/I5, not here.
   const produced = producedValues(rec);
+  const deliveredByIter = new Map(); // k -> [j, ...] in delivery order
   let prevK = -1, prevJ = -1;
   for (const c of nextCalls) {
-    if (!c.settle || c.settle.type !== 'value') continue;
-    const v = c.settle.value;
-    if (!produced.has(v)) { add(`next#${c.id} delivered ${v}, which no inner pull produced`); continue; }
-    const m = /^(\d+):(\d+)$/.exec(v);
-    if (!m) { add(`next#${c.id} delivered a non-inner value ${v}`); continue; }
-    const k = Number(m[1]), j = Number(m[2]);
+    if (!c.settle) continue;
+    let k, j;
+    if (c.settle.type === 'value') {
+      const v = c.settle.value;
+      const m = /^(\d+):(\d+)$/.exec(v);
+      if (!m) { add(`next#${c.id} delivered a non-inner value ${v}`); continue; }
+      if (!produced.has(v)) { add(`next#${c.id} delivered ${v}, which no inner pull produced`); continue; }
+      k = Number(m[1]); j = Number(m[2]);
+    } else if (c.settle.type === 'reject') {
+      const m = /^Ei(\d+)\.(\d+)$/.exec(c.settle.error);
+      if (!m) continue; // underlying/mapper error: not an inner item
+      k = Number(m[1]); j = Number(m[2]);
+    } else continue; // done
     if (k < prevK || (k === prevK && j <= prevJ)) {
-      add(`out-of-order/duplicate delivery: next#${c.id} got ${v} after (${prevK}:${prevJ})`);
+      add(`out-of-order/duplicate inner delivery: next#${c.id} got (${k}:${j}) after (${prevK}:${prevJ})`);
     }
     prevK = k; prevJ = j;
+    if (!deliveredByIter.has(k)) deliveredByIter.set(k, []);
+    deliveredByIter.get(k).push(j);
+  }
+
+  // (I1, contiguity) Within one inner iterator, delivered item indices must be a
+  // gap-free prefix 0,1,2,...: an inner's pulls are delivered in order and none is
+  // skipped. (Strict increase alone would miss a dropped middle item like
+  // delivering 0:0 then 0:2.)
+  for (const [k, js] of deliveredByIter) {
+    for (let t = 0; t < js.length; t++) {
+      if (js[t] !== t) { add(`inner I${k} delivered non-contiguous item indices [${js.join(',')}] (expected 0..${js.length - 1})`); break; }
+    }
   }
 
   // (I7) cleanup / "closed iff": an iterator that flatMap was actively consuming
@@ -478,8 +541,9 @@ function checkInvariants(rec) {
   if (rec.finishedNaturally) {
     // The underlying must be closed once the helper terminates unless it finished
     // on its own -- including a return() before the first pull (map/filter close
-    // it unconditionally), so this is NOT exempted for the never-pulled case.
-    if (!rec.underlying.naturalFinished && rec.underlying.returnCalls === 0) {
+    // it unconditionally), so this is NOT exempted for the never-pulled case. An
+    // iterator without a .return() method has nothing to close, so it can't leak.
+    if (!rec.underlying.naturalFinished && rec.underlying.returnCalls === 0 && rec.underlying.hasReturn) {
       add(`underlying was left open at termination (not finished, not .return()'d): leak`);
     }
     for (const inner of rec.inners) {
@@ -491,7 +555,7 @@ function checkInvariants(rec) {
         if (!inner.createdWhileFinished) add(`inner I${inner.id} was created but never pulled`);
         continue;
       }
-      if (!inner.naturalFinished && inner.returnCalls === 0) {
+      if (!inner.naturalFinished && inner.returnCalls === 0 && inner.hasReturn) {
         add(`inner I${inner.id} was left open at termination (pulled, not finished, not .return()'d): leak`);
       }
     }

@@ -525,6 +525,50 @@ tests.push(['map: predicate error does not close the source after an underlying 
   t.expectLog('predicate error rejects r1 with no close', ['r1 rejected predicate']);
 }]);
 
+// A mapper error closes the source via it.return(); while that close is still
+// PENDING, the error's own call is withheld (the rejection waits for the close to
+// settle) — but a later concurrent call is on an independent chain and delivers
+// its value immediately, without waiting for the held close. (filter pins the
+// same property with its "held error" tests; this is the map analogue.)
+tests.push(['map: a held error close withholds its call but does not block a later one', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const fn = controlledFn(t.log, 'fn');
+  const mapped = map(src.iterator, fn.fn);
+
+  const r0 = mapped.next();
+  const r1 = mapped.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two concurrent pulls', ['src.next() #0', 'src.next() #1']);
+
+  src.yield(0, 1);
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('both mappers in flight', ['fn(1) #0', 'fn(2) #1']);
+
+  // r0's mapper errors; the source close is held pending. r0 is withheld and
+  // nothing settles yet.
+  src.holdReturn();
+  fn.reject(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the error closes the source but the close is pending; nothing settles', [
+    'src.return() #0',
+  ]);
+
+  // r1 resolves on its own independent chain while the close is still pending.
+  fn.resolve(1, 'B');
+  await flushMicrotasks();
+  t.expectLog('the later call delivers its value without waiting for the held close', [
+    'r1 resolved {"value":"B","done":false}',
+  ]);
+
+  // Only once it.return() settles does the errored call reject.
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('the errored call rejects once the close settles', ['r0 rejected boom']);
+}]);
+
 // --- terminal values are ignored -----------------------------------------
 //
 // Policy: map ignores values attached to terminal results. A `done` from the

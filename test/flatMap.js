@@ -2525,6 +2525,56 @@ tests.push(['flatMap: an inner error swallows an async underlying-close rejectio
   ]);
 }]);
 
+// A head inner-iterator error closes the underlying via it.return(); while that
+// close is still PENDING, a value already buffered behind the error (from a later
+// pull of the same iterator) is delivered immediately to its call — the committed
+// head error's recipient is fixed, so following values needn't wait for the close.
+// Only the errored call waits for it.return() to settle. (The flatMap analogue of
+// filter's "head predicate-error close delivers the value behind it immediately".)
+tests.push(['flatMap: a held inner-error close delivers a value buffered behind it without waiting', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked once', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across the active iterator', ['A.next() #0', 'A.next() #1']);
+
+  // The later pull (#1) yields first: a1 is buffered behind the still-pending head
+  // pull (#0).
+  A.yield(1, 'a1');
+  await flushMicrotasks();
+  t.expectLog('the later value is buffered behind the pending head', []);
+
+  // The head pull (#0) errors with the underlying close held pending. The error is
+  // committed to r0 (withheld), and the buffered a1 is delivered to r1 immediately
+  // — without waiting for it.return() to settle.
+  src.holdReturn();
+  A.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the close is pending; the buffered value delivers while the error waits', [
+    'src.return() #0',
+    'r1 resolved {"value":"a1","done":false}',
+  ]);
+
+  // Only once it.return() settles does the errored call reject.
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('the errored call rejects once the close settles', ['r0 rejected boom']);
+}]);
+
 // --- return() while blocked on a pending mapper -----------------------------
 //
 // SUSPECTED BUG (see flatMap.ts:498 TODO "if we're actually blocked on the mapper

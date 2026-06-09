@@ -6,7 +6,7 @@ class FilterHelper {
   #it;
   #pred;
 
-  // TODO rename to InFlight
+  // TODO rename to InFlight or slots or something
   // Positions is an ordered queue of results or placeholders for results,
   // held in a Set: insertion order is pull order, so the head is the
   // first-inserted entry (`#head()`). Membership means "still live": a position

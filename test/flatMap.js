@@ -797,12 +797,37 @@ tests.push(['flatMap: return() before starting closes the underlying without pul
   t.expectLog('a next() after return() is done', ['r0 resolved {"done":true}']);
 }]);
 
-// return() while still reading the underlying (a pull is in flight, no inner
-// iterator yet) closes the underlying and resolves done. The in-flight pull is NOT
-// abandoned: when it resolves, its value is mapped to an inner iterator, which is
-// pulled once for the single outstanding call, that value is delivered, and the
-// inner iterator is then closed.
-tests.push(['flatMap: return() while reading the underlying still delivers the in-flight pull', async function (t) {
+// --- return() while reading the underlying (the "less-eager pull" model) -----
+//
+// When return() lands while a pull from the underlying is in flight (no inner
+// iterator yet), we are committed to closing, so we will NOT pull the iterator that
+// pull is about to produce. We close the UNDERLYING eagerly (right at return(),
+// while the pull is still in flight), but we still wait for the pull and the mapper,
+// because they might throw/reject — a stream error that must reach a consumer call.
+//
+//   * The `requested` units of demand bound to that pull can never receive a value
+//     (we won't pull), so the trailing `requested - 1` "surplus" calls are doned
+//     {done:true} EAGERLY at return(). The head-most bound call is HELD: it is the
+//     position a pull/mapper rejection would be delivered to (queued behind any
+//     parked values, like a normal underlying error).
+//   * When the in-flight pull/mapper settle:
+//       - pull rejects   -> the rejection (the stream's error) goes to the held call.
+//       - mapper rejects -> the mapper error goes to the held call (withheld until
+//                           the eager underlying close settles).
+//       - value+iterable -> invoke the iterable and call .return() on it RIGHT AWAY
+//                           (no .next()); the held call dones.
+//   * result.return() waits for BOTH the eager underlying .return() AND (if an inner
+//     iterator gets produced) the inner .return(), which can be outstanding
+//     CONCURRENTLY. (This is intentionally different from the active-iterator return
+//     path, which closes inner-then-underlying sequentially.) It resolves done once
+//     both settle, or rejects with a CLOSE error (inner taking precedence over the
+//     underlying). The stream error from a pull/mapper rejection goes to the held
+//     call, never to return()'s promise.
+
+// The base success case: a single outstanding call. The underlying is closed eagerly
+// at return(); the produced iterator is closed without being pulled; the held call
+// dones; and return() waits for BOTH closes.
+tests.push(['flatMap: return() while reading the underlying closes the produced iterator without pulling it', async function (t) {
   const src = controlledSource(t.log, 'src');
   const m = controlledFn(t.log, 'm');
   const fm = flatMap(src.iterator, m.fn);
@@ -812,36 +837,198 @@ tests.push(['flatMap: return() while reading the underlying still delivers the i
   await flushMicrotasks();
   t.expectLog('a pull is in flight', ['src.next() #0']);
 
+  // return() while reading underlying. The underlying is closed EAGERLY (the pull is
+  // still in flight); r0 is held in case the pull/mapper rejects.
+  src.holdReturn();
   const ret = fm.return();
   t.check('return() returns a promise', ret instanceof Promise, true);
-  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  track(t.log, 'ret', ret);
   await flushMicrotasks();
-  // return() closes the underlying and resolves done immediately; the in-flight
-  // call stays outstanding (it is NOT eagerly doned).
-  t.expectLog('return() closes the underlying and resolves done; the call stays outstanding', [
-    'src.return() #0',
-    'ret resolved {"done":true}',
-  ]);
+  t.expectLog('the underlying is closed eagerly; the call is held', ['src.return() #0']);
 
-  // The in-flight pull now resolves and is mapped.
+  // The pull resolves with a value; the mapper is invoked.
   src.yield(0, 1);
   await flushMicrotasks();
   t.expectLog('the in-flight underlying value is mapped', ['m(1) #0']);
 
-  // The mapper resolves to an inner iterator: it is pulled once for the one
-  // outstanding call, then closed.
+  // The mapper resolves to an iterable: invoke it and call .return() RIGHT AWAY (no
+  // .next()). The held call can never get a value now, so it dones.
   const A = controlledSource(t.log, 'A');
+  A.holdReturn();
   m.resolve(0, A.iterator);
   await flushMicrotasks();
-  t.expectLog('the produced iterator is pulled once for the outstanding call, then closed', [
-    'A.next() #0',
+  t.expectLog('the produced iterator is closed without being pulled; the held call dones', [
     'A.return() #0',
+    'r0 resolved {"done":true}',
   ]);
 
-  A.yield(0, 'a0');
+  // return() waits for BOTH closes (concurrently). Settling just the inner is not
+  // enough...
+  A.settleReturn(0);
   await flushMicrotasks();
-  t.expectLog('the in-flight value is delivered to the outstanding call', [
-    'r0 resolved {"value":"a0","done":false}',
+  t.expectLog('settling only the inner close does not resolve return()', []);
+
+  // ...return() resolves once the underlying close also settles.
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('once both closes settle, return() resolves', ['ret resolved {"done":true}']);
+}]);
+
+// With more than one bound call, the trailing surplus is doned EAGERLY at return()
+// time (it can never get a value), while the head-most bound call is held.
+tests.push(['flatMap: return() while reading the underlying dones the surplus eagerly and holds the head call', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  const r1 = fm.next();
+  track(t.log, 'r0', r0);
+  track(t.log, 'r1', r1);
+  await flushMicrotasks();
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  // Demand 2; we won't pull, so the trailing call (r1) can never get a value -> done
+  // it eagerly. The head call (r0) is held; the underlying is closed eagerly.
+  src.holdReturn();
+  const ret = fm.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  // (src.return() is a synchronous call; the surplus done is observed a microtask
+  // later, so the close logs first.)
+  t.expectLog('the surplus dones eagerly; the head is held; the underlying closes eagerly', [
+    'src.return() #0',
+    'r1 resolved {"done":true}',
+  ]);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the in-flight underlying value is mapped', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  A.holdReturn();
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('the produced iterator is closed without being pulled; the held call dones', [
+    'A.return() #0',
+    'r0 resolved {"done":true}',
+  ]);
+
+  A.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('return() still waits for the underlying close', []);
+
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('once both closes settle, return() resolves', ['ret resolved {"done":true}']);
+}]);
+
+// The in-flight pull REJECTS after return(). The rejection is the stream's and goes
+// to the held call. No inner is produced, so return() waits only for the eager
+// underlying close.
+tests.push(['flatMap: return() while reading the underlying surfaces an underlying-pull rejection to the held call', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('a pull is in flight', ['src.next() #0']);
+
+  src.holdReturn();
+  const ret = fm.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('the underlying is closed eagerly; the call is held', ['src.return() #0']);
+
+  src.throw(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the pull error reaches the held call; return() still awaits the close', [
+    'r0 rejected boom',
+  ]);
+
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('once the underlying close settles, return() resolves done', ['ret resolved {"done":true}']);
+}]);
+
+// The MAPPER rejects after return(). The underlying is already closing (eagerly), so
+// we don't close it again; the mapper error is the stream's, withheld until that
+// close settles, then delivered to the held call. No inner is produced.
+tests.push(['flatMap: return() while reading the underlying, then the mapper rejects, surfaces the error to the held call', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('a pull is in flight', ['src.next() #0']);
+
+  src.holdReturn();
+  const ret = fm.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('the underlying is closed eagerly; the call is held', ['src.return() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the in-flight underlying value is mapped', ['m(1) #0']);
+
+  m.reject(0, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the mapper error is withheld until the eager close settles', []);
+
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('once the close settles, the error reaches the held call and return() resolves', [
+    'r0 rejected boom',
+    'ret resolved {"done":true}',
+  ]);
+}]);
+
+// CLOSE error on the success path: the produced iterator's .return() rejects. return()
+// waits for both closes; once both settle it rejects with the inner-close error
+// (inner taking precedence over the underlying).
+tests.push(['flatMap: return() while reading the underlying rejects with the inner-close error when the produced .return() rejects', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
+  await flushMicrotasks();
+  t.expectLog('a pull is in flight', ['src.next() #0']);
+
+  src.holdReturn();
+  const ret = fm.return();
+  track(t.log, 'ret', ret);
+  await flushMicrotasks();
+  t.expectLog('the underlying is closed eagerly; the call is held', ['src.return() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the in-flight underlying value is mapped', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  A.holdReturn();
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('the produced iterator is closed without being pulled; the held call dones', [
+    'A.return() #0',
+    'r0 resolved {"done":true}',
+  ]);
+
+  // The inner .return() rejects, but return() still awaits the underlying close.
+  A.settleReturnThrow(0, new Error('inner-close'));
+  await flushMicrotasks();
+  t.expectLog('the inner close rejected; return() still awaits the underlying close', []);
+
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('once both closes settle, return() rejects with the inner-close error', [
+    'ret rejected inner-close',
   ]);
 }]);
 
@@ -2411,17 +2598,16 @@ tests.push(['flatMap: return() rejects with the underlying-close error when the 
   ]);
 }]);
 
-// return() while reading the underlying, where the underlying .return() rejects
-// ASYNCHRONOUSLY: return() rejects only once that close settles.
-tests.push(['flatMap: return() while reading underlying rejects when the underlying close rejects', async function (t) {
+// CLOSE error on the success path, on the UNDERLYING this time: the inner .return()
+// succeeds but the eager underlying .return() rejects ASYNCHRONOUSLY. return() waits
+// for both closes, then rejects with the underlying-close error.
+tests.push(['flatMap: return() while reading underlying rejects with the underlying-close error when the underlying .return() rejects', async function (t) {
   const src = controlledSource(t.log, 'src');
   const m = controlledFn(t.log, 'm');
   const fm = flatMap(src.iterator, m.fn);
 
-  // The in-flight call stays outstanding (it is not eagerly doned); we never
-  // settle this pull, so it simply remains pending. This test is about the close
-  // rejection, so the call is left untracked.
-  fm.next();
+  const r0 = fm.next();
+  track(t.log, 'r0', r0);
   await flushMicrotasks();
   t.expectLog('a pull is in flight', ['src.next() #0']);
 
@@ -2429,12 +2615,32 @@ tests.push(['flatMap: return() while reading underlying rejects when the underly
   const ret = fm.return();
   track(t.log, 'ret', ret);
   await flushMicrotasks();
-  // The underlying close is issued but pending, so return() is withheld.
-  t.expectLog('the underlying is closed but the rejection is withheld', ['src.return() #0']);
+  t.expectLog('the underlying is closed eagerly; the call is held', ['src.return() #0']);
 
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the in-flight underlying value is mapped', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  A.holdReturn();
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('the produced iterator is closed without being pulled; the held call dones', [
+    'A.return() #0',
+    'r0 resolved {"done":true}',
+  ]);
+
+  // The inner close settles cleanly; return() still awaits the underlying close.
+  A.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('the inner closed cleanly; return() still awaits the underlying close', []);
+
+  // The underlying .return() rejects: return() rejects with the underlying-close error.
   src.settleReturnThrow(0, new Error('underlying-close'));
   await flushMicrotasks();
-  t.expectLog('once the close rejects, return() rejects with it', ['ret rejected underlying-close']);
+  t.expectLog('once the underlying close rejects, return() rejects with it', [
+    'ret rejected underlying-close',
+  ]);
 }]);
 
 // Iterators with NO .return() method at all are tolerated: return() closes
@@ -2598,13 +2804,12 @@ tests.push(['flatMap: a held inner-error close delivers a value buffered behind 
 
 // --- return() while blocked on a pending mapper -----------------------------
 //
-// When return() lands while the helper is "reading underlying" but has ALREADY
-// pulled a value and invoked the mapper (so the mapper promise is pending), the
-// underlying is closed and return() resolves done. The outstanding call is NOT
-// abandoned: once the mapper resolves to an inner iterator, that iterator is
-// pulled as many times as were outstanding (here once), the value is delivered,
-// and the iterator is then closed (not leaked).
-tests.push(['flatMap: return() while blocked on the mapper still serves the outstanding call from the produced iterator', async function (t) {
+// Structurally distinct from the tests above: return() lands AFTER the source has
+// yielded and the mapper was invoked (so the mapper promise is pending), rather
+// than while the underlying pull is in flight. The underlying still closes eagerly
+// at return(); when the mapper resolves to an iterable we close it WITHOUT pulling,
+// done the held call, and return() waits for both closes.
+tests.push(['flatMap: return() while blocked on the mapper closes the produced iterator without pulling it', async function (t) {
   const src = controlledSource(t.log, 'src');
   const m = controlledFn(t.log, 'm');
   const fm = flatMap(src.iterator, m.fn);
@@ -2618,150 +2823,166 @@ tests.push(['flatMap: return() while blocked on the mapper still serves the outs
   await flushMicrotasks();
   t.expectLog('the mapper is invoked, now pending', ['m(1) #0']);
 
-  // return() lands while the mapper is still pending. The underlying is closed and
-  // return() resolves done; the call stays outstanding.
+  // return() lands while the mapper is still pending. The underlying closes eagerly;
+  // r0 is held.
+  src.holdReturn();
   const ret = fm.return();
-  if (ret instanceof Promise) track(t.log, 'ret', ret);
+  track(t.log, 'ret', ret);
   await flushMicrotasks();
-  t.expectLog('return() closes the underlying and resolves done; the call stays outstanding', [
-    'src.return() #0',
-    'ret resolved {"done":true}',
-  ]);
+  t.expectLog('the underlying is closed eagerly; the call is held', ['src.return() #0']);
 
-  // The mapper now resolves with an inner iterator. It is pulled once for the one
-  // outstanding call, then closed.
   const A = controlledSource(t.log, 'A');
+  A.holdReturn();
   m.resolve(0, A.iterator);
   await flushMicrotasks();
-  t.expectLog('the produced iterator is pulled once for the outstanding call, then closed', [
-    'A.next() #0',
+  t.expectLog('the produced iterator is closed without being pulled; the held call dones', [
     'A.return() #0',
+    'r0 resolved {"done":true}',
   ]);
 
-  A.yield(0, 'a0');
+  A.settleReturn(0);
   await flushMicrotasks();
-  t.expectLog('the value reaches the outstanding call', [
-    'r0 resolved {"value":"a0","done":false}',
-  ]);
+  t.expectLog('return() still waits for the underlying close', []);
+
+  src.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('once both closes settle, return() resolves', ['ret resolved {"done":true}']);
 }]);
 
-// A richer cousin of the test above, drawn from an animation of the "return()
-// while reading the underlying" path. The distinctive ingredients:
-//
-//   * An inner iterator (A) has reported done two values short, so it is PARKED
-//     with an earlier pull (A#0) still in flight feeding p1, while the freed
-//     demand (2, for p2/p3) has been redirected to a fresh underlying pull that is
-//     now in flight.
-//   * return() lands in exactly that window: A is already finished (so it is NOT
-//     closed), the underlying IS closed, and return() resolves done off the
-//     underlying close without waiting for the still-outstanding calls.
-//   * The already-in-flight underlying pull THEN yields another value ('B'). Even
-//     after return(), flatMap maps it, pulls the resulting inner iterator (B) as
-//     many times as the redirected demand asked (TWICE, for p2 and p3), and then
-//     closes B (the helper has finished) — with B's already-issued pulls' values
-//     still delivered to p2/p3, exactly as in-flight inner values survive return().
-//
-// What distinguishes this from the test above is structural, not the mapper:
-// return() lands while the *underlying pull* is in flight and before the next
-// source value has been yielded, so the mapper has not been (re-)invoked. (Above,
-// return() lands after the source has yielded and the mapper promise is pending.)
-// The mapper here is synchronous just to mirror the scenario and keep the 'B' step
-// to a single flush; it is not load-bearing.
-tests.push(['flatMap: return() while reading underlying still maps the in-flight source value and serves the redirected demand', async function (t) {
+// return() while reading underlying with a PARKED iterator ahead. An inner iterator
+// (A) reported done one short and is parked feeding p1 with an in-flight pull; the
+// freed demand redirected to a fresh underlying pull that is now in flight. On
+// return(): the bound demand's surplus (p3) dones eagerly, the head-most bound call
+// (p2) is held, p1 keeps its parked pull, and the underlying closes eagerly. When the
+// in-flight pull yields, its iterator (B) is closed WITHOUT pulling and p2 dones; the
+// parked value still reaches p1.
+tests.push(['flatMap: return() while reading underlying with a parked iterator delivers the parked value and dones the rest', async function (t) {
   const src = controlledSource(t.log, 'src');
-  const A = controlledSource(t.log, 'A');
-  const B = controlledSource(t.log, 'B');
-  // A plain, synchronous recording mapper: 'A' -> innerA, 'B' -> innerB. Each
-  // result is an async ITERABLE whose [Symbol.asyncIterator]() yields the
-  // recording iterator (flatMap does GetIterator(..., async) on it).
-  const inners = { A: A.iterator, B: B.iterator };
-  const fn = (value) => {
-    t.log(`f(${value})`);
-    return { [Symbol.asyncIterator]: () => inners[value] };
-  };
-  const fm = flatMap(src.iterator, fn);
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
 
-  // 1: first next() pulls the underlying once.
   const p1 = fm.next();
-  track(t.log, 'p1', p1);
-  await flushMicrotasks();
-  t.expectLog('first next() pulls the underlying once', ['src.next() #0']);
-
-  // 2: two more concurrent next()s only raise demand to 3 — no further pull.
   const p2 = fm.next();
   const p3 = fm.next();
+  track(t.log, 'p1', p1);
   track(t.log, 'p2', p2);
   track(t.log, 'p3', p3);
   await flushMicrotasks();
-  t.expectLog('further concurrent next()s do not pull the underlying again', []);
+  t.expectLog('three coalesced calls, one underlying pull', ['src.next() #0']);
 
-  // 3: the underlying yields 'A'; the (synchronous) mapper produces innerA, which
-  // the coalesced demand (3) fans out across.
-  src.yield(0, 'A');
+  src.yield(0, 1);
   await flushMicrotasks();
-  t.expectLog('the underlying value is mapped and the inner iterator is pulled three times', [
-    'f(A)',
-    'A.next() #0',
-    'A.next() #1',
-    'A.next() #2',
-  ]);
+  t.expectLog('the mapper is invoked', ['m(1) #0']);
 
-  // 4: innerA's MIDDLE pull (#1) reports done before #0. innerA is exhausted (not
-  // forwarded as a consumer done); A#0 stays parked feeding p1, and the freed
-  // demand (2, for p2/p3) redirects to a fresh underlying pull.
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 3 fans out across A', ['A.next() #0', 'A.next() #1', 'A.next() #2']);
+
+  // A reports done at its MIDDLE pull (#1) with #0 still in flight: A parks keeping
+  // A#0 (feeding p1); the freed demand (2, for p2/p3) reads the underlying again.
   A.finish(1);
   await flushMicrotasks();
-  t.expectLog('inner done redirects the freed demand (2) to a fresh underlying pull', ['src.next() #1']);
+  t.expectLog('A parks; the freed demand reads the underlying again', ['src.next() #1']);
 
-  // 5: return() lands while reading the underlying. The underlying is closed (held
-  // so we can observe the ordering); innerA is NOT closed (already finished). The
-  // outstanding p1/p2/p3 are NOT doned.
+  // return() while reading underlying. Bound demand is 2 (p2, p3): the trailing one
+  // (p3) dones eagerly; p2 (head-most bound) is held; p1 keeps its parked pull; the
+  // underlying closes eagerly.
   src.holdReturn();
   const pr = fm.return();
   track(t.log, 'pr', pr);
   await flushMicrotasks();
-  t.expectLog('return() closes the underlying (not the already-finished inner) and leaves the calls outstanding', [
+  // (src.return() is synchronous; the surplus done is observed a microtask later.)
+  t.expectLog('the surplus dones eagerly; the underlying closes eagerly', [
     'src.return() #0',
+    'p3 resolved {"done":true}',
   ]);
 
-  // 6: the underlying close settles; return() resolves done WITHOUT waiting for the
-  // still-outstanding calls.
+  // The in-flight pull yields a value; the mapper is invoked again.
+  src.yield(1, 2);
+  await flushMicrotasks();
+  t.expectLog('the in-flight underlying value is mapped', ['m(2) #1']);
+
+  // The mapper resolves to iterator B: close it WITHOUT pulling; the held bound call
+  // (p2) dones. p1 is still owed its parked value.
+  const B = controlledSource(t.log, 'B');
+  B.holdReturn();
+  m.resolve(1, B.iterator);
+  await flushMicrotasks();
+  t.expectLog('the produced iterator is closed without being pulled; the held call dones', [
+    'B.return() #0',
+    'p2 resolved {"done":true}',
+  ]);
+
+  B.settleReturn(0);
+  await flushMicrotasks();
+  t.expectLog('return() still waits for the underlying close', []);
+
   src.settleReturn(0);
   await flushMicrotasks();
-  t.expectLog('return() resolves done off the underlying close', ['pr resolved {"done":true}']);
+  t.expectLog('once both closes settle, return() resolves', ['pr resolved {"done":true}']);
 
-  // 7: innerA's parked pull #0 finally yields; p1 receives it even though return()
-  // has already resolved.
+  // p1's parked pull finally yields: it still gets its value.
   A.yield(0, 'a1');
   await flushMicrotasks();
-  t.expectLog('the parked inner value still reaches the first call', [
+  t.expectLog('the parked value still reaches the first call', [
     'p1 resolved {"value":"a1","done":false}',
   ]);
+}]);
 
-  // 8: the still-in-flight underlying pull yields 'B'. Even after return(), flatMap
-  // maps it, pulls innerB TWICE for the remaining already-requested demand (p2/p3),
-  // and then closes innerB (the helper is finished).
-  src.yield(1, 'B');
+// Same parked setup, but the in-flight pull REJECTS. The error is queued behind p1's
+// still-pending parked value and reaches the held call (p2) only after p1 is
+// delivered. return() waits for the eager underlying close.
+tests.push(['flatMap: return() while reading underlying surfaces a pull rejection behind a parked value', async function (t) {
+  const src = controlledSource(t.log, 'src');
+  const m = controlledFn(t.log, 'm');
+  const fm = flatMap(src.iterator, m.fn);
+
+  const p1 = fm.next();
+  const p2 = fm.next();
+  track(t.log, 'p1', p1);
+  track(t.log, 'p2', p2);
   await flushMicrotasks();
-  t.expectLog('the in-flight underlying value is mapped, pulled twice, then closed', [
-    'f(B)',
-    'B.next() #0',
-    'B.next() #1',
-    'B.return() #0',
+  t.expectLog('two coalesced calls, one underlying pull', ['src.next() #0']);
+
+  src.yield(0, 1);
+  await flushMicrotasks();
+  t.expectLog('the mapper is invoked', ['m(1) #0']);
+
+  const A = controlledSource(t.log, 'A');
+  m.resolve(0, A.iterator);
+  await flushMicrotasks();
+  t.expectLog('demand 2 fans out across A', ['A.next() #0', 'A.next() #1']);
+
+  A.finish(1);
+  await flushMicrotasks();
+  t.expectLog('A parks; the freed demand reads the underlying again', ['src.next() #1']);
+
+  // Bound demand is 1 (p2): nothing to done eagerly (p2 is held); p1 keeps its parked
+  // pull; the underlying closes eagerly.
+  src.holdReturn();
+  const pr = fm.return();
+  track(t.log, 'pr', pr);
+  await flushMicrotasks();
+  t.expectLog('the underlying closes eagerly; the calls are held', ['src.return() #0']);
+
+  // The in-flight pull rejects: the error is queued behind p1's still-pending parked
+  // value. No inner is produced, so return() waits only for the eager underlying close.
+  src.throw(1, new Error('boom'));
+  await flushMicrotasks();
+  t.expectLog('the pull error is queued behind the parked value', []);
+
+  // p1's parked pull yields: p1 gets its value, then the error surfaces to p2.
+  A.yield(0, 'a1');
+  await flushMicrotasks();
+  t.expectLog('the parked value is delivered, then the error reaches the held call', [
+    'p1 resolved {"value":"a1","done":false}',
+    'p2 rejected boom',
   ]);
 
-  // 9: innerB's already-issued pulls settle; their values reach p2 and p3 in order.
-  B.yield(0, 'b1');
+  src.settleReturn(0);
   await flushMicrotasks();
-  t.expectLog('the second call is satisfied by the new inner iterator', [
-    'p2 resolved {"value":"b1","done":false}',
-  ]);
-
-  B.yield(1, 'b2');
-  await flushMicrotasks();
-  t.expectLog('the third call is satisfied by the new inner iterator', [
-    'p3 resolved {"value":"b2","done":false}',
-  ]);
+  t.expectLog('once the underlying close settles, return() resolves done', ['pr resolved {"done":true}']);
 }]);
 
 runTests(tests, xfailed);

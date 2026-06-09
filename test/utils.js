@@ -46,7 +46,12 @@ export async function runTests(tests, xfails = []) {
   let totalFailures = 0;
   for (const [name, fn] of tests) {
     const t = makeTestContext(name);
-    await fn(t);
+    try {
+      await fn(t);
+    } catch (e) {
+      // A throw is a failure too — and shouldn't abort the rest of the suite.
+      t._fail('the test threw', [String((e && e.stack) || e)]);
+    }
     totalFailures += t.failures;
   }
   let xfailed = 0;

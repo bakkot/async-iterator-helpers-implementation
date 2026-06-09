@@ -25,7 +25,9 @@ type Slot =
   | ErrorState
   | { type: 'removed' }
 
-type InFlight = { type: 'iter', iter: unknown, readonly values: Slot[] }
+// `finishedOnOwn` records that this iterator reported done/error from one of its
+// own pulls — so we must never call .return() on it (it's already exhausted).
+type InFlight = { type: 'iter', iter: unknown, readonly values: Slot[], finishedOnOwn?: boolean }
 
 // For errors from the mapper or from result iterators, we invoke .return() on
 // whatever is still open (the underlying, and possibly an active inner iterator).
@@ -36,9 +38,19 @@ type ErrorState =
 
 type ReadingUnderlyingState = { type: 'reading underlying', requested: number /* integer > 0 */ };
 
+// return() landed while we were reading the underlying for the next inner iterator.
+// We've closed the underlying and resolved return() done, but the `requested` units
+// of demand bound to the still-in-flight underlying pull are NOT abandoned: when
+// that pull resolves we still map it, pull the resulting iterator `requested` times,
+// deliver those values to the outstanding calls, then close the iterator. Behaves
+// like 'reading underlying' for demand bookkeeping, but never pulls the underlying
+// again (it's already closed).
+type DrainingState = { type: 'draining', requested: number /* integer > 0 */ };
+
 type ActiveState =
   | { type: 'unstarted' }
   | ReadingUnderlyingState
+  | DrainingState
   | ErrorState // specifically this means an error when reading from underlying or invoking the mapper
   | InFlight
   | { type: 'finished' } // but still might be outstanding earlier calls, to be settled by closedButStillHaveValuesInFlight
@@ -131,6 +143,7 @@ class FlatMapHelper {
         ASSERT(slot.type === 'awaiting', 'slot awaiting');
 
         if ((iterResult as { done: boolean }).done) {
+          inFlight.finishedOnOwn = true; // exhausted itself — never .return() it
           // Find the current index: earlier slots of this iterator may have been
           // delivered (and shifted off) since this pull was issued, so an index
           // captured at issue time would be stale.
@@ -165,7 +178,11 @@ class FlatMapHelper {
                 this.#issuePullFromCurrentActive();
               }
             }
-          } else if (this.#active.type === 'reading underlying') {
+          } else if (this.#active.type === 'reading underlying' || this.#active.type === 'draining') {
+            // The freed demand is absorbed by the iterator the in-flight underlying
+            // pull will produce. (While draining we won't pull the underlying again,
+            // but we still pull that produced iterator `requested` times before
+            // closing it, so the freed demand rolls onto it just the same.)
             this.#active.requested += removedCount;
           } else {
             ASSERT(this.#active.type === 'error' || this.#active.type === 'finished', 'active is error or finished');
@@ -193,6 +210,7 @@ class FlatMapHelper {
 
         if (slot.type === 'removed') return;
         ASSERT(slot.type === 'awaiting', 'slot awaiting');
+        inFlight.finishedOnOwn = true; // exhausted itself (by erroring) — never .return() it
         slot.type = 'error';
         const slotButWithTypeScript = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
         slotButWithTypeScript.error = error;
@@ -257,6 +275,21 @@ class FlatMapHelper {
           return;
           // TODO do exceptions from the fn call at this point go into unhandled promise rejection
         }
+        if (this.#active.type === 'draining') {
+          // Same as the reading-underlying case, but after return(): a parked
+          // iterator errored while we were draining the in-flight underlying pull.
+          // The underlying is already closing, so we don't close it again; the bound
+          // demand can never be filled now the stream is truncated here, so done it
+          // (and the in-flight pull's result is discarded once we're finished). The
+          // error itself still reaches the call at this slot's position.
+          this.#markSomeCallsAsNoLongerGettingValues(this.#active.requested);
+          this.#active = { type: 'finished' };
+          (slot as ErrorState).closeState = 'ready';
+          if (this.#isHeadOfQueue(slot)) {
+            this.#processQueue();
+          }
+          return;
+        }
         ASSERT(this.#active.type === 'error' || this.#active.type === 'finished', 'active is error or finished');
         // nothing to close in this case
         (slot as ErrorState).closeState = 'ready';
@@ -276,52 +309,116 @@ class FlatMapHelper {
     this.#active = { type: 'finished' };
   }
 
+  // The in-flight underlying pull we were draining (after return()) produced no
+  // usable inner iterator — it reported done, errored, or the mapper failed. The
+  // `requested` units of demand bound to it can never be filled, so done them.
+  // Values buffered in already-parked iterators (ahead in the queue) keep their
+  // own calls and still deliver.
+  #finishDraining() {
+    ASSERT(this.#active.type === 'draining', 'active is draining');
+    const { requested } = this.#active as DrainingState;
+    this.#active = { type: 'finished' };
+    this.#markSomeCallsAsNoLongerGettingValues(requested);
+  }
+
   #issuePullFromUnderlying(requested: number) {
     ASSERT(this.#active.type === 'unstarted' || this.#active.type === 'iter', 'active is unstarted or iter'); // latter case is when we just got { done: true } from previous active
     this.#active = { type: 'reading underlying', requested };
 
     fastPromiseTry(() => (this.#underlying as Nextable).next()).then(
       r => {
-        if (this.#finished) return;
-        ASSERT(this.#active.type === 'reading underlying', 'active is reading underlying');
+        // We may be 'reading underlying' (live) or 'draining' (return() landed while
+        // this pull was in flight). Anything else means the stream already ended via
+        // another path, so this value is discarded.
+        const st = this.#active.type;
+        if (st !== 'reading underlying' && st !== 'draining') return;
         if ((r as { done: boolean }).done) {
-          this.#markUnderlyingAsFinished();
+          // Underlying exhausted. While draining the bound demand can never be
+          // filled; otherwise this is the normal terminal done.
+          if (st === 'draining') {
+            this.#finishDraining();
+          } else {
+            this.#markUnderlyingAsFinished();
+          }
           return;
         }
 
         // NB we don't await value; contract is non-promise here
         fastPromiseTry(() => (this.#fn as (r: unknown) => AsyncIterable<unknown>)((r as { value: unknown }).value)).then(
           iter => {
-            if (this.#finished) return;
-            ASSERT(this.#active.type === 'reading underlying', 'active is reading underlying');
+            const st = this.#active.type;
+            if (st !== 'reading underlying' && st !== 'draining') return;
+            const draining = st === 'draining';
 
             // TODO handle sync iterators / iterables
             // TODO consider how to deal with distinguishing sync iterator from async iterator
+            let actualIter: unknown;
             try {
-              const actualIter = iter[Symbol.asyncIterator]();
-
-              const { requested } = (this.#active as ReadingUnderlyingState);
-              this.#active = { type: 'iter', iter: actualIter, values: [] };
-
-              // ok, time to actually pull
-              for (let i = 0; i < requested; ++i) {
-                // TODO worry about re-entrancy from calling .next()/.return() - probably is OK, just gotta make sure state is set appropriately before invoking user code
-                this.#issuePullFromCurrentActive();
-              }
+              actualIter = iter[Symbol.asyncIterator]();
             } catch (error) {
-              this.#closeUnderlyingForErrorInMapper(error);
+              // Obtaining the inner iterator failed. While draining the underlying
+              // is already closing, so just abandon the bound demand; otherwise this
+              // closes the underlying like a mapper throw.
+              if (draining) {
+                this.#finishDraining();
+              } else {
+                this.#closeUnderlyingForErrorInMapper(error);
+              }
+              return;
+            }
+
+            const { requested } = (this.#active as ReadingUnderlyingState | DrainingState);
+            this.#active = { type: 'iter', iter: actualIter, values: [] };
+
+            // ok, time to actually pull
+            for (let i = 0; i < requested; ++i) {
+              // TODO worry about re-entrancy from calling .next()/.return() - probably is OK, just gotta make sure state is set appropriately before invoking user code
+              this.#issuePullFromCurrentActive();
+            }
+
+            if (draining) {
+              // We only ever wanted these `requested` values out of this iterator.
+              // Park it (its just-issued pulls keep delivering through the finished
+              // machinery) and close it. markUnderlyingAsFinished dones nothing here:
+              // the invariant guarantees calls.length - bufferedValueCount === the
+              // `requested` slots we just parked.
+              const innerInFlight = this.#active as InFlight;
+              this.#markUnderlyingAsFinished();
+              // DEFER the close one microtask and skip it if the iterator has by then
+              // reported done/error on its own: flatMap only learns a pull's outcome
+              // asynchronously, so closing synchronously could .return() an iterator a
+              // (synchronously-resolved) done pull already finished. Closing a still-
+              // live iterator while its pulls are in flight is fine — a later done is
+              // recorded after this check, exactly as an ordinary return() leaves
+              // already-requested pulls deliverable.
+              Promise.resolve().then(() => {
+                if (innerInFlight.finishedOnOwn) return;
+                fastPromiseTry(() => (actualIter as MaybeReturnable).return?.()).then(() => {}, () => {});
+              });
             }
           },
           error => {
-            if (this.#finished) return;
-            ASSERT(this.#active.type === 'reading underlying', 'active is reading underlying');
+            const st = this.#active.type;
+            if (st !== 'reading underlying' && st !== 'draining') return;
+            if (st === 'draining') {
+              // Mapper rejected after return(): the underlying is already closing,
+              // so just abandon the bound demand.
+              this.#finishDraining();
+              return;
+            }
             this.#closeUnderlyingForErrorInMapper(error);
           }
         );
       },
       error => {
-        if (this.#finished) return;
-        ASSERT(this.#active.type === 'reading underlying', 'active is reading underlying');
+        const st = this.#active.type;
+        if (st !== 'reading underlying' && st !== 'draining') return;
+        if (st === 'draining') {
+          // The underlying errored after return(); it's already closing, so swallow
+          // the error and abandon the bound demand.
+          this.#finishDraining();
+          return;
+        }
 
         // The underlying errored while fetching the next inner iterator. It is NOT
         // closed (it reported the error itself). Values buffered in already-parked
@@ -442,7 +539,7 @@ class FlatMapHelper {
   }
 
   next() {
-    if (this.#finished) {
+    if (this.#finished || this.#active.type === 'draining') {
       return Promise.resolve({ value: undefined, done: true });
     }
     const { resolve, reject, promise } = Promise.withResolvers();
@@ -468,40 +565,41 @@ class FlatMapHelper {
       return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
         .then(() => ({ value: undefined, done: true }));
     }
-    if (this.#finished) {
+    if (this.#finished || this.#active.type === 'draining') {
       return Promise.resolve({ value: undefined, done: true });
     }
-    // TODO order of truncation vs resolving this Promise
-    // Capture #active before #markUnderlyingAsFinished resets it to 'finished'.
-    const active = this.#active;
-    this.#markUnderlyingAsFinished();
 
-    if (active.type === 'iter') {
-      // TODO consider whether to block on closing active before closing underlying
-      // probably yes?
-      // TODO make this match above
-      // TODO check against iterator sync flatmap
-      const activeIter = active.iter;
-
-      // todo fast path for missing returns
-      return fastPromiseTry(() => (activeIter as MaybeReturnable).return?.()).then(
-        () => {
-          // TODO strictly speaking we need to check for object-ness of the return value here
-          // or, change the spec to never do that, because it's dumb
-          return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
-            .then(() => ({ value: undefined, done: true }))
-        },
-        error => {
-          // this error squashes errors from closing underlying
-          return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
-            .finally(() => Promise.reject(error));
-        },
-      );
+    if (this.#active.type === 'reading underlying') {
+      // A pull from the underlying is in flight (possibly with the mapper also
+      // pending). Close the underlying and resolve done now, but DON'T abandon the
+      // demand bound to that pull: switch to 'draining' so that when the pull
+      // resolves we still map it, pull the produced iterator for the bound demand,
+      // deliver those values, then close it.
+      this.#active = { type: 'draining', requested: this.#active.requested };
+      return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
+        .then(() => ({ value: undefined, done: true }));
     }
 
-    ASSERT(active.type === 'reading underlying', 'active is reading underlying');
-    // TODO if we're actually blocked on the mapper here, we probably need to handle closing the result
-    return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
-      .then(() => ({ value: undefined, done: true }));
+    // active is an inner iterator. Park it (its in-flight pulls keep delivering),
+    // then close it and the underlying in sequence — active iterator first.
+    // TODO order of truncation vs resolving this Promise
+    const active = this.#active;
+    this.#markUnderlyingAsFinished();
+    const activeIter = active.iter;
+
+    // todo fast path for missing returns
+    return fastPromiseTry(() => (activeIter as MaybeReturnable).return?.()).then(
+      () => {
+        // TODO strictly speaking we need to check for object-ness of the return value here
+        // or, change the spec to never do that, because it's dumb
+        return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
+          .then(() => ({ value: undefined, done: true }))
+      },
+      error => {
+        // this error squashes errors from closing underlying
+        return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
+          .finally(() => Promise.reject(error));
+      },
+    );
   }
 }

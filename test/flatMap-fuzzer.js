@@ -549,13 +549,19 @@ function checkInvariants(rec) {
     for (const inner of rec.inners) {
       if (inner.pulls.length === 0) {
         // A live inner is always pulled immediately on creation, so a zero-pull
-        // inner can only be one the mapper produced AFTER the helper finished.
-        // That is the known mapper-pending leak (see the xfail in
-        // test/flatMap.js); exempt it until that bug is fixed.
+        // inner can only be one the mapper produced AFTER the helper had already
+        // finished via another path (so flatMap never adopts it). flatMap arguably
+        // ought to close it, but that's a separate corner; don't count it as a leak.
         if (!inner.createdWhileFinished) add(`inner I${inner.id} was created but never pulled`);
         continue;
       }
-      if (!inner.naturalFinished && inner.returnCalls === 0 && inner.hasReturn) {
+      // Inners created DURING finalize never existed at natural termination, so the
+      // pre-finalize snapshot says nothing about them: use their actual finished
+      // status (anything pulled during finalize is force-settled done, so it really
+      // did finish). For inners that existed at natural termination, keep using the
+      // snapshot so finalize's force-settling can't mask a genuine open-at-end leak.
+      const finishedForLeak = inner.naturalFinished !== undefined ? inner.naturalFinished : inner.finished;
+      if (!finishedForLeak && inner.returnCalls === 0 && inner.hasReturn) {
         add(`inner I${inner.id} was left open at termination (pulled, not finished, not .return()'d): leak`);
       }
     }

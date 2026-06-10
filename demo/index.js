@@ -5,6 +5,7 @@ import { scenarioToAnimation } from './scenarios/scenario-to-animation.js';
 import { mapScenarios } from './scenarios/map-scenarios.js';
 import { filterScenarios } from './scenarios/filter-scenarios.js';
 import { flatMapScenarios } from './scenarios/flatmap-scenarios.js';
+import { map } from '../map.js';
 const root = document.getElementById('viz');
 
 // The selectable sets of animations, switched via the `{map,filter,flatMap}`
@@ -23,6 +24,8 @@ const RESET_SELECTOR = STATE_CLASSES.map(c => '.' + c).join(',');
 let animIndex = 0;                              // which animation is selected
 let step = 0;                                   // which step within it
 let urlSync = false;                            // start writing the hash only after the first user switch
+let currentSet = 'map';                         // active helper set (for the Interactive tab)
+let interactive = false;                        // the live Interactive tab is active
 const stepsOf = () => animations[animIndex].steps;
 const maxStep = () => stepsOf().length - 1;
 
@@ -226,12 +229,23 @@ function buildTabs() {
     descEl.appendChild(d);
     descItems.push(d);
   });
+
+  // A live "Interactive" tab at the end of the set: instead of replaying a
+  // pre-baked scenario, it drives the real implementation and reflects the
+  // user's stimuli (see the interactive driver below). Distinguished with a
+  // sparkle + shimmer so it reads as the odd one out.
+  const ib = document.createElement('button');
+  ib.className = 'tab interactive';
+  ib.innerHTML = '✨ Interactive';
+  ib.addEventListener('click', () => selectInteractive());
+  tabsEl.appendChild(ib);
 }
 
 // Switch to a named set (map | filter), rebuild its tabs, and select one of
 // its animations (the first by default). The header links reflect the set.
 function selectSet(name, index = 0) {
   animations = animationSets[name];
+  currentSet = name;
   root.classList.toggle('flatmap', name === 'flatMap');   // gates the inner.return() column
   setLinks.forEach((a, key) => a.classList.toggle('active', key === name));
   buildTabs();
@@ -256,6 +270,7 @@ const setLinks = new Map([
 setLinks.forEach((a, name) => a.addEventListener('click', () => selectSet(name)));
 
 function selectAnimation(i) {
+  exitInteractive();   // leaving the live tab (if we were on it)
   animIndex = i;
   step = 0;
   [...tabsEl.children].forEach((b, j) => b.classList.toggle('active', j === i));
@@ -270,10 +285,339 @@ function selectAnimation(i) {
   if (urlSync) history.replaceState(null, '', '#' + animations[i].id);
 }
 
+// ====================================================================
+// Interactive (live) mode
+// --------------------------------------------------------------------
+// Instead of replaying a recorded scenario, the Interactive tab wires up
+// the *real* implementation (imported above) behind a controlled source
+// and controlled fn, and lets the user supply the stimuli the recorded
+// scenarios bake in: calling `.next()`/`.return()`, and settling the
+// promises the helper is waiting on (the underlying pulls, the mapper
+// calls, the underlying `.return()`).
+//
+// Each user action is one *tick*: we perform the stimulus, drain the
+// microtask queue so the implementation reacts fully, then commit every
+// resulting effect in a single synchronous DOM pass — so same-tick
+// effects animate simultaneously (different ticks come from different
+// user actions, which are naturally sequenced). Input is refused while a
+// tick's transition plays out.
+//
+// The diagram grid is fixed (rows 0..3), and `map` keeps a strict
+// one-to-one correspondence: the k-th `.next()` drives pull/​slot/​result
+// row k. We tag source values with letters (A,B,…) and mapper results
+// with `f`-prefixes (fA,…) so the data flowing through the real helper
+// also tells us which boxes to light and which arrows to draw.
+// ====================================================================
+const LETTERS = ['A', 'B', 'C', 'D'];
+const COMMIT_MS = 430;        // ~ the .4s box/value transition; input is gated this long
+const flush = async (rounds = 60) => { for (let i = 0; i < rounds; i++) await Promise.resolve(); };
+
+let ix = null;                // the live session ({ mapped, results, ... }) or null
+const stimuli = new Map();    // boxId -> { kind, deferred, row?, slot?, arg? } for settleable promises
+
+// Per-tick frame: every effect is recorded here during the microtask
+// drain, then flushed to the DOM together by commitFrame().
+let fOps, fContent, fArrows, fDotAdd, fDotRemove;
+function resetFrame() { fOps = []; fContent = []; fArrows = []; fDotAdd = []; fDotRemove = []; }
+
+// ---- recorders (called as the helper reacts; pure data, no DOM) ----
+function recResultPending(row) { fOps.push([`#r${row} .box`, '+pending']); }
+function recPullPending(row, d) {
+  fOps.push([`#u${row} .box`, '+pending']);
+  fDotAdd.push({ id: `u${row}`, st: { kind: 'pull', deferred: d, row } });
+}
+function recFnPending(slot, arg, d) {
+  fOps.push([`#i${slot} .box`, '+pending'], [`#i${slot} .label`, '+reveal'], [`#i${slot} .divider`, '+reveal']);
+  fContent.push([`i${slot}`, 'label', `f(${arg})`]);
+  fArrows.push([`U${slot}`, `I${slot}`]);
+  fDotAdd.push({ id: `i${slot}`, st: { kind: 'fn', deferred: d, slot, arg } });
+}
+function recClosePending(d) {
+  fOps.push(['#c0 .box', '+pending']);
+  fContent.push(['c0', 'val', '{}']);
+  fDotAdd.push({ id: 'c0', st: { kind: 'return', deferred: d } });
+}
+function recReturnPending() {
+  fOps.push(['#c1 .box', '+pending']);
+  fContent.push(['c1', 'val', '{}']);
+}
+function recPullSettle(row, kind) {           // kind: 'value' | 'done' | 'error'
+  const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
+  fOps.push([`#u${row} .box`, spec], [`#u${row} .val`, '+reveal']);
+  fContent.push([`u${row}`, 'val', kind === 'value' ? LETTERS[row] : kind === 'done' ? { done: 'true' } : 'Error']);
+  fDotRemove.push(`u${row}`);
+}
+function recFnSettleValue(slot, mapped) {
+  fOps.push([`#i${slot} .box`, '-pending +settled'], [`#i${slot} .sub`, '+reveal']);
+  fContent.push([`i${slot}`, 'sub', mapped]);
+  fDotRemove.push(`i${slot}`);
+}
+function recFnSettleError(slot) {
+  fOps.push([`#i${slot} .box`, '-pending +settled +errored'], [`#i${slot} .label`, '-reveal'],
+    [`#i${slot} .divider`, '-reveal'], [`#i${slot} .err`, '+reveal']);
+  fContent.push([`i${slot}`, 'err', 'Error']);
+  fDotRemove.push(`i${slot}`);
+}
+function recResultSettle(row, kind, value) {  // kind: 'value' | 'done' | 'error'
+  const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
+  fOps.push([`#r${row} .box`, spec], [`#r${row} .val`, '+reveal']);
+  fContent.push([`r${row}`, 'val', kind === 'value' ? value : kind === 'done' ? { done: 'true' } : 'Error']);
+  if (kind === 'value') {
+    const slot = ix.mappedToSlot.get(value);
+    if (slot != null) fArrows.push([`I${slot}`, `R${row}`]);
+  }
+}
+function recCloseSettle(kind) {               // c0 (underlying .return()): 'done' | 'error'
+  const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
+  fOps.push(['#c0 .box', spec], ['#c0 .val', '+reveal']);
+  if (kind === 'error') fContent.push(['c0', 'val', 'Error']);
+  fDotRemove.push('c0');
+}
+function recReturnSettle(kind) {              // c1 (result .return()): 'done' | 'error'
+  const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
+  fOps.push(['#c1 .box', spec], ['#c1 .val', '+reveal']);
+  if (kind === 'error') fContent.push(['c1', 'val', 'Error']);
+}
+
+// ---- controlled source + fn that record as the helper drives them ----
+function makeSession() {
+  const sourceIterator = {
+    next() {
+      const row = ix.pullCount++;
+      const d = Promise.withResolvers();
+      recPullPending(row, d);
+      return d.promise;
+    },
+    return() {
+      const d = Promise.withResolvers();
+      recClosePending(d);
+      return d.promise;
+    },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  const fn = (value) => {
+    const slot = LETTERS.indexOf(value);    // value is the source letter -> its row
+    const d = Promise.withResolvers();
+    recFnPending(slot, value, d);
+    return d.promise;
+  };
+  ix = {
+    mapped: map(sourceIterator, fn),
+    results: [],                 // one per consumer .next(), in call order
+    mappedToSlot: new Map(),     // mapper result value -> Internal slot (for I->R arrows)
+    pullCount: 0,
+    busy: false,
+  };
+}
+
+// ---- the three user-action entry points ----
+function doNext() {
+  const row = ix.results.length;
+  recResultPending(row);
+  const p = ix.mapped.next();   // synchronously issues the underlying pull (recorded above)
+  ix.results.push(p);
+  p.then(
+    (v) => recResultSettle(row, v.done ? 'done' : 'value', v.value),
+    () => recResultSettle(row, 'error'),
+  );
+}
+function doReturn() {
+  recReturnPending();
+  ix.mapped.return().then(() => recReturnSettle('done'), () => recReturnSettle('error'));
+}
+function settleStimulus(id, type) {           // type: 'value' | 'done' | 'error'
+  const st = stimuli.get(id);
+  if (!st) return;
+  if (st.kind === 'pull') {
+    recPullSettle(st.row, type);
+    if (type === 'value') st.deferred.resolve({ value: LETTERS[st.row], done: false });
+    else if (type === 'done') st.deferred.resolve({ value: undefined, done: true });
+    else st.deferred.reject(new Error('boom'));
+  } else if (st.kind === 'fn') {
+    if (type === 'done') return;              // mapper result: right-click does nothing
+    if (type === 'value') {
+      const mapped = 'f' + st.arg;
+      ix.mappedToSlot.set(mapped, st.slot);
+      recFnSettleValue(st.slot, mapped);
+      st.deferred.resolve(mapped);
+    } else {
+      recFnSettleError(st.slot);
+      st.deferred.reject(new Error('boom'));
+    }
+  } else {                                    // kind 'return' — underlying .return()
+    if (type === 'error') { recCloseSettle('error'); st.deferred.reject(new Error('boom')); }
+    else { recCloseSettle('done'); st.deferred.resolve({ value: undefined, done: true }); }
+  }
+}
+
+// Run one user action as a single tick: perform it, let the helper react
+// to quiescence, then commit every effect at once. Input is refused for
+// the duration of the resulting transition.
+async function userAction(perform) {
+  if (!ix || ix.busy) return;
+  ix.busy = true;
+  updateButtons();
+  resetFrame();
+  perform();
+  await flush();
+  commitFrame();
+  updateButtons();
+  setTimeout(() => { if (ix) { ix.busy = false; updateButtons(); } }, COMMIT_MS);
+}
+
+function commitFrame() {
+  applyStep(fOps);
+  for (const [id, field, val] of fContent) {
+    if (field === 'val') buildVal(root.querySelector(`#${id} .val`), val);
+    else { const el = root.querySelector(`#${id} .${field}`); if (el) el.textContent = val; }
+  }
+  for (const id of fDotRemove) removeDot(id);
+  for (const d of fDotAdd) addDot(d);
+  for (const key in arrowEls) arrowEls[key].classList.remove('reveal');   // arrows are momentary
+  for (const conn of fArrows) revealArrow(conn);
+}
+
+// ---- stimulus dots ----
+function addDot({ id, st }) {
+  stimuli.set(id, st);
+  const box = root.querySelector(`#${id} .box`);
+  box.classList.add('stimulus');
+  const dot = svgEl('circle', {
+    class: 'stim-dot',
+    cx: +box.getAttribute('x') + 15,
+    cy: +box.getAttribute('y') + 15,
+    r: 7,
+  });
+  root.querySelector(`#${id}`).appendChild(dot);
+}
+function removeDot(id) {
+  stimuli.delete(id);
+  root.querySelector(`#${id} .box`)?.classList.remove('stimulus');
+  root.querySelector(`#${id} .stim-dot`)?.remove();
+}
+
+function revealArrow(conn) {
+  const key = conn[0] + '>' + conn[1];
+  let el = arrowEls[key];
+  if (!el) {
+    el = svgEl('path', { class: 'arrow', d: arrowD(conn) });
+    (BAND[conn[0][0]] === 'closing' ? closingArrows : mainArrows).appendChild(el);
+    arrowEls[key] = el;
+  }
+  el.classList.add('reveal');
+}
+
+// Delegated pointer handling: a left/shift click or right-click on a box
+// that currently carries a settleable promise drives that settlement.
+root.addEventListener('click', (e) => {
+  if (!interactive || !ix || ix.busy) return;
+  const g = e.target.closest('[id]');
+  if (g && stimuli.has(g.id)) userAction(() => settleStimulus(g.id, e.shiftKey ? 'error' : 'value'));
+});
+root.addEventListener('contextmenu', (e) => {
+  if (!interactive || !ix) return;
+  const g = e.target.closest('[id]');
+  const st = g && stimuli.get(g.id);
+  if (!st) return;
+  e.preventDefault();                       // suppress the context menu over any settleable box
+  if (st.kind === 'fn') return;             // right-click does nothing on a mapper result
+  if (!ix.busy) userAction(() => settleStimulus(g.id, 'done'));
+});
+
+// ---- enabling/disabling the consumer buttons ----
+function updateButtons() {
+  const nb = root.querySelector('#next-btn');
+  const rb = root.querySelector('#return-btn');
+  if (nb) nb.classList.toggle('disabled', !ix || ix.busy || ix.results.length >= 4);
+  if (rb) rb.classList.toggle('disabled', !ix || ix.busy);
+}
+
+// ---- building the consumer controls (.next() + result.return()) ----
+function buildInteractiveButtons() {
+  root.querySelector('#next-btn')?.remove();
+  // A `.next()` button sits just under the Result column header.
+  const g = svgEl('g', { id: 'next-btn', class: 'ibtn' });
+  const bg = svgEl('rect', { class: 'ibtn-bg', x: 683, y: 58, width: 114, height: 26, rx: 7 });
+  const label = svgEl('text', { class: 'ibtn-label', x: 740, y: 71, 'text-anchor': 'middle', 'dominant-baseline': 'central' });
+  label.textContent = '.next()';
+  g.append(bg, label);
+  document.getElementById('main').appendChild(g);
+  g.addEventListener('click', () => { if (ix && !ix.busy && ix.results.length < 4) userAction(doNext); });
+
+  // Turn the result.return() column header into a button: wrap the existing
+  // header text in a clickable group behind a backing pill (so the whole pill
+  // is the hit target). exitInteractive() unwraps it back to a plain header.
+  const hdr = [...root.querySelectorAll('#closing .header.ret')].find(t => t.textContent.includes('result.return'));
+  if (hdr && !root.querySelector('#return-btn')) {
+    const bb = hdr.getBBox();
+    const grp = svgEl('g', { id: 'return-btn', class: 'ibtn' });
+    const pill = svgEl('rect', { class: 'ibtn-header-bg', x: bb.x - 12, y: bb.y - 5, width: bb.width + 24, height: bb.height + 10, rx: 8 });
+    hdr.parentNode.insertBefore(grp, hdr);
+    grp.append(pill, hdr);                 // pill behind, header text in front
+    hdr.classList.add('ibtn-header');
+    grp.addEventListener('click', () => { if (ix && !ix.busy) userAction(doReturn); });
+  }
+}
+
+const IX_INSTRUCTIONS = 'Driving the real <code>map</code> implementation. Click <code>.next()</code> to pull; settle a glowing promise yourself — <b>click</b> = value, <b>right-click</b> = done, <b>shift-click</b> = error.';
+const IX_COMING_SOON = (h) => `Interactive mode for <code>${h}</code> is coming soon — only <code>map</code> is wired up so far.`;
+
+function selectInteractive() {
+  exitInteractive();
+  interactive = true;
+  [...tabsEl.children].forEach((b) => b.classList.remove('active'));
+  tabsEl.querySelector('.tab.interactive')?.classList.add('active');
+  descItems.forEach((d) => d.classList.remove('active'));
+
+  // Wipe to a clean diagram with the closing band permanently open.
+  root.classList.add('no-anim');
+  root.querySelectorAll(RESET_SELECTOR).forEach((el) => el.classList.remove(...STATE_CLASSES));
+  applyContent({});
+  mainArrows.textContent = ''; closingArrows.textContent = ''; arrowEls = {};
+  document.getElementById('main').classList.add('shifted');
+  document.getElementById('closing').classList.add('shown');
+  root.setAttribute('viewBox', '0 0 900 740');
+  root.querySelectorAll('.stim-dot').forEach((d) => d.remove());
+  stimuli.clear();
+  buildInteractiveButtons();
+  void root.getBoundingClientRect();
+  root.classList.remove('no-anim');
+
+  // Hide the stepper; the live tab is click-driven.
+  document.querySelector('.controls').style.display = 'none';
+  document.querySelector('.hint').style.display = 'none';
+
+  if (currentSet === 'map') { makeSession(); caption.innerHTML = IX_INSTRUCTIONS; }
+  else { ix = null; caption.innerHTML = IX_COMING_SOON(currentSet); }
+  updateButtons();
+
+  if (urlSync) history.replaceState(null, '', '#' + currentSet + '-interactive');
+}
+
+function exitInteractive() {
+  if (!interactive) return;
+  interactive = false;
+  ix = null;
+  stimuli.clear();
+  root.querySelectorAll('.stim-dot').forEach((d) => d.remove());
+  root.querySelectorAll('.box.stimulus').forEach((b) => b.classList.remove('stimulus'));
+  root.querySelector('#next-btn')?.remove();
+  const grp = root.querySelector('#return-btn');   // unwrap the result.return() button
+  if (grp) {
+    const txt = grp.querySelector('.header.ret');
+    txt.classList.remove('ibtn-header');
+    grp.parentNode.insertBefore(txt, grp);
+    grp.remove();
+  }
+  document.querySelector('.controls').style.display = '';
+  document.querySelector('.hint').style.display = '';
+}
+
 nextBtn.addEventListener('click', () => go(step + 1));
 prevBtn.addEventListener('click', () => go(step - 1));
 
 window.addEventListener('keydown', (e) => {
+  if (interactive) return;   // the stepper is inert on the live tab
   if (e.altKey) {
     switch (e.key) {
       case 'ArrowRight': case 'ArrowDown':
@@ -310,8 +654,15 @@ placeTombstone('tomb-underlying', 'hdr-underlying');
 placeTombstone('tomb-result', 'hdr-result');
 
 // Initial paint: jump to the animation named in the URL hash if it's a known
-// id, otherwise fall back to the map set's first animation.
-const initial = locateAnim(decodeURIComponent((location.hash || '').slice(1)));
-if (initial) selectSet(initial.name, initial.i);
-else selectSet('map');
+// id, otherwise fall back to the map set's first animation. A `#<set>-interactive`
+// hash lands on that set's live tab.
+const hash = decodeURIComponent((location.hash || '').slice(1));
+if (hash.endsWith('-interactive') && animationSets[hash.slice(0, -'-interactive'.length)]) {
+  selectSet(hash.slice(0, -'-interactive'.length));
+  selectInteractive();
+} else {
+  const initial = locateAnim(hash);
+  if (initial) selectSet(initial.name, initial.i);
+  else selectSet('map');
+}
 urlSync = true;   // from here on, switches update the hash

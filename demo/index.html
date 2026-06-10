@@ -353,6 +353,52 @@
     border-radius: 5px;
   }
   .hint { color: var(--muted); font-size: 12.5px; }
+
+  /* ---- Interactive (live) mode ---- */
+  /* the live tab — a shimmering, sparkly outlier among the scenario tabs */
+  .tab.interactive {
+    border-color: #c4b5fd;
+    color: #6d28d9;
+    font-weight: 700;
+    background: linear-gradient(100deg, #fdf4ff, #eef2ff, #ecfeff, #eef2ff, #fdf4ff);
+    background-size: 220% 100%;
+    animation: ix-shimmer 4s linear infinite;
+  }
+  .tab.interactive:hover {
+    background: linear-gradient(100deg, #f8ecff, #e6ecff, #e3fcff, #e6ecff, #f8ecff);
+    background-size: 220% 100%;
+  }
+  .tab.interactive.active {
+    color: #5b21b6;
+    border-color: #8b5cf6;
+    box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.25);
+  }
+  @keyframes ix-shimmer { to { background-position: 220% 0; } }
+
+  /* a settleable promise: the box is clickable and wears a pulsing corner dot */
+  .box.stimulus { cursor: pointer; }
+  .stim-dot {
+    fill: #f59e0b;
+    stroke: #fff;
+    stroke-width: 1.5;
+    cursor: pointer;
+    filter: drop-shadow(0 0 3px rgba(245, 158, 11, 0.9));
+    animation: ix-dot 1.4s ease-in-out infinite;
+  }
+  @keyframes ix-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  /* the consumer's .next() button under the Result header */
+  .ibtn { cursor: pointer; }
+  .ibtn-bg { fill: #eef2ff; stroke: #6366f1; stroke-width: 2; transition: fill .15s; }
+  .ibtn:hover .ibtn-bg, .ibtn:hover .ibtn-header-bg { fill: #e0e7ff; }
+  .ibtn-label {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 16px; font-weight: 600; fill: #3730a3;
+  }
+  .ibtn.disabled { opacity: 0.4; pointer-events: none; }
+  /* the result.return() header, restyled as a button */
+  .ibtn-header-bg { fill: #eef2ff; stroke: #6366f1; stroke-width: 1.5; transition: fill .15s; }
+  .ibtn-header { fill: #3730a3; }
 </style>
 </head>
 <body>

@@ -156,15 +156,16 @@ function errMsg(e) {
 //                       with a throwing `value` getter, to test protocol violations)
 //   throwNext(err)   -> make the next `.next()` call throw `err` *synchronously*
 //   throwReturn(err) -> make the next `.return()` call throw `err` *synchronously*
-//   holdReturn()     -> make `.return()` return a pending promise (settled later
-//                       by settleReturn) instead of resolving immediately
-//   settleReturn(i)  -> settle the i-th held `.return()` call with { done: true }
-//   settleReturnThrow(i, err) -> reject the i-th held `.return()` call with `err`
+//   settleReturn(i)  -> settle the i-th `.return()` call with { done: true }
+//   settleReturnThrow(i, err) -> reject the i-th `.return()` call with `err`
+//
+// Like `.next()`, `.return()` returns a pending promise the test settles later
+// (via settleReturn / settleReturnThrow), so a close that the helper gates work
+// on is observable rather than collapsing into a single microtask flush.
 export function controlledSource(log, name = 'src') {
   const pulls = [];
-  const heldReturns = []; // deferreds for held .return() calls, by return index
+  const heldReturns = []; // deferreds for .return() calls, by return index
   let returnCount = 0;
-  let holdReturns = false; // when true, .return() is deferred (see holdReturn)
   let nextThrow = null; // { err } armed for the next .next() call
   let returnThrow = null; // { err } armed for the next .return() call
 
@@ -191,12 +192,9 @@ export function controlledSource(log, name = 'src') {
         throw err;
       }
       log(`${name}.return() #${i}`);
-      if (holdReturns) {
-        const d = Promise.withResolvers();
-        heldReturns[i] = { d, value };
-        return d.promise;
-      }
-      return Promise.resolve({ value, done: true });
+      const d = Promise.withResolvers();
+      heldReturns[i] = { d, value };
+      return d.promise;
     },
     [Symbol.asyncIterator]() {
       return this;
@@ -211,7 +209,6 @@ export function controlledSource(log, name = 'src') {
     yieldResult: (i, result) => pulls[i].resolve(result),
     throwNext: (err) => { nextThrow = { err }; },
     throwReturn: (err) => { returnThrow = { err }; },
-    holdReturn: () => { holdReturns = true; },
     settleReturn: (i) => heldReturns[i].d.resolve({ value: heldReturns[i].value, done: true }),
     settleReturnThrow: (i, err) => heldReturns[i].d.reject(err), // reject a held .return()
   };

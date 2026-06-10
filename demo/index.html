@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Concurrent AsyncIterator .filter</title>
+<style>
+  :root {
+    --idle-fill: #f3f3f5;
+    --idle-stroke: #d8d8de;
+    --pending-fill: #e7e7ef;
+    --pending-stroke: #3b82f6;
+    --settled-fill: #d6d6da;
+    --settled-stroke: #9a9aa3;
+    --voided-fill: #ede9fe;
+    --voided-stroke: #8b5cf6;
+    --voided-settled-fill: #cbbdf0;
+    --errored-fill: #fee2e2;
+    --errored-stroke: #ef4444;
+    --errored-settled-fill: #efb0b0;
+    --ink: #1f2933;
+    --muted: #6b7280;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    padding: 28px 20px 40px;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--ink);
+    background: #f7f7f9;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 20px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }
+  h1 code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #ececed;
+    padding: 1px 7px;
+    border-radius: 6px;
+    font-size: 0.92em;
+  }
+  /* `map` / `filter` in the header pick which set of animations is shown.
+     The inactive one is an underlined link; the active one is the current
+     selection (not a link) — same text/weight/color, marked instead by a
+     single centered dot above it (a CSS pseudo-element, so no markup juggling
+     and no ruby abuse). */
+  h1 code a.setlink {
+    color: inherit;
+    text-decoration: underline;
+    text-decoration-thickness: 1.5px;
+    text-underline-offset: 3px;
+    cursor: pointer;
+  }
+  h1 code a.setlink.active {
+    text-decoration: none;
+    cursor: default;
+    pointer-events: none;
+    position: relative;
+  }
+  h1 code a.setlink.active::after {
+    content: "·";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -0.66em;
+    text-align: center;
+    line-height: 1;
+    font-weight: 800;
+  }
+
+  .stage {
+    width: min(960px, 100%);
+    background: #fff;
+    border: 1px solid #e6e6ea;
+    border-radius: 14px;
+    box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+    padding: 8px;
+  }
+
+  svg { width: 100%; height: auto; display: block; }
+
+  /* ---- column headers ---- */
+  .header {
+    font: 600 19px ui-sans-serif, system-ui, sans-serif;
+    fill: var(--muted);
+    text-anchor: middle;
+  }
+  /* the closing band's headers are method calls, so they read in monospace */
+  .header.ret { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 17px; }
+
+  /* a tombstone marking a closed iterator, appended just past its column
+     header. Its x is computed in JS (right of the header's measured edge) so
+     the header itself stays centered; it fades in via the standard .reveal,
+     so it wipes/replays with every other step like any other state. */
+  .tomb {
+    font-size: 19px;
+    text-anchor: start;
+    opacity: 0;
+    transition: opacity .4s ease;
+  }
+
+  /* ============================================================
+     VISUAL STATES — expressed purely as classes that JS toggles.
+     The CSS just describes how each state looks and transitions;
+     it knows nothing about step numbers. The <script> owns the
+     timeline and flips these classes on/off per step.
+
+       .box            idle (resting / empty)
+       .box.pending    highlighted + swollen (active, unsettled)
+       .box.settled    solid gray, holding a value (no hue, just weight)
+       .reveal         a value/label/divider/arrow faded into view
+       .gone           a group faded out (discarded)
+       .slide-up       a group climbed one row (compaction)
+       .incoming       a group parked just below the stack (baked in markup)
+       .slide-in       ...that parked group slid into the freed slot
+     ============================================================ */
+
+  /* ---- boxes ---- */
+  .box {
+    fill: var(--idle-fill);
+    stroke: var(--idle-stroke);
+    stroke-width: 2;
+    transform-box: fill-box;
+    transform-origin: center;
+    transition: fill .4s ease, stroke .4s ease, stroke-width .4s ease, transform .4s ease, opacity .4s ease;
+  }
+  .box.pending {
+    fill: var(--pending-fill);
+    stroke: var(--pending-stroke);
+    stroke-width: 4;
+    transform: scale(1.07);
+  }
+  .box.settled {
+    fill: var(--settled-fill);
+    stroke: var(--settled-stroke);
+    stroke-width: 2.5;
+  }
+  /* a settled `done: true` box reads as exhausted — faint crosshatch fill */
+  .box.settled.done { fill: url(#hatch); }
+  /* a pull superseded by the source's completion — never delivers a value (purple) */
+  .box.voided {
+    fill: var(--voided-fill);
+    stroke: var(--voided-stroke);
+    stroke-width: 4;
+    transform: scale(1.07);
+  }
+  /* an already-settled promise that is then voided: no highlight, no swell —
+     styled like a completed (settled) box, but purple instead of gray */
+  .box.settled.voided {
+    fill: var(--voided-settled-fill);
+    stroke: var(--voided-stroke);
+    stroke-width: 2.5;
+    transform: none;
+  }
+  /* an underlying pull (or the result it feeds) that settles with an *error* —
+     styled like a settled box, but red instead of gray. The iterator is now
+     closed; no value is ever delivered. */
+  .box.errored {
+    fill: var(--errored-fill);
+    stroke: var(--errored-stroke);
+    stroke-width: 4;
+    transform: scale(1.07);
+  }
+  .box.settled.errored {
+    fill: var(--errored-settled-fill);
+    stroke: var(--errored-stroke);
+    stroke-width: 2.5;
+    transform: none;
+  }
+
+  /* text that lives inside a box, hidden until .reveal */
+  .label, .val, .sub, .err {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    fill: var(--ink);
+    text-anchor: middle;
+    opacity: 0;
+    transition: opacity .4s ease;
+  }
+  .val  { font-size: 30px; font-weight: 600; }
+  /* the return() boxes hold a small `{}`, sized like the Internal labels */
+  #closing .val text { font-size: 19px; }
+  .label{ font-size: 19px; }
+  .sub  { font-size: 19px; fill: var(--ink); font-weight: 600; }
+  /* a centered "Error" in an Internal box (the predicate slot a failed pull
+     feeds) — sized like the small `{}` in the .return() boxes */
+  .err  { font-size: 19px; font-weight: 600; }
+  /* "Error" in an Underlying/Result .val reads at that same smaller size.
+     Keyed off the val's content (.errval, set in buildVal), not the box's
+     transient .errored class — otherwise a back-step removes .errored and the
+     text snaps 19px -> 30px while it's still fading out. */
+  .val.errval text { font-size: 19px; }
+
+  /* ---- flatMap inner-iterator boxes ----
+     For flatMap the Internal stage maps each source value to an *iterator*.
+     When the mapper settles, its box is replaced by that inner iterator,
+     drawn as a short horizontal run of smaller (~2/3-size) promise boxes
+     (#fi0..#fi3 wrappers holding #m00..#m33). They're parked hidden (.spare)
+     for the map/filter sets and revealed (+shown) only when a flatMap step
+     unfolds an iterator; the value text inside them is scaled to match. */
+  .fmbox .val text { font-size: 19px; font-weight: 600; }
+  .fmbox .val .rline { font-size: 12px; }
+
+  /* a .val rendered as a two-line iterator record: `done: …` / `value: …` */
+  .rline { font-size: 15px; font-weight: 400; text-anchor: start; }
+  .rk { fill: var(--muted); }
+  .rv { fill: var(--ink); font-weight: 700; }
+
+  .divider {
+    stroke: var(--idle-stroke);
+    stroke-width: 1.5;
+    opacity: 0;
+    transition: opacity .4s ease;
+  }
+
+  /* arrows */
+  .arrow {
+    stroke: #475569;
+    stroke-width: 3;
+    fill: none;
+    marker-end: url(#head);
+    opacity: 0;
+    transition: opacity .45s ease;
+  }
+  #head path { fill: #475569; }
+
+  /* generic "now visible" — wins over the opacity:0 defaults above */
+  .reveal { opacity: 1; }
+
+  /* a discarded group fades out */
+  g { transition: opacity .4s ease; }
+  .gone { opacity: 0; }
+
+  /* vertical compaction: move whole groups so their contents ride along.
+     A box climbs one row (120 units) for each discarded box above it:
+     .up1, .up2, .up3. Spare slots are parked below the stack (.spare,
+     hidden) and a compaction spawns the next one into the freed bottom
+     slot (.shown), climbing with the same .upN classes thereafter. */
+  g[id] { transition: transform .4s ease, opacity .4s ease; }
+  .up1 { transform: translateY(-120px); }
+  .up2 { transform: translateY(-240px); }
+  .up3 { transform: translateY(-360px); }
+  .spare { opacity: 0; }   /* a not-yet-spawned spare slot, parked below the stack */
+  .shown { opacity: 1; }   /* ...that spare has been spawned into view */
+
+  /* ---- closing teardown band ----
+     A pair of return() columns that slides in above the main diagram. The
+     whole main group shifts down to make room; the band fades in (.shown).
+     The taller viewBox is set by render() whenever #main is shifted. */
+  #main.shifted { transform: translateY(180px); }
+  #closing { opacity: 0; }              /* hidden until a close shifts it into view... */
+  #closing.shown { opacity: 1; }        /* ...id-specificity override of the .shown default */
+  /* the inner.return() column belongs only to flatMap; #viz gets a .flatmap
+     class while that set is active (set in selectSet). */
+  .flatmap-only { display: none; }
+  #viz.flatmap .flatmap-only { display: inline; }
+
+  /* during multi-step jumps we suppress animation and snap to the target */
+  .no-anim * { transition: none !important; }
+
+  /* ---- animation selector ---- */
+  .tabs { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  .tab {
+    font: 500 14px ui-sans-serif, system-ui, sans-serif;
+    padding: 7px 16px;
+    border: 1px solid #d0d0d6;
+    background: #fff;
+    border-radius: 9px;
+    color: var(--muted);
+    cursor: pointer;
+    transition: background .15s, border-color .15s, color .15s;
+  }
+  .tab:hover { background: #f1f1f4; }
+  .tab.active {
+    font-weight: 700;
+    color: var(--ink);
+    border-color: var(--pending-stroke);
+    background: #eef2ff;
+  }
+  .tab.active:hover { background: #eef2ff; }
+
+  /* ---- per-animation description (below the tabs, above the stage) ----
+     Every animation's description is rendered at once and stacked into a
+     single CSS-grid cell, so the box's height is the *tallest* description.
+     Inactive ones stay laid out (visibility:hidden) but invisible; only the
+     active one is shown. No JS measurement needed — the grid does the sizing. */
+  .description {
+    width: min(960px, 100%);
+    display: grid;
+  }
+  .description > * {
+    grid-area: 1 / 1;        /* stack all descriptions into one cell */
+    visibility: hidden;      /* present for sizing, but not shown */
+    margin: 0;
+    padding: 12px 16px;
+    font-size: 14.5px;
+    line-height: 1.55;
+    color: #374151;
+    background: #fbfbfd;
+    border: 1px solid #e6e6ea;
+    border-radius: 10px;
+  }
+  .description > .active { visibility: visible; }
+  .description code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #ececed;
+    padding: 1px 5px;
+    border-radius: 5px;
+  }
+
+  /* ---- controls ---- */
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  button {
+    font: 500 15px ui-sans-serif, system-ui, sans-serif;
+    padding: 8px 18px;
+    border: 1px solid #d0d0d6;
+    background: #fff;
+    border-radius: 9px;
+    cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  button:hover:not(:disabled) { background: #f1f1f4; border-color: #b9b9c2; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .counter { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 14px; min-width: 64px; text-align: center; }
+
+  .caption {
+    width: min(960px, 100%);
+    min-height: 48px;
+    font-size: 15.5px;
+    line-height: 1.5;
+    color: #374151;
+    text-align: center;
+  }
+  .caption code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #ececed;
+    padding: 1px 5px;
+    border-radius: 5px;
+  }
+  .hint { color: var(--muted); font-size: 12.5px; }
+</style>
+</head>
+<body>
+  <h1>Concurrent <code>AsyncIterator.prototype.{<a id="sel-map" class="setlink">map</a>,<a id="sel-filter" class="setlink">filter</a>,<a id="sel-flatmap" class="setlink">flatMap</a>}</code></h1>
+
+  <div class="tabs" id="tabs"></div>
+
+  <div class="description" id="description"></div>
+
+  <div class="stage">
+    <svg id="viz" viewBox="0 0 900 560" role="img" aria-label="filter dataflow">
+      <defs>
+        <marker id="head" viewBox="0 0 10 10" refX="8" refY="5"
+                markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z"></path>
+        </marker>
+        <!-- faint crosshatch for a settled `done: true` (exhausted) box -->
+        <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse"
+                 patternTransform="rotate(45)">
+          <rect width="6" height="6" fill="#d6d6da"></rect>
+          <path d="M0 0 V6 M0 0 H6" stroke="#a9a9b3" stroke-width="0.9"></path>
+        </pattern>
+      </defs>
+
+      <!-- everything below shifts down as a unit when a close opens the
+           teardown band above (see #closing). -->
+      <g id="main">
+      <!-- column headers -->
+      <text class="header" id="hdr-underlying" x="160" y="50">Underlying</text>
+      <text class="header" x="450" y="50">Internal</text>
+      <text class="header" id="hdr-result" x="740" y="50">Result</text>
+      <!-- tombstones: shown (+reveal) when that iterator is closed. The x is
+           set in JS to sit just past the header's right edge. -->
+      <text class="tomb" id="tomb-underlying" y="50">🪦</text>
+      <text class="tomb" id="tomb-result" y="50">🪦</text>
+
+      <!-- arrows are generated per step from each step's `arrows` list -->
+      <g id="arrows"></g>
+
+      <!-- ===================== Underlying column ===================== -->
+      <g id="u0">
+        <rect class="box" x="95" y="85" width="130" height="90" rx="8"></rect>
+        <g class="val" data-cx="160" data-cy="130"></g>
+      </g>
+      <g id="u1">
+        <rect class="box" x="95" y="205" width="130" height="90" rx="8"></rect>
+        <g class="val" data-cx="160" data-cy="250"></g>
+      </g>
+      <g id="u2">
+        <rect class="box" x="95" y="325" width="130" height="90" rx="8"></rect>
+        <g class="val" data-cx="160" data-cy="370"></g>
+      </g>
+      <g id="u3">
+        <rect class="box" x="95" y="445" width="130" height="90" rx="8"></rect>
+        <g class="val" data-cx="160" data-cy="490"></g>
+      </g>
+
+      <!-- ===================== Internal column ===================== -->
+      <g id="i0">
+        <rect class="box" x="385" y="85" width="130" height="90" rx="8"></rect>
+        <text class="label" x="450" y="113" dominant-baseline="central"></text>
+        <line class="divider" x1="397" y1="131" x2="503" y2="131"></line>
+        <text class="sub" x="450" y="155" dominant-baseline="central"></text>
+        <text class="err" x="450" y="130" dominant-baseline="central"></text>
+      </g>
+      <g id="i1">
+        <rect class="box" x="385" y="205" width="130" height="90" rx="8"></rect>
+        <text class="label" x="450" y="233" dominant-baseline="central"></text>
+        <line class="divider" x1="397" y1="251" x2="503" y2="251"></line>
+        <text class="sub" x="450" y="275" dominant-baseline="central"></text>
+        <text class="err" x="450" y="250" dominant-baseline="central"></text>
+      </g>
+      <g id="i2">
+        <rect class="box" x="385" y="325" width="130" height="90" rx="8"></rect>
+        <text class="label" x="450" y="353" dominant-baseline="central"></text>
+        <line class="divider" x1="397" y1="371" x2="503" y2="371"></line>
+        <text class="sub" x="450" y="395" dominant-baseline="central"></text>
+        <text class="err" x="450" y="370" dominant-baseline="central"></text>
+      </g>
+      <g id="i3">
+        <rect class="box" x="385" y="445" width="130" height="90" rx="8"></rect>
+        <text class="label" x="450" y="473" dominant-baseline="central"></text>
+        <line class="divider" x1="397" y1="491" x2="503" y2="491"></line>
+        <text class="sub" x="450" y="515" dominant-baseline="central"></text>
+        <text class="err" x="450" y="490" dominant-baseline="central"></text>
+      </g>
+      <!-- spare slots parked below the stack; each compaction spawns the next
+           one (.shown) up into the freed bottom slot -->
+      <g id="i4" class="spare"><rect class="box" x="385" y="565" width="130" height="90" rx="8"></rect></g>
+      <g id="i5" class="spare"><rect class="box" x="385" y="685" width="130" height="90" rx="8"></rect></g>
+
+      <!-- =============== flatMap inner iterators (Internal) ===============
+           One wrapper per Internal row (#fi0..#fi3), each holding four small
+           promise boxes (#m{row}{col}) for the iterator the mapper returns.
+           Parked hidden (.spare) until a flatMap step reveals the wrapper
+           (+shown); map/filter never touch them. Same row centers as the main
+           columns (y = 130 + row*120), so arrows line up. -->
+      <g id="fi0" class="spare">
+        <g id="m00" class="fmbox"><rect class="box" x="261" y="101" width="84" height="58" rx="6"></rect><g class="val" data-cx="303" data-cy="130"></g></g>
+        <g id="m01" class="fmbox"><rect class="box" x="359" y="101" width="84" height="58" rx="6"></rect><g class="val" data-cx="401" data-cy="130"></g></g>
+        <g id="m02" class="fmbox"><rect class="box" x="457" y="101" width="84" height="58" rx="6"></rect><g class="val" data-cx="499" data-cy="130"></g></g>
+        <g id="m03" class="fmbox"><rect class="box" x="555" y="101" width="84" height="58" rx="6"></rect><g class="val" data-cx="597" data-cy="130"></g></g>
+      </g>
+      <g id="fi1" class="spare">
+        <g id="m10" class="fmbox"><rect class="box" x="261" y="221" width="84" height="58" rx="6"></rect><g class="val" data-cx="303" data-cy="250"></g></g>
+        <g id="m11" class="fmbox"><rect class="box" x="359" y="221" width="84" height="58" rx="6"></rect><g class="val" data-cx="401" data-cy="250"></g></g>
+        <g id="m12" class="fmbox"><rect class="box" x="457" y="221" width="84" height="58" rx="6"></rect><g class="val" data-cx="499" data-cy="250"></g></g>
+        <g id="m13" class="fmbox"><rect class="box" x="555" y="221" width="84" height="58" rx="6"></rect><g class="val" data-cx="597" data-cy="250"></g></g>
+      </g>
+      <g id="fi2" class="spare">
+        <g id="m20" class="fmbox"><rect class="box" x="261" y="341" width="84" height="58" rx="6"></rect><g class="val" data-cx="303" data-cy="370"></g></g>
+        <g id="m21" class="fmbox"><rect class="box" x="359" y="341" width="84" height="58" rx="6"></rect><g class="val" data-cx="401" data-cy="370"></g></g>
+        <g id="m22" class="fmbox"><rect class="box" x="457" y="341" width="84" height="58" rx="6"></rect><g class="val" data-cx="499" data-cy="370"></g></g>
+        <g id="m23" class="fmbox"><rect class="box" x="555" y="341" width="84" height="58" rx="6"></rect><g class="val" data-cx="597" data-cy="370"></g></g>
+      </g>
+      <g id="fi3" class="spare">
+        <g id="m30" class="fmbox"><rect class="box" x="261" y="461" width="84" height="58" rx="6"></rect><g class="val" data-cx="303" data-cy="490"></g></g>
+        <g id="m31" class="fmbox"><rect class="box" x="359" y="461" width="84" height="58" rx="6"></rect><g class="val" data-cx="401" data-cy="490"></g></g>
+        <g id="m32" class="fmbox"><rect class="box" x="457" y="461" width="84" height="58" rx="6"></rect><g class="val" data-cx="499" data-cy="490"></g></g>
+        <g id="m33" class="fmbox"><rect class="box" x="555" y="461" width="84" height="58" rx="6"></rect><g class="val" data-cx="597" data-cy="490"></g></g>
+      </g>
+
+      <!-- ===================== Result column ===================== -->
+      <g id="r0">
+        <rect class="box" x="675" y="85" width="130" height="90" rx="8"></rect>
+        <g class="val" data-cx="740" data-cy="130"></g>
+      </g>
+      <g id="r1">
+        <rect class="box" x="675" y="205" width="130" height="90" rx="8"></rect>
+        <g class="val" data-cx="740" data-cy="250"></g>
+      </g>
+      <g id="r2">
+        <rect class="box" x="675" y="325" width="130" height="90" rx="8"></rect>
+        <g class="val" data-cx="740" data-cy="370"></g>
+      </g>
+      <g id="r3">
+        <rect class="box" x="675" y="445" width="130" height="90" rx="8"></rect>
+        <g class="val" data-cx="740" data-cy="490"></g>
+      </g>
+      </g><!-- /#main -->
+
+      <!-- ===================== Closing teardown band =====================
+           underlying.return() (left) and result.return() (right), with an
+           inner.return() column in the middle that only applies to flatMap
+           (its inner iterator also gets closed) — that column is marked
+           .flatmap-only and stays hidden for the map/filter sets. Hidden
+           until a close shows the band. -->
+      <g id="closing">
+        <text class="header ret" x="160" y="35">underlying.return()</text>
+        <text class="header ret flatmap-only" x="450" y="35">inner.return()</text>
+        <text class="header ret" x="740" y="35">result.return()</text>
+        <g id="closing-arrows"></g>
+        <g id="c0">
+          <rect class="box" x="95" y="60" width="130" height="90" rx="8"></rect>
+          <g class="val" data-cx="160" data-cy="105"></g>
+        </g>
+        <g id="c2" class="flatmap-only">
+          <rect class="box" x="385" y="60" width="130" height="90" rx="8"></rect>
+          <g class="val" data-cx="450" data-cy="105"></g>
+        </g>
+        <g id="c1">
+          <rect class="box" x="675" y="60" width="130" height="90" rx="8"></rect>
+          <g class="val" data-cx="740" data-cy="105"></g>
+        </g>
+      </g>
+    </svg>
+  </div>
+
+  <div class="caption" id="caption"></div>
+
+  <div class="controls">
+    <button id="prev">◀ Prev</button>
+    <span class="counter"><span id="stepnum">0</span> / <span id="stepmax">0</span></span>
+    <button id="next">Next ▶</button>
+  </div>
+  <div class="hint">← / → (or space) to step · Home / End to jump</div>
+
+<script type="module">
+  // Animations are authored as *scenarios* (semantic event sequences — see
+  // scenarios/FORMAT.md) and compiled to step timelines at load time. The
+  // same scenario files run as tests against the implementation repo.
+  import { scenarioToAnimation } from './scenarios/scenario-to-animation.js';
+  import { mapScenarios } from './scenarios/map-scenarios.js';
+  import { filterScenarios } from './scenarios/filter-scenarios.js';
+  import { flatMapScenarios } from './scenarios/flatmap-scenarios.js';
+  const root = document.getElementById('viz');
+
+  // The selectable sets of animations, switched via the `{map,filter,flatMap}`
+  // links in the header. `animations` always points at the active set.
+  const animationSets = {
+    map: mapScenarios.map(scenarioToAnimation),
+    filter: filterScenarios.map(scenarioToAnimation),
+    flatMap: flatMapScenarios.map(scenarioToAnimation),
+  };
+  let animations = animationSets.map;
+
+  // every class the timeline can apply, so a render can wipe back to base
+  const STATE_CLASSES = ['pending', 'settled', 'voided', 'errored', 'reveal', 'gone', 'up1', 'up2', 'up3', 'shown', 'shifted'];
+  const RESET_SELECTOR = STATE_CLASSES.map(c => '.' + c).join(',');
+
+  let animIndex = 0;                              // which animation is selected
+  let step = 0;                                   // which step within it
+  let urlSync = false;                            // start writing the hash only after the first user switch
+  const stepsOf = () => animations[animIndex].steps;
+  const maxStep = () => stepsOf().length - 1;
+
+  const prevBtn = document.getElementById('prev');
+  const nextBtn = document.getElementById('next');
+  const stepnum = document.getElementById('stepnum');
+  const stepmax = document.getElementById('stepmax');
+  const caption = document.getElementById('caption');
+
+  // Populate the box text for an animation. `content` maps a box id to its
+  // text, keyed by text-class. `.label`/`.sub` (Internal column) are plain
+  // strings. `.val` (Underlying/Result) is a value-group whose contents we
+  // build: a bare string ("A"), or a record { done, value } shown as two
+  // lines. The steps still control *when* a box reveals (via .reveal).
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  function svgEl(tag, attrs) {
+    const el = document.createElementNS(SVGNS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    return el;
+  }
+  function recordLine(x, y, key, value, center) {
+    const t = svgEl('text', { class: 'rline', x, y, 'dominant-baseline': 'central' });
+    // a lone `done: …` line centers on x (size-independent, so it sits right in
+    // the smaller flatMap boxes too); the two-line record stays left-aligned so
+    // its `done:`/`value:` keys line up. Inline style beats the .rline CSS anchor.
+    if (center) t.style.textAnchor = 'middle';
+    const k = svgEl('tspan', { class: 'rk' }); k.textContent = key;
+    const v = svgEl('tspan', { class: 'rv' }); v.textContent = value;
+    t.append(k, v);
+    return t;
+  }
+  function buildVal(group, val) {
+    group.replaceChildren();
+    // the bare-string "Error" sentinel reads at the smaller .err size (see CSS)
+    group.classList.toggle('errval', val === 'Error');
+    // mark the box exhausted when the record is `done: true` (drives the hatch)
+    const box = group.parentNode && group.parentNode.querySelector('.box');
+    if (box) box.classList.toggle('done', !!(val && typeof val === 'object' && val.done === 'true'));
+    if (val == null) return;
+    const cx = +group.dataset.cx, cy = +group.dataset.cy;
+    if (typeof val === 'string') {
+      const t = svgEl('text', { x: cx, y: cy, 'dominant-baseline': 'central' });
+      t.textContent = val;
+      group.appendChild(t);
+    } else if (val.value == null) {
+      // a record with no value (e.g. done: true) — single centered line
+      group.appendChild(recordLine(cx, cy, 'done: ', val.done, true));
+    } else {
+      group.appendChild(recordLine(cx - 50, cy - 13, 'done: ',  val.done));
+      group.appendChild(recordLine(cx - 50, cy + 13, 'value: ', val.value));
+    }
+  }
+  function applyContent(content) {
+    root.querySelectorAll('.label, .sub, .err').forEach(t => { t.textContent = ''; });
+    root.querySelectorAll('.val').forEach(g => g.replaceChildren());
+    root.querySelectorAll('.box.done').forEach(b => b.classList.remove('done'));
+    for (const id in content) {
+      const spec = content[id];
+      for (const cls in spec) {
+        if (cls === 'val') {
+          const g = root.querySelector('#' + id + ' .val');
+          if (g) buildVal(g, spec.val);
+        } else {
+          const el = root.querySelector('#' + id + ' .' + cls);
+          if (el) el.textContent = spec[cls];
+        }
+      }
+    }
+  }
+
+  // ---- arrows ----------------------------------------------------------
+  // A step's `arrows` are [from, to] cell pairs like ['U3','I2'] — a column
+  // letter + 0-based row. Cells live in one of two bands: the main diagram
+  // (U/I/R) and the closing teardown row (L = underlying.return(), M =
+  // inner.return() (flatMap only), P = result.return(), always row 1). We
+  // generate one <path> per distinct pair
+  // an animation uses, then just toggle .reveal to flash the current step's.
+  // Geometry is computed from the box rectangles: an arrow leaves the source
+  // box's near edge and arrives at the target's near edge, so it works in
+  // either direction — the close flows P→L, then resolves back L→P.
+  const mainArrows    = document.getElementById('arrows');         // rides the shift (inside #main)
+  const closingArrows = document.getElementById('closing-arrows'); // in the static top band
+  const BAND = { U: 'main', I: 'main', R: 'main', L: 'closing', M: 'closing', P: 'closing' };
+  const COLX = { U: 95, I: 385, R: 675, L: 95, M: 385, P: 675 };   // left edge of each column's box
+  const BOX_W = 130;
+  const CLOSING_CY = 105;                                   // single return-row center
+  // A cell is normally a column letter + row ("U3"); for flatMap's inner boxes
+  // it may instead be an element selector ("#m00"), whose geometry we read off
+  // the actual box rectangle so an arrow can leave one of those smaller boxes.
+  function cellGeom(cell) {
+    if (cell[0] === '#') {
+      const bb = root.querySelector(cell + ' .box').getBBox();
+      return { left: bb.x, right: bb.x + bb.width, cy: bb.y + bb.height / 2 };
+    }
+    const x = COLX[cell[0]];
+    return {
+      left: x, right: x + BOX_W,
+      cy: BAND[cell[0]] === 'closing' ? CLOSING_CY : 130 + (+cell.slice(1)) * 120,
+    };
+  }
+  function arrowD([from, to]) {
+    const a = cellGeom(from), b = cellGeom(to);
+    const ltr = a.left < b.left;                       // left-to-right?
+    const startX = ltr ? a.right + 2 : a.left - 2;     // leave the near edge (+2 into the gap)
+    const endX   = ltr ? b.left - 2 : b.right + 2;     // arrive at the target's near edge
+    return 'M ' + startX + ' ' + a.cy + ' L ' + endX + ' ' + b.cy;
+  }
+  let arrowEls = {};   // "from>to" -> <path>, rebuilt per animation
+  function buildArrows(anim) {
+    mainArrows.textContent = '';
+    closingArrows.textContent = '';
+    arrowEls = {};
+    for (const st of anim.steps) {
+      for (const conn of (st.arrows || [])) {
+        const key = conn[0] + '>' + conn[1];
+        if (arrowEls[key]) continue;
+        const p = svgEl('path', { class: 'arrow', d: arrowD(conn) });
+        (BAND[conn[0][0]] === 'closing' ? closingArrows : mainArrows).appendChild(p);
+        arrowEls[key] = p;
+      }
+    }
+  }
+
+  function applyStep(ops) {
+    for (const [sel, spec] of ops) {
+      const els = root.querySelectorAll(sel);
+      for (const tok of spec.split(/\s+/)) {
+        const add = tok[0] === '+';
+        const cls = tok.slice(1);
+        els.forEach(el => el.classList.toggle(cls, add));
+      }
+    }
+  }
+
+  // Rebuild the diagram for the current `step` by wiping to base and
+  // replaying every diff up to it. Because this all happens in one
+  // synchronous turn (no layout read), the browser only paints the final
+  // state — so a single-step move transitions just that step's delta.
+  // For jumps we add .no-anim and force one reflow so it snaps instead.
+  function render(animate) {
+    if (!animate) root.classList.add('no-anim');
+
+    // wipe ALL state classes (every element, regardless of animation), then
+    // replay this animation's diffs up to the current step
+    root.querySelectorAll(RESET_SELECTOR)
+        .forEach(el => el.classList.remove(...STATE_CLASSES));
+    const steps = stepsOf();
+    for (let i = 1; i <= step; i++) applyStep(steps[i].ops);
+
+    // Arrows are momentary: show only the connections this step declares.
+    for (const key in arrowEls) arrowEls[key].classList.remove('reveal');
+    for (const conn of (steps[step].arrows || [])) {
+      const el = arrowEls[conn[0] + '>' + conn[1]];
+      if (el) el.classList.add('reveal');
+    }
+
+    // grow the canvas while the closing band is in view; shrink back otherwise
+    const shifted = document.getElementById('main').classList.contains('shifted');
+    root.setAttribute('viewBox', shifted ? '0 0 900 740' : '0 0 900 560');
+
+    if (!animate) {
+      void root.getBoundingClientRect();   // commit the snap, then re-enable
+      root.classList.remove('no-anim');
+    }
+
+    stepnum.textContent = step;
+    stepmax.textContent = maxStep();
+    caption.innerHTML = steps[step].caption;
+    prevBtn.disabled = step === 0;
+    nextBtn.disabled = step === maxStep();
+  }
+
+  function go(to) {
+    to = Math.max(0, Math.min(maxStep(), to));
+    const animate = Math.abs(to - step) === 1;   // single steps animate; jumps snap
+    step = to;
+    render(animate);
+  }
+
+  // ---- animation selector (tab buttons, generated from `animations`) ----
+  const tabsEl = document.getElementById('tabs');
+  const descEl = document.getElementById('description');
+  let descItems = [];   // one description <div> per animation, all stacked
+
+  // (Re)build the tabs + descriptions for the active set. Called once at
+  // startup and again whenever the header switches between map and filter.
+  function buildTabs() {
+    tabsEl.replaceChildren();
+    descEl.replaceChildren();
+    descItems = [];
+    animations.forEach((a, i) => {
+      const b = document.createElement('button');
+      b.className = 'tab';
+      b.textContent = a.label;
+      b.addEventListener('click', () => selectAnimation(i));
+      tabsEl.appendChild(b);
+
+      // Render every description up front so the grid can size to the tallest.
+      const d = document.createElement('div');
+      d.innerHTML = a.description || '';
+      descEl.appendChild(d);
+      descItems.push(d);
+    });
+  }
+
+  // Switch to a named set (map | filter), rebuild its tabs, and select one of
+  // its animations (the first by default). The header links reflect the set.
+  function selectSet(name, index = 0) {
+    animations = animationSets[name];
+    root.classList.toggle('flatmap', name === 'flatMap');   // gates the inner.return() column
+    setLinks.forEach((a, key) => a.classList.toggle('active', key === name));
+    buildTabs();
+    selectAnimation(index);
+  }
+
+  // Locate an animation by id across both sets (ids are unique across helpers,
+  // e.g. 'map-non-concurrent'). Returns { name, i } or null if unknown.
+  function locateAnim(id) {
+    for (const name in animationSets) {
+      const i = animationSets[name].findIndex(a => a.id === id);
+      if (i !== -1) return { name, i };
+    }
+    return null;
+  }
+
+  const setLinks = new Map([
+    ['map', document.getElementById('sel-map')],
+    ['filter', document.getElementById('sel-filter')],
+    ['flatMap', document.getElementById('sel-flatmap')],
+  ]);
+  setLinks.forEach((a, name) => a.addEventListener('click', () => selectSet(name)));
+
+  function selectAnimation(i) {
+    animIndex = i;
+    step = 0;
+    [...tabsEl.children].forEach((b, j) => b.classList.toggle('active', j === i));
+    descItems.forEach((d, j) => d.classList.toggle('active', j === i));
+    buildArrows(animations[i]);                  // generate this animation's arrow paths
+    applyContent(animations[i].content || {});   // load this animation's box text
+    render(false);   // render() wipes any state left from the prior animation
+    // Reflect the selection in the URL, in place (no new history entry, and
+    // replaceState doesn't scroll or fire hashchange). Suppressed for the
+    // initial paint so a fresh load doesn't immediately stamp the hash — we
+    // only start syncing once the user actually switches.
+    if (urlSync) history.replaceState(null, '', '#' + animations[i].id);
+  }
+
+  nextBtn.addEventListener('click', () => go(step + 1));
+  prevBtn.addEventListener('click', () => go(step - 1));
+
+  window.addEventListener('keydown', (e) => {
+    if (e.altKey) {
+      switch (e.key) {
+        case 'ArrowRight': case 'ArrowDown':
+          e.preventDefault();
+          selectAnimation((animIndex + 1) % animations.length);
+          return;
+        case 'ArrowLeft': case 'ArrowUp':
+          e.preventDefault();
+          selectAnimation((animIndex - 1 + animations.length) % animations.length);
+          return;
+      }
+      return;
+    }
+    switch (e.key) {
+      case 'ArrowRight': case 'ArrowDown': case ' ': case 'PageDown': case 'j':
+        e.preventDefault(); go(step + 1); break;
+      case 'ArrowLeft': case 'ArrowUp': case 'PageUp': case 'k':
+        e.preventDefault(); go(step - 1); break;
+      case 'Home': e.preventDefault(); go(0); break;
+      case 'End':  e.preventDefault(); go(maxStep()); break;
+    }
+  });
+
+  // Park each tombstone just past the right edge of its (centered) header,
+  // measured once now that the SVG is laid out.
+  function placeTombstone(tombId, headerId) {
+    const tomb = document.getElementById(tombId);
+    const header = document.getElementById(headerId);
+    if (!tomb || !header) return;
+    const bb = header.getBBox();
+    tomb.setAttribute('x', bb.x + bb.width + 6);
+  }
+  placeTombstone('tomb-underlying', 'hdr-underlying');
+  placeTombstone('tomb-result', 'hdr-result');
+
+  // Initial paint: jump to the animation named in the URL hash if it's a known
+  // id, otherwise fall back to the map set's first animation.
+  const initial = locateAnim(decodeURIComponent((location.hash || '').slice(1)));
+  if (initial) selectSet(initial.name, initial.i);
+  else selectSet('map');
+  urlSync = true;   // from here on, switches update the hash
+</script>
+</body>
+</html>

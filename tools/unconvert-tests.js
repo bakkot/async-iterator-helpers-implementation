@@ -201,11 +201,6 @@ function generateTest(scenario, cfg, tickComments) {
           body.push(`  ${ctlVar(ev.target)}.${method}(new Error(${lit(ev.error)}));`);
           break;
         }
-        case 'hold-close': {
-          if (ev.target !== 'source') ensureInner(ev.target);
-          body.push(`  ${ctlVar(ev.target)}.holdReturn();`);
-          break;
-        }
         case 'close-settled': {
           if ('error' in ev) body.push(`  ${ctlVar(ev.target)}.settleReturnThrow(${entry.heldIndex}, new Error(${lit(ev.error)}));`);
           else body.push(`  ${ctlVar(ev.target)}.settleReturn(${entry.heldIndex});`);

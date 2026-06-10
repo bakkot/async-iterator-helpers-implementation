@@ -2,8 +2,8 @@
 // ../../async-iterator-animations/scenarios/FORMAT.md). Runs the example
 // scenarios as real tests against the implementations, and compiles each one
 // to an animation, checking that the output only uses the class vocabulary
-// the player knows. The conversions of the actual animations/unit tests will
-// be exercised the same way once the conversion scripts exist.
+// the player knows. (The real suites are scenarios too: scenario-tests.js
+// and scenario-animation-check.js.)
 
 import { map } from '../map.js';
 import { filter } from '../filter.js';

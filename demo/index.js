@@ -309,8 +309,40 @@ function selectAnimation(i) {
 // also tells us which boxes to light and which arrows to draw.
 // ====================================================================
 const LETTERS = ['A', 'B', 'C', 'D'];
-const COMMIT_MS = 430;        // ~ the .4s box/value transition; input is gated this long
 const flush = async (rounds = 60) => { for (let i = 0; i < rounds; i++) await Promise.resolve(); };
+
+// Resolve once every CSS transition kicked off by the just-committed frame
+// has finished — so input is gated for exactly as long as the effects take
+// to play out (and not at all when nothing actually moved). We count
+// transitionrun against transitionend/cancel on the SVG (the events bubble);
+// if nothing has begun within a couple of frames there was nothing to wait
+// for. If the count never returns to zero, that's a bug (an unbalanced or
+// never-ending transition) — make it loud rather than silently recovering.
+function waitForTransitions() {
+  return new Promise((resolve) => {
+    let running = 0, started = false, done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      root.removeEventListener('transitionrun', onRun);
+      root.removeEventListener('transitionend', onEnd);
+      root.removeEventListener('transitioncancel', onEnd);
+      clearTimeout(stuck);
+      resolve();
+    };
+    const onRun = () => { running++; started = true; };
+    const onEnd = () => { if (started && --running <= 0) finish(); };
+    root.addEventListener('transitionrun', onRun);
+    root.addEventListener('transitionend', onEnd);
+    root.addEventListener('transitioncancel', onEnd);
+    requestAnimationFrame(() => requestAnimationFrame(() => { if (!started) finish(); }));
+    const stuck = setTimeout(() => {
+      if (done) return;
+      alert(`Interactive demo is stuck: ${running} transition(s) never finished after 4s. ` +
+        `This is a bug in the effect playout — check waitForTransitions/commitFrame.`);
+    }, 4000);
+  });
+}
 
 let ix = null;                // the live session ({ mapped, results, ... }) or null
 const stimuli = new Map();    // boxId -> { kind, deferred, row?, slot?, arg? } for settleable promises
@@ -462,7 +494,8 @@ async function userAction(perform) {
   await flush();
   commitFrame();
   updateButtons();
-  setTimeout(() => { if (ix) { ix.busy = false; updateButtons(); } }, COMMIT_MS);
+  await waitForTransitions();   // gate input for exactly the effects' duration
+  if (ix) { ix.busy = false; updateButtons(); }
 }
 
 function commitFrame() {
@@ -559,7 +592,7 @@ function buildInteractiveButtons() {
   }
 }
 
-const IX_INSTRUCTIONS = 'Driving the real <code>map</code> implementation. Click <code>.next()</code> to pull; settle a glowing promise yourself — <b>click</b> = value, <b>right-click</b> = done, <b>shift-click</b> = error.';
+const IX_INSTRUCTIONS = 'This drives the <i>real</i> <code>map</code> implementation — your clicks are the stimuli, and the boxes show what it actually does in response. Press <code>.next()</code> (or <code>result.return()</code>) to act as the consumer. Any promise the helper is waiting on wears a glowing dot — settle it yourself: <b>click</b> = a value, <b>right-click</b> = <code>done</code>, <b>shift-click</b> = an error. Effects from one tick animate together; input is paused while they play out.';
 const IX_COMING_SOON = (h) => `Interactive mode for <code>${h}</code> is coming soon — only <code>map</code> is wired up so far.`;
 
 function selectInteractive() {
@@ -567,28 +600,35 @@ function selectInteractive() {
   interactive = true;
   [...tabsEl.children].forEach((b) => b.classList.remove('active'));
   tabsEl.querySelector('.tab.interactive')?.classList.add('active');
-  descItems.forEach((d) => d.classList.remove('active'));
 
-  // Wipe to a clean diagram with the closing band permanently open.
-  root.classList.add('no-anim');
+  // Wipe to a clean diagram with the closing band permanently open and the
+  // box columns lowered (the `interactive` class drives both, via CSS).
+  root.classList.add('no-anim', 'interactive');
   root.querySelectorAll(RESET_SELECTOR).forEach((el) => el.classList.remove(...STATE_CLASSES));
   applyContent({});
   mainArrows.textContent = ''; closingArrows.textContent = ''; arrowEls = {};
   document.getElementById('main').classList.add('shifted');
   document.getElementById('closing').classList.add('shown');
-  root.setAttribute('viewBox', '0 0 900 740');
+  root.setAttribute('viewBox', '0 0 900 760');
   root.querySelectorAll('.stim-dot').forEach((d) => d.remove());
   stimuli.clear();
   buildInteractiveButtons();
   void root.getBoundingClientRect();
   root.classList.remove('no-anim');
 
-  // Hide the stepper; the live tab is click-driven.
+  // Hide the stepper (the live tab is click-driven) and show the usage
+  // instructions in the top description area rather than the bottom note.
   document.querySelector('.controls').style.display = 'none';
   document.querySelector('.hint').style.display = 'none';
+  caption.innerHTML = '';
+  descItems.forEach((d) => d.classList.remove('active'));
+  let ixDesc = descEl.querySelector('#ix-desc');
+  if (!ixDesc) { ixDesc = document.createElement('div'); ixDesc.id = 'ix-desc'; descEl.appendChild(ixDesc); }
+  ixDesc.innerHTML = currentSet === 'map' ? IX_INSTRUCTIONS : IX_COMING_SOON(currentSet);
+  ixDesc.classList.add('active');
 
-  if (currentSet === 'map') { makeSession(); caption.innerHTML = IX_INSTRUCTIONS; }
-  else { ix = null; caption.innerHTML = IX_COMING_SOON(currentSet); }
+  if (currentSet === 'map') makeSession();
+  else ix = null;
   updateButtons();
 
   if (urlSync) history.replaceState(null, '', '#' + currentSet + '-interactive');
@@ -599,6 +639,8 @@ function exitInteractive() {
   interactive = false;
   ix = null;
   stimuli.clear();
+  root.classList.remove('interactive');
+  descEl.querySelector('#ix-desc')?.remove();
   root.querySelectorAll('.stim-dot').forEach((d) => d.remove());
   root.querySelectorAll('.box.stimulus').forEach((b) => b.classList.remove('stimulus'));
   root.querySelector('#next-btn')?.remove();

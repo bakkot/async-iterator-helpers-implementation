@@ -40,8 +40,7 @@ const DEFAULT_FN_NAME = { map: 'fn', filter: 'pred', flatMap: 'm' };
 
 // Pull the `tests` array out of a test file by evaluating its body with the
 // imports stripped. The bodies only reference the identifiers we pass in.
-function extractTests(file) {
-  let src = readFileSync(join(root, file), 'utf8');
+function extractTests(src) {
   src = src.replace(/^import[^;]*;/gm, '');
   src = src.replace(/^\s*(await\s+)?runTests\([^;]*;\s*$/m, '');
   src += '\nreturn { tests, xfailed };';
@@ -291,24 +290,87 @@ function makeRecorder(helperKind) {
   return rec;
 }
 
+// ---------------------------------------------------------------- comments
+
+// The originals are slated for deletion, so their comments move into the
+// generated files. Comments are associated positionally:
+//   - a // run directly above a tests.push(...) line -> that scenario;
+//   - any other // run outside test bodies -> the next test (section
+//     dividers), or the file header if there is no earlier test;
+//   - a // run inside a test body -> the tick it sits in, i.e. the one whose
+//     expectLog is the next one below it (tick k = number of expectLog calls
+//     above the run).
+// Returns { header: [block], perTest: [{ lead: [block], ticks: Map<int, [block]> }] }
+// where a block is an array of '// …' strings.
+function extractComments(srcText) {
+  const lines = srcText.split('\n');
+  const isComment = (i) => /^\s*\/\//.test(lines[i]);
+
+  const pushLines = [];
+  lines.forEach((l, i) => { if (/^tests\.push\(\[/.test(l)) pushLines.push(i); });
+  const spans = pushLines.map((start) => {
+    let end = start;
+    while (end < lines.length && !/^\}\]\);/.test(lines[end])) end++;
+    return [start, end];
+  });
+
+  // contiguous full-line comment runs
+  const runs = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!isComment(i)) continue;
+    const start = i;
+    const text = [];
+    while (i < lines.length && isComment(i)) text.push(lines[i++].replace(/^\s*/, ''));
+    runs.push({ start, end: i - 1, text });
+  }
+
+  const header = [];
+  const perTest = pushLines.map(() => ({ lead: [], ticks: new Map() }));
+  for (const run of runs) {
+    const inBody = spans.findIndex(([s, e]) => run.start > s && run.end <= e);
+    if (inBody !== -1) {
+      const [s, e] = spans[inBody];
+      let tick = 0;
+      for (let i = s; i < run.start; i++) {
+        if (i <= e && /\bt\.expectLog\(/.test(lines[i])) tick++;
+      }
+      const m = perTest[inBody].ticks;
+      m.set(tick, [...(m.get(tick) ?? []), run.text]);
+      continue;
+    }
+    const next = pushLines.findIndex((p) => p > run.end);
+    if (next === -1) header.push(run.text); // trailing; nothing to attach to
+    else if (pushLines[next] === run.end + 1 || next > 0) perTest[next].lead.push(run.text);
+    else header.push(run.text); // before the first test and not directly above it
+  }
+  return { header, perTest };
+}
+
 // ---------------------------------------------------------------- serialize
 
 const q = (s) => JSON.stringify(s);
 function printEvent(ev) {
   return `{ ${Object.entries(ev).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join(', ')} }`;
 }
+const printBlocks = (out, blocks, indent) => {
+  for (const block of blocks ?? []) {
+    for (const line of block) out.push(`${indent}${line}`);
+  }
+};
 function printScenario(s) {
   const lines = [];
+  printBlocks(lines, s.comments, '  ');
   lines.push('  {');
   lines.push(`    id: ${q(s.id)},`);
   lines.push(`    helper: ${q(s.helper)},`);
   lines.push(`    label: ${q(s.label)},`);
   lines.push('    ticks: [');
-  for (const tick of s.ticks) {
+  s.ticks.forEach((tick, i) => {
+    printBlocks(lines, s.tickComments?.get(i), '      ');
     lines.push(`      { note: ${q(tick.note)}, steps: [ { events: [`);
     for (const ev of tick.steps[0].events) lines.push(`        ${printEvent(ev)},`);
     lines.push('      ] } ] },');
-  }
+  });
   lines.push('    ],');
   lines.push('  },');
   return lines.join('\n');
@@ -317,8 +379,11 @@ function printScenario(s) {
 // ---------------------------------------------------------------- main
 
 for (const cfg of CONFIGS) {
-  const make = extractTests(cfg.file);
-  const scenarios = [];
+  const srcText = readFileSync(join(root, cfg.file), 'utf8');
+  const make = extractTests(srcText);
+  const comments = extractComments(srcText);
+  const emitted = []; // printScenario output and skip-marker comments, in test order
+  let converted = 0;
   const skipped = [];
 
   // The body is evaluated once; the stand-ins dispatch to whichever
@@ -332,6 +397,7 @@ for (const cfg of CONFIGS) {
 
   let n = 0;
   for (const [name, fn] of tests) {
+    const meta = comments.perTest[n] ?? { lead: [], ticks: new Map() };
     n++;
     rec = makeRecorder(cfg.helper);
     try {
@@ -342,6 +408,14 @@ for (const cfg of CONFIGS) {
     }
     if (rec.problems.length > 0) {
       skipped.push([name, rec.problems]);
+      // keep the original's documentation even though the test itself
+      // cannot be represented
+      const marker = [
+        `  // [not converted: ${JSON.stringify(name)}]`,
+        ...rec.problems.map((p) => `  //   reason: ${p}`),
+      ];
+      printBlocks(marker, meta.lead, '  ');
+      emitted.push(marker.join('\n'));
       continue;
     }
     for (const note of rec.notes) console.log(`  note (${name}): ${note}`);
@@ -350,26 +424,32 @@ for (const cfg of CONFIGS) {
       helper: cfg.helper,
       label: name,
       ticks: rec.ticks,
+      comments: meta.lead,
+      tickComments: meta.ticks,
     };
     if (rec.fnSync.length > 0) {
       scenario.ticks[0]?.steps[0]?.events.unshift(...rec.fnSync);
     }
-    scenarios.push(scenario);
+    emitted.push(printScenario(scenario));
+    converted++;
   }
 
+  const headerLines = [];
+  printBlocks(headerLines, comments.header, '');
   const body = [
     `// GENERATED from ${cfg.file} (async-iterator-implementation) by tools/convert-tests.js.`,
     `// Rerunning the converter overwrites this file.`,
+    ...(headerLines.length > 0 ? ['', ...headerLines] : []),
     '',
     `export const ${cfg.exportName} = [`,
-    ...scenarios.map(printScenario),
+    ...emitted,
     '];',
     '',
   ].join('\n');
   mkdirSync(outDir, { recursive: true });
   writeFileSync(join(outDir, cfg.out), body);
 
-  console.log(`${cfg.file}: converted ${scenarios.length}/${tests.length} -> scenarios/${cfg.out}`);
+  console.log(`${cfg.file}: converted ${converted}/${tests.length} -> scenarios/${cfg.out}`);
   for (const [name, problems] of skipped) {
     console.log(`  skipped: ${name}`);
     for (const p of problems) console.log(`      ${p}`);

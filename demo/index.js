@@ -6,6 +6,8 @@ import { mapScenarios } from './scenarios/map-scenarios.js';
 import { filterScenarios } from './scenarios/filter-scenarios.js';
 import { flatMapScenarios } from './scenarios/flatmap-scenarios.js';
 import { map } from '../map.js';
+import { filter } from '../filter.js';
+import { flatMap } from '../flatMap.ts';
 const root = document.getElementById('viz');
 
 // The selectable sets of animations, switched via the `{map,filter,flatMap}`
@@ -302,13 +304,26 @@ function selectAnimation(i) {
 // user actions, which are naturally sequenced). Input is refused while a
 // tick's transition plays out.
 //
-// The diagram grid is fixed (rows 0..3), and `map` keeps a strict
-// one-to-one correspondence: the k-th `.next()` drives pull/​slot/​result
-// row k. We tag source values with letters (A,B,…) and mapper results
-// with `f`-prefixes (fA,…) so the data flowing through the real helper
-// also tells us which boxes to light and which arrows to draw.
+// The same driver backs all three helpers; the per-helper differences are
+// confined to `HELPERS` (the Internal label and what settling the `fn`
+// promise means) and a few branches in settleStimulus. We tag the k-th
+// underlying value with the letter LETTERS[k] (so a pull's box and any
+// predicate/mapper it feeds are identified by that row), `map` mapper
+// results with an `f`-prefix (fA,…), and `flatMap` inner values with the
+// lowercased source letter + column (a0, a1, …). That tagging lets the
+// data flowing through the real helper tell us which boxes to light and
+// which arrows to draw.
+//
+// Unlike `map`'s strict one-to-one, `filter` can *drop* a value (predicate
+// false): the Internal slot compacts away and the helper issues a fresh
+// underlying pull — exactly as the recorded scenarios show. `flatMap`
+// replaces a settled mapper box with the inner iterator it returned (a run
+// of smaller pull boxes) and flattens those. The visual bookkeeping for
+// compaction (gone slots / climbing rows / spare slots) mirrors
+// scenario-to-animation.js.
 // ====================================================================
 const LETTERS = ['A', 'B', 'C', 'D'];
+const MAX_ROWS = 4;   // the diagram has rows 0..3 in each column
 const flush = async (rounds = 60) => { for (let i = 0; i < rounds; i++) await Promise.resolve(); };
 
 // Resolve once every CSS transition kicked off by the just-committed frame
@@ -344,8 +359,24 @@ function waitForTransitions() {
   });
 }
 
-let ix = null;                // the live session ({ mapped, results, ... }) or null
-const stimuli = new Map();    // boxId -> { kind, deferred, row?, slot?, arg? } for settleable promises
+// Per-helper config: the Internal-box label prefix, the real constructor,
+// and whether the Internal box draws a label/value divider (flatMap's box is
+// replaced by an inner-iterator run, so it has no sub-value line).
+const HELPERS = {
+  map:     { fnDisplay: 'f',    make: map,     divider: true },
+  filter:  { fnDisplay: 'pred', make: filter,  divider: true },
+  flatMap: { fnDisplay: 'f',    make: flatMap, divider: false },
+};
+
+let ix = null;                // the live session, or null
+const stimuli = new Map();    // boxId -> { kind, deferred, row?, slot?, col?, arg? } for settleable promises
+
+// Visual bookkeeping carried across ticks (compaction, mirroring
+// scenario-to-animation.js). Reset per session. `map`/`flatMap` never
+// compact, so for them `gone` stays empty and visualRow is the identity.
+let vstate;
+function resetVState() { vstate = { gone: new Set(), upLevel: new Map(), sparesSpawned: 0 }; }
+const visualRow = (slot) => { let n = slot; for (const g of vstate.gone) if (g < slot) n--; return n; };
 
 // Per-tick frame: every effect is recorded here during the microtask
 // drain, then flushed to the DOM together by commitFrame().
@@ -359,17 +390,22 @@ function recPullPending(row, d) {
   fDotAdd.push({ id: `u${row}`, st: { kind: 'pull', deferred: d, row } });
 }
 function recFnPending(slot, arg, d) {
-  fOps.push([`#i${slot} .box`, '+pending'], [`#i${slot} .label`, '+reveal'], [`#i${slot} .divider`, '+reveal']);
-  fContent.push([`i${slot}`, 'label', `f(${arg})`]);
-  fArrows.push([`U${slot}`, `I${slot}`]);
+  fOps.push([`#i${slot} .box`, '+pending'], [`#i${slot} .label`, '+reveal']);
+  if (HELPERS[ix.helper].divider) fOps.push([`#i${slot} .divider`, '+reveal']);
+  fContent.push([`i${slot}`, 'label', `${HELPERS[ix.helper].fnDisplay}(${arg})`]);
+  fArrows.push([`U${slot}`, `I${visualRow(slot)}`]);
   fDotAdd.push({ id: `i${slot}`, st: { kind: 'fn', deferred: d, slot, arg } });
 }
-function recClosePending(d) {
-  fOps.push(['#c0 .box', '+pending']);
-  fContent.push(['c0', 'val', '{}']);
-  fDotAdd.push({ id: 'c0', st: { kind: 'return', deferred: d } });
+function recInnerPullPending(slot, col, d) {   // flatMap inner-iterator pull
+  fOps.push([`#m${slot}${col} .box`, '+pending']);
+  fDotAdd.push({ id: `m${slot}${col}`, st: { kind: 'inner', deferred: d, slot, col } });
 }
-function recReturnPending() {
+function recClosePending(box, kind, d) {       // box: 'c0' (underlying) | 'c2' (inner)
+  fOps.push([`#${box} .box`, '+pending']);
+  fContent.push([box, 'val', '{}']);
+  fDotAdd.push({ id: box, st: { kind, deferred: d } });
+}
+function recReturnPending() {                  // c1: the consumer's own result.return()
   fOps.push(['#c1 .box', '+pending']);
   fContent.push(['c1', 'val', '{}']);
 }
@@ -379,9 +415,19 @@ function recPullSettle(row, kind) {           // kind: 'value' | 'done' | 'error
   fContent.push([`u${row}`, 'val', kind === 'value' ? LETTERS[row] : kind === 'done' ? { done: 'true' } : 'Error']);
   fDotRemove.push(`u${row}`);
 }
-function recFnSettleValue(slot, mapped) {
+function recInnerSettle(slot, col, kind, token) {
+  const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
+  fOps.push([`#m${slot}${col} .box`, spec], [`#m${slot}${col} .val`, '+reveal']);
+  fContent.push([`m${slot}${col}`, 'val', kind === 'value' ? token : kind === 'done' ? { done: 'true' } : 'Error']);
+  fDotRemove.push(`m${slot}${col}`);
+}
+function recFnSettleValue(slot, sub) {        // map: mapped value; filter: 'true'
   fOps.push([`#i${slot} .box`, '-pending +settled'], [`#i${slot} .sub`, '+reveal']);
-  fContent.push([`i${slot}`, 'sub', mapped]);
+  fContent.push([`i${slot}`, 'sub', sub]);
+  fDotRemove.push(`i${slot}`);
+}
+function recFnSettleIterator(slot) {          // flatMap: box becomes the inner run
+  fOps.push([`#i${slot} .box`, '-pending'], [`#i${slot}`, '+gone'], [`#fi${slot}`, '+shown']);
   fDotRemove.push(`i${slot}`);
 }
 function recFnSettleError(slot) {
@@ -390,20 +436,53 @@ function recFnSettleError(slot) {
   fContent.push([`i${slot}`, 'err', 'Error']);
   fDotRemove.push(`i${slot}`);
 }
+// A filter drop (predicate false) or exhaustion-discard: the Internal slot
+// fades out, later slots climb, and a parked spare spawns into the freed
+// bottom row — exactly the compaction the recorded scenarios animate.
+function recCompact(slot) {
+  vstate.gone.add(slot);
+  fOps.push([`#i${slot}`, '+gone']);
+  fDotRemove.push(`i${slot}`);
+  const lastEl = 3 + vstate.sparesSpawned;
+  for (let idx = slot + 1; idx <= lastEl; idx++) {
+    if (vstate.gone.has(idx)) continue;
+    const newUp = [...vstate.gone].filter((g) => g < idx).length;
+    const oldUp = vstate.upLevel.get(idx) ?? 0;
+    if (newUp !== oldUp) {
+      fOps.push([`#i${idx}`, `${oldUp > 0 ? `-up${oldUp} ` : ''}+up${newUp}`]);
+      vstate.upLevel.set(idx, newUp);
+    }
+  }
+  if (vstate.sparesSpawned < 2) {
+    const spare = 4 + vstate.sparesSpawned++;
+    fOps.push([`#i${spare}`, `+up${vstate.gone.size} +shown`]);
+    vstate.upLevel.set(spare, vstate.gone.size);
+  }
+}
 function recResultSettle(row, kind, value) {  // kind: 'value' | 'done' | 'error'
   const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
   fOps.push([`#r${row} .box`, spec], [`#r${row} .val`, '+reveal']);
   fContent.push([`r${row}`, 'val', kind === 'value' ? value : kind === 'done' ? { done: 'true' } : 'Error']);
   if (kind === 'value') {
-    const slot = ix.mappedToSlot.get(value);
-    if (slot != null) fArrows.push([`I${slot}`, `R${row}`]);
+    const from = deliveryArrowFrom(value);
+    if (from) fArrows.push([from, `R${row}`]);
   }
 }
-function recCloseSettle(kind) {               // c0 (underlying .return()): 'done' | 'error'
+// The cell a delivered value flowed from, for the Internal/inner -> Result
+// arrow: a predicate/mapper slot (map, filter) or an inner pull box (flatMap).
+function deliveryArrowFrom(value) {
+  if (ix.helper === 'flatMap') {
+    const cell = ix.innerValueToCell.get(value);
+    return cell ? `#m${cell.slot}${cell.col}` : null;
+  }
+  const slot = ix.valueToSlot.get(value);
+  return slot != null ? `I${visualRow(slot)}` : null;
+}
+function recCloseSettle(box, kind) {          // c0 / c2: 'done' | 'error'
   const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
-  fOps.push(['#c0 .box', spec], ['#c0 .val', '+reveal']);
-  if (kind === 'error') fContent.push(['c0', 'val', 'Error']);
-  fDotRemove.push('c0');
+  fOps.push([`#${box} .box`, spec], [`#${box} .val`, '+reveal']);
+  if (kind === 'error') fContent.push([box, 'val', 'Error']);
+  fDotRemove.push(box);
 }
 function recReturnSettle(kind) {              // c1 (result .return()): 'done' | 'error'
   const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
@@ -411,18 +490,30 @@ function recReturnSettle(kind) {              // c1 (result .return()): 'done' |
   if (kind === 'error') fContent.push(['c1', 'val', 'Error']);
 }
 
-// ---- controlled source + fn that record as the helper drives them ----
-function makeSession() {
-  const sourceIterator = {
+// ---- controlled source / fn / inner iterators that record as the helper
+// drives them. The user settles every promise these hand out. ----
+function makeSession(helper) {
+  resetVState();
+  ix = {
+    helper,
+    obj: null,
+    results: [],                  // one per consumer .next(), in call order
+    pullCount: 0,                 // underlying rows handed out (u0..u3)
+    valueToSlot: new Map(),       // map: mapped value, filter: source value -> Internal slot
+    innerValueToCell: new Map(),  // flatMap: inner token -> { slot, col }
+    inners: new Map(),            // flatMap: Internal slot -> { pullCount }
+    busy: false,
+  };
+  const source = {
     next() {
       const row = ix.pullCount++;
       const d = Promise.withResolvers();
-      recPullPending(row, d);
+      if (row < MAX_ROWS) recPullPending(row, d);   // beyond the grid: still drive, just unshown
       return d.promise;
     },
     return() {
       const d = Promise.withResolvers();
-      recClosePending(d);
+      recClosePending('c0', 'return', d);
       return d.promise;
     },
     [Symbol.asyncIterator]() { return this; },
@@ -433,20 +524,35 @@ function makeSession() {
     recFnPending(slot, value, d);
     return d.promise;
   };
-  ix = {
-    mapped: map(sourceIterator, fn),
-    results: [],                 // one per consumer .next(), in call order
-    mappedToSlot: new Map(),     // mapper result value -> Internal slot (for I->R arrows)
-    pullCount: 0,
-    busy: false,
-  };
+  ix.obj = HELPERS[helper].make(source, fn);
 }
 
-// ---- the three user-action entry points ----
+// A controlled inner iterator (flatMap), produced when the user settles a
+// mapper promise with a value. Its pulls land in the #m<slot><col> boxes.
+function makeInner(slot) {
+  ix.inners.set(slot, { pullCount: 0 });
+  const inner = {
+    next() {
+      const col = ix.inners.get(slot).pullCount++;
+      const d = Promise.withResolvers();
+      if (col < MAX_ROWS) recInnerPullPending(slot, col, d);
+      return d.promise;
+    },
+    return() {
+      const d = Promise.withResolvers();
+      recClosePending('c2', 'inner-return', d);
+      return d.promise;
+    },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  return inner;
+}
+
+// ---- the user-action entry points ----
 function doNext() {
   const row = ix.results.length;
   recResultPending(row);
-  const p = ix.mapped.next();   // synchronously issues the underlying pull (recorded above)
+  const p = ix.obj.next();   // synchronously issues whatever pull the helper needs
   ix.results.push(p);
   p.then(
     (v) => recResultSettle(row, v.done ? 'done' : 'value', v.value),
@@ -455,30 +561,52 @@ function doNext() {
 }
 function doReturn() {
   recReturnPending();
-  ix.mapped.return().then(() => recReturnSettle('done'), () => recReturnSettle('error'));
+  ix.obj.return().then(() => recReturnSettle('done'), () => recReturnSettle('error'));
 }
 function settleStimulus(id, type) {           // type: 'value' | 'done' | 'error'
   const st = stimuli.get(id);
   if (!st) return;
-  if (st.kind === 'pull') {
-    recPullSettle(st.row, type);
-    if (type === 'value') st.deferred.resolve({ value: LETTERS[st.row], done: false });
-    else if (type === 'done') st.deferred.resolve({ value: undefined, done: true });
-    else st.deferred.reject(new Error('boom'));
-  } else if (st.kind === 'fn') {
-    if (type === 'done') return;              // mapper result: right-click does nothing
-    if (type === 'value') {
-      const mapped = 'f' + st.arg;
-      ix.mappedToSlot.set(mapped, st.slot);
-      recFnSettleValue(st.slot, mapped);
-      st.deferred.resolve(mapped);
-    } else {
-      recFnSettleError(st.slot);
-      st.deferred.reject(new Error('boom'));
+  switch (st.kind) {
+    case 'pull':
+      recPullSettle(st.row, type);
+      if (type === 'value') st.deferred.resolve({ value: LETTERS[st.row], done: false });
+      else if (type === 'done') st.deferred.resolve({ value: undefined, done: true });
+      else st.deferred.reject(new Error('boom'));
+      break;
+    case 'fn':
+      settleFn(st, type);
+      break;
+    case 'inner': {
+      const token = LETTERS[st.slot].toLowerCase() + st.col;
+      recInnerSettle(st.slot, st.col, type, token);
+      if (type === 'value') { ix.innerValueToCell.set(token, { slot: st.slot, col: st.col }); st.deferred.resolve({ value: token, done: false }); }
+      else if (type === 'done') st.deferred.resolve({ value: undefined, done: true });
+      else st.deferred.reject(new Error('boom'));
+      break;
     }
-  } else {                                    // kind 'return' — underlying .return()
-    if (type === 'error') { recCloseSettle('error'); st.deferred.reject(new Error('boom')); }
-    else { recCloseSettle('done'); st.deferred.resolve({ value: undefined, done: true }); }
+    case 'return':        // underlying .return() (c0)
+    case 'inner-return': {// inner-iterator .return() (c2)
+      const box = st.kind === 'return' ? 'c0' : 'c2';
+      if (type === 'error') { recCloseSettle(box, 'error'); st.deferred.reject(new Error('boom')); }
+      else { recCloseSettle(box, 'done'); st.deferred.resolve({ value: undefined, done: true }); }
+      break;
+    }
+  }
+}
+// Settling a mapper/predicate promise means different things per helper.
+function settleFn(st, type) {
+  if (ix.helper === 'map') {
+    if (type === 'done') return;              // a mapped value can't be `done`
+    if (type === 'value') { const m = 'f' + st.arg; ix.valueToSlot.set(m, st.slot); recFnSettleValue(st.slot, m); st.deferred.resolve(m); }
+    else { recFnSettleError(st.slot); st.deferred.reject(new Error('boom')); }
+  } else if (ix.helper === 'filter') {
+    if (type === 'value') { ix.valueToSlot.set(st.arg, st.slot); recFnSettleValue(st.slot, 'true'); st.deferred.resolve(true); }
+    else if (type === 'done') { recCompact(st.slot); st.deferred.resolve(false); }   // predicate false -> drop + re-pull
+    else { recFnSettleError(st.slot); st.deferred.reject(new Error('boom')); }
+  } else {                                    // flatMap
+    if (type === 'done') return;              // a mapper iterator can't be `done`
+    if (type === 'value') { recFnSettleIterator(st.slot); st.deferred.resolve(makeInner(st.slot)); }
+    else { recFnSettleError(st.slot); st.deferred.reject(new Error('boom')); }
   }
 }
 
@@ -553,7 +681,9 @@ root.addEventListener('contextmenu', (e) => {
   const st = g && stimuli.get(g.id);
   if (!st) return;
   e.preventDefault();                       // suppress the context menu over any settleable box
-  if (st.kind === 'fn') return;             // right-click does nothing on a mapper result
+  // right-click is `done`/`false`. A map/flatMap mapper result can't be done,
+  // so right-clicking it does nothing; a filter predicate settles to `false`.
+  if (st.kind === 'fn' && ix.helper !== 'filter') return;
   if (!ix.busy) userAction(() => settleStimulus(g.id, 'done'));
 });
 
@@ -592,8 +722,20 @@ function buildInteractiveButtons() {
   }
 }
 
-const IX_INSTRUCTIONS = 'This drives the <i>real</i> <code>map</code> implementation — your clicks are the stimuli, and the boxes show what it actually does in response. Press <code>.next()</code> (or <code>result.return()</code>) to act as the consumer. Any promise the helper is waiting on wears a glowing dot — settle it yourself: <b>click</b> = a value, <b>right-click</b> = <code>done</code>, <b>shift-click</b> = an error. Effects from one tick animate together; input is paused while they play out.';
-const IX_COMING_SOON = (h) => `Interactive mode for <code>${h}</code> is coming soon — only <code>map</code> is wired up so far.`;
+// The usage blurb shown at the top of the live tab. The general controls are
+// the same for every helper; only the per-element note (what the Internal
+// promise is, and what right-clicking it does) changes.
+const IX_FN_NOTE = {
+  map: 'A mapper promise (<code>f(x)</code>) takes only a value or an error — right-clicking it does nothing.',
+  filter: 'On a predicate (<code>pred(x)</code>), <b>click</b> = <code>true</code> (keep) and <b>right-click</b> = <code>false</code> (drop, then re-pull).',
+  flatMap: 'Settling a mapper (<code>f(x)</code>) with a value hands back an inner iterator, drawn as its own run of pull boxes; right-clicking it does nothing.',
+};
+const IX_INSTRUCTIONS = (h) =>
+  `This drives the <i>real</i> <code>${h}</code> implementation — your clicks are the stimuli, and the boxes show what it actually does in response. ` +
+  'Press <code>.next()</code> (or <code>result.return()</code>) to act as the consumer. Any promise the helper is waiting on wears a glowing dot — settle it yourself: ' +
+  '<b>click</b> = a value, <b>right-click</b> = <code>done</code>, <b>shift-click</b> = an error. ' +
+  IX_FN_NOTE[h] +
+  ' Effects from one tick animate together; input is paused while they play out.';
 
 function selectInteractive() {
   exitInteractive();
@@ -624,11 +766,10 @@ function selectInteractive() {
   descItems.forEach((d) => d.classList.remove('active'));
   let ixDesc = descEl.querySelector('#ix-desc');
   if (!ixDesc) { ixDesc = document.createElement('div'); ixDesc.id = 'ix-desc'; descEl.appendChild(ixDesc); }
-  ixDesc.innerHTML = currentSet === 'map' ? IX_INSTRUCTIONS : IX_COMING_SOON(currentSet);
+  ixDesc.innerHTML = IX_INSTRUCTIONS(currentSet);
   ixDesc.classList.add('active');
 
-  if (currentSet === 'map') makeSession();
-  else ix = null;
+  makeSession(currentSet);
   updateButtons();
 
   if (urlSync) history.replaceState(null, '', '#' + currentSet + '-interactive');

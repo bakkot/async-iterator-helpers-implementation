@@ -356,8 +356,12 @@
 
   /* ---- Interactive (live) mode ---- */
   /* In the live demo the three box columns are pushed down to clear the
-     .next() button that sits under the Result header. */
-  #viz.interactive #main > g:not(#next-btn) { transform: translateY(20px); }
+     .next() button that sits under the Result header. This uses the
+     independent `translate` property (not `transform`) on purpose: filter's
+     compaction climb is a `transform: translateY(...)` (.upN) on the very
+     same Internal-column groups, and the two must compose rather than one
+     overriding the other. */
+  #viz.interactive #main > g:not(#next-btn) { translate: 0 20px; }
 
   /* Decorative/hidden overlays must not steal clicks meant for a box: arrows
      ride over the boxes, and the parked flatMap inner-iterator rows (.spare)

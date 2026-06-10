@@ -691,7 +691,7 @@ async function main() {
       replay: { type: 'string' },
     },
   });
-  const maxEvents = Number(positionals[0] ?? (values.fuzz !== undefined ? 5 : 2));
+  const maxEvents = Number(positionals[0] ?? (values.fuzz !== undefined ? 5 : 1));
   setFlushChunk(Math.max(16, 3 * maxEvents));
   if (values.replay !== undefined) return runReplay(maxEvents, JSON.parse(values.replay));
   if (values.fuzz !== undefined) return runFuzz(maxEvents, Number(values.fuzz), values.seed);

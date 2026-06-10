@@ -1,3 +1,5 @@
+// TODO: actual fuzzing support, like the other fuzzers
+
 // Bounded-exhaustive differential test for the concurrent `map`.
 //
 // Idea: enumerate every distinct *schedule* of up to N consumer calls

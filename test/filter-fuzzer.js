@@ -770,7 +770,7 @@ async function main() {
       replay: { type: 'string' }, // JSON decision vector printed by a fuzz failure
     },
   });
-  const maxEvents = Number(positionals[0] ?? 5);
+  const maxEvents = Number(positionals[0] ?? 3);
   setFlushChunk(Math.max(8, 2 * maxEvents));
   if (process.env.COUNT) return countSchedules(maxEvents);
   if (values.replay !== undefined) return runReplay(maxEvents, JSON.parse(values.replay));

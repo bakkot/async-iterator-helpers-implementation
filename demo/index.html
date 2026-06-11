@@ -478,9 +478,23 @@
         <text class="err" x="450" y="490" dominant-baseline="central"></text>
       </g>
       <!-- spare slots parked below the stack; each compaction spawns the next
-           one (.shown) up into the freed bottom slot -->
-      <g id="i4" class="spare"><rect class="box" x="385" y="565" width="130" height="90" rx="8"></rect></g>
-      <g id="i5" class="spare"><rect class="box" x="385" y="685" width="130" height="90" rx="8"></rect></g>
+           one (.shown) up into the freed bottom slot. Structured like i0-i3
+           because the Interactive tab can run mappers/predicates in them
+           (and it materializes i6+ dynamically with this same shape). -->
+      <g id="i4" class="spare">
+        <rect class="box" x="385" y="565" width="130" height="90" rx="8"></rect>
+        <text class="label" x="450" y="593" dominant-baseline="central"></text>
+        <line class="divider" x1="397" y1="611" x2="503" y2="611"></line>
+        <text class="sub" x="450" y="635" dominant-baseline="central"></text>
+        <text class="err" x="450" y="610" dominant-baseline="central"></text>
+      </g>
+      <g id="i5" class="spare">
+        <rect class="box" x="385" y="685" width="130" height="90" rx="8"></rect>
+        <text class="label" x="450" y="713" dominant-baseline="central"></text>
+        <line class="divider" x1="397" y1="731" x2="503" y2="731"></line>
+        <text class="sub" x="450" y="755" dominant-baseline="central"></text>
+        <text class="err" x="450" y="730" dominant-baseline="central"></text>
+      </g>
 
       <!-- =============== flatMap inner iterators (Internal) ===============
            One wrapper per Internal row (#fi0..#fi3), each holding four small

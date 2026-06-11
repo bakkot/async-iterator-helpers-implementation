@@ -19,9 +19,11 @@ const animationSets = {
 };
 let animations = animationSets.map;
 
-// every class the timeline can apply, so a render can wipe back to base
+// every class the timeline can apply, so a render can wipe back to base.
+// upN classes past up3 are minted on demand (ensureUpClass) when the live
+// tab compacts past the static rows; they join this list as they're made.
 const STATE_CLASSES = ['pending', 'settled', 'voided', 'errored', 'reveal', 'gone', 'up1', 'up2', 'up3', 'shown', 'shifted'];
-const RESET_SELECTOR = STATE_CLASSES.map(c => '.' + c).join(',');
+let RESET_SELECTOR = STATE_CLASSES.map(c => '.' + c).join(',');
 
 let animIndex = 0;                              // which animation is selected
 let step = 0;                                   // which step within it
@@ -307,7 +309,7 @@ function selectAnimation(i) {
 // The same driver backs all three helpers; the per-helper differences are
 // confined to `HELPERS` (the Internal label and what settling the `fn`
 // promise means) and a few branches in settleStimulus. We tag the k-th
-// underlying value with the letter LETTERS[k] (so a pull's box and any
+// underlying value with letterFor(k) (A..Z, then AA, AB, …; so a pull's box and any
 // predicate/mapper it feeds are identified by that row), `map` mapper
 // results with an `f`-prefix (fA,…), and `flatMap` inner values with the
 // lowercased source letter + column (a0, a1, …). That tagging lets the
@@ -322,8 +324,17 @@ function selectAnimation(i) {
 // compaction (gone slots / climbing rows / spare slots) mirrors
 // scenario-to-animation.js.
 // ====================================================================
-const LETTERS = ['A', 'B', 'C', 'D'];
-const MAX_ROWS = 4;   // the diagram has rows 0..3 in each column
+// Underlying values are spreadsheet-style letters: A..Z, then AA, AB, …
+function letterFor(n) {
+  let s = '';
+  for (n++; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s;
+  return s;
+}
+function letterIndex(s) {
+  let n = 0;
+  for (const c of s) n = n * 26 + (c.charCodeAt(0) - 64);
+  return n - 1;
+}
 const flush = async (rounds = 60) => { for (let i = 0; i < rounds; i++) await Promise.resolve(); };
 
 // Resolve once every CSS transition kicked off by the just-committed frame
@@ -374,8 +385,10 @@ const stimuli = new Map();    // boxId -> { kind, deferred, row?, slot?, col?, a
 // Visual bookkeeping carried across ticks (compaction, mirroring
 // scenario-to-animation.js). Reset per session. `map`/`flatMap` never
 // compact, so for them `gone` stays empty and visualRow is the identity.
+// `maxSlot` is the highest Internal slot materialized so far (the static
+// markup provides 0..5; ensureSlot mints more as the session needs them).
 let vstate;
-function resetVState() { vstate = { gone: new Set(), upLevel: new Map(), sparesSpawned: 0 }; }
+function resetVState() { vstate = { gone: new Set(), upLevel: new Map(), maxSlot: 3 }; }
 const visualRow = (slot) => { let n = slot; for (const g of vstate.gone) if (g < slot) n--; return n; };
 
 // Per-tick frame: every effect is recorded here during the microtask
@@ -383,13 +396,125 @@ const visualRow = (slot) => { let n = slot; for (const g of vstate.gone) if (g <
 let fOps, fContent, fArrows, fDotAdd, fDotRemove;
 function resetFrame() { fOps = []; fContent = []; fArrows = []; fDotAdd = []; fDotRemove = []; }
 
-// ---- recorders (called as the helper reacts; pure data, no DOM) ----
-function recResultPending(row) { fOps.push([`#r${row} .box`, '+pending']); }
+// ---- dynamic geometry --------------------------------------------------
+// The static markup bakes in four rows per column (and four inner-iterator
+// columns per flatMap row); the live tab materializes more as the user
+// drives past them. Everything minted here is tagged .dyn and torn down by
+// exitInteractive. New elements are created during the microtask drain —
+// nothing paints until the tick's commit, so they appear with that frame.
+
+// .upN transform rules exist in the stylesheet for N <= 3; mint the rest.
+const dynStyle = document.head.appendChild(document.createElement('style'));
+let maxUpRule = 3;
+function ensureUpClass(n) {
+  while (maxUpRule < n) {
+    maxUpRule++;
+    dynStyle.sheet.insertRule(`.up${maxUpRule} { transform: translateY(-${maxUpRule * 120}px); }`);
+    STATE_CLASSES.push(`up${maxUpRule}`);
+    RESET_SELECTOR = STATE_CLASSES.map(c => '.' + c).join(',');
+  }
+}
+
+// Grow the canvas to fit `rows` grid rows (closing band + shifted main +
+// the interactive 20px button clearance + a 25px bottom margin).
+function growViewBox(rows) {
+  if (rows <= ix.vRows) return;
+  ix.vRows = rows;
+  root.setAttribute('viewBox', `0 0 900 ${400 + (rows - 1) * 120}`);
+}
+
+function makeValCol(id, x, row) {   // an Underlying/Result-style box group
+  const g = svgEl('g', { id, class: 'dyn' });
+  g.appendChild(svgEl('rect', { class: 'box', x, y: 85 + row * 120, width: 130, height: 90, rx: 8 }));
+  g.appendChild(svgEl('g', { class: 'val', 'data-cx': x + 65, 'data-cy': 130 + row * 120 }));
+  document.getElementById('main').appendChild(g);
+}
+function ensureURow(row) {
+  if (!root.querySelector(`#u${row}`)) makeValCol(`u${row}`, 95, row);
+  growViewBox(row + 1);
+}
+function ensureRRow(row) {
+  if (!root.querySelector(`#r${row}`)) makeValCol(`r${row}`, 675, row);
+  growViewBox(row + 1);
+}
+// Materialize Internal slots up to `slot`. Like the static spares, each
+// parks at its own base row and is shown climbed to the stack's current
+// bottom (its base row minus one per compacted slot above it).
+function ensureSlot(slot) {
+  while (vstate.maxSlot < slot) {
+    const s = ++vstate.maxSlot;
+    if (!root.querySelector(`#i${s}`)) {
+      const y = 85 + s * 120;
+      const g = svgEl('g', { id: `i${s}`, class: 'spare dyn' });
+      g.appendChild(svgEl('rect', { class: 'box', x: 385, y, width: 130, height: 90, rx: 8 }));
+      g.appendChild(svgEl('text', { class: 'label', x: 450, y: y + 28, 'dominant-baseline': 'central' }));
+      g.appendChild(svgEl('line', { class: 'divider', x1: 397, y1: y + 46, x2: 503, y2: y + 46 }));
+      g.appendChild(svgEl('text', { class: 'sub', x: 450, y: y + 70, 'dominant-baseline': 'central' }));
+      g.appendChild(svgEl('text', { class: 'err', x: 450, y: y + 45, 'dominant-baseline': 'central' }));
+      document.getElementById('main').appendChild(g);
+    }
+    const up = vstate.gone.size;
+    ensureUpClass(up);
+    fOps.push([`#i${s}`, `${up > 0 ? `+up${up} ` : ''}+shown`]);
+    vstate.upLevel.set(s, up);
+    growViewBox(s - up + 1);
+  }
+}
+// flatMap inner rows: four columns fit at the native box size; a fifth and
+// beyond squeeze the whole run into the same horizontal span.
+const FI_LEFT = 261, FI_RIGHT = 639, FI_GAP = 14;
+function fmBox(slot, col) {
+  const m = svgEl('g', { id: `m${slot}${col}`, class: 'fmbox' });
+  m.appendChild(svgEl('rect', { class: 'box', y: 101 + slot * 120, height: 58, rx: 6 }));
+  m.appendChild(svgEl('g', { class: 'val', 'data-cy': 130 + slot * 120 }));
+  return m;
+}
+function layoutInnerRow(slot, cols) {
+  const w = (FI_RIGHT - FI_LEFT - FI_GAP * (cols - 1)) / cols;
+  for (let col = 0; col < cols; col++) {
+    const m = root.querySelector(`#m${slot}${col}`);
+    if (!m) continue;
+    const x = FI_LEFT + col * (w + FI_GAP), cx = x + w / 2;
+    const box = m.querySelector('.box');
+    box.setAttribute('x', x);
+    box.setAttribute('width', w);
+    const val = m.querySelector('.val');
+    val.dataset.cx = cx;
+    // inner-box values are always a single centered line, so re-centering
+    // the existing text is a plain x move
+    val.querySelectorAll('text').forEach((t) => t.setAttribute('x', cx));
+    m.querySelector('.stim-dot')?.setAttribute('cx', x + Math.min(15, w / 2));
+  }
+}
+function ensureFiRow(slot) {
+  if (root.querySelector(`#fi${slot}`)) return;
+  const g = svgEl('g', { id: `fi${slot}`, class: 'spare dyn' });
+  for (let col = 0; col < 4; col++) g.appendChild(fmBox(slot, col));
+  document.getElementById('main').appendChild(g);
+  layoutInnerRow(slot, 4);
+  growViewBox(slot + 1);
+}
+function ensureInnerBox(slot, col) {   // inner pulls arrive in column order
+  if (root.querySelector(`#m${slot}${col}`)) return;
+  const m = fmBox(slot, col);
+  m.classList.add('dyn');
+  root.querySelector(`#fi${slot}`).appendChild(m);
+  layoutInnerRow(slot, col + 1);
+}
+
+// ---- recorders (called as the helper reacts; they record class/content
+// effects for the commit, materializing any rows/boxes they target) ----
+function recResultPending(row) {
+  ensureRRow(row);
+  fOps.push([`#r${row} .box`, '+pending']);
+}
 function recPullPending(row, d) {
+  ensureURow(row);
   fOps.push([`#u${row} .box`, '+pending']);
   fDotAdd.push({ id: `u${row}`, st: { kind: 'pull', deferred: d, row } });
 }
 function recFnPending(slot, arg, d) {
+  ensureSlot(slot);
   fOps.push([`#i${slot} .box`, '+pending'], [`#i${slot} .label`, '+reveal']);
   if (HELPERS[ix.helper].divider) fOps.push([`#i${slot} .divider`, '+reveal']);
   fContent.push([`i${slot}`, 'label', `${HELPERS[ix.helper].fnDisplay}(${arg})`]);
@@ -397,6 +522,7 @@ function recFnPending(slot, arg, d) {
   fDotAdd.push({ id: `i${slot}`, st: { kind: 'fn', deferred: d, slot, arg } });
 }
 function recInnerPullPending(slot, col, d) {   // flatMap inner-iterator pull
+  ensureInnerBox(slot, col);
   fOps.push([`#m${slot}${col} .box`, '+pending']);
   fDotAdd.push({ id: `m${slot}${col}`, st: { kind: 'inner', deferred: d, slot, col } });
 }
@@ -412,7 +538,7 @@ function recReturnPending() {                  // c1: the consumer's own result.
 function recPullSettle(row, kind) {           // kind: 'value' | 'done' | 'error'
   const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
   fOps.push([`#u${row} .box`, spec], [`#u${row} .val`, '+reveal']);
-  fContent.push([`u${row}`, 'val', kind === 'value' ? LETTERS[row] : kind === 'done' ? { done: 'true' } : 'Error']);
+  fContent.push([`u${row}`, 'val', kind === 'value' ? letterFor(row) : kind === 'done' ? { done: 'true' } : 'Error']);
   fDotRemove.push(`u${row}`);
 }
 function recInnerSettle(slot, col, kind, token) {
@@ -427,6 +553,7 @@ function recFnSettleValue(slot, sub) {        // map: mapped value; filter: 'tru
   fDotRemove.push(`i${slot}`);
 }
 function recFnSettleIterator(slot) {          // flatMap: box becomes the inner run
+  ensureFiRow(slot);
   fOps.push([`#i${slot} .box`, '-pending'], [`#i${slot}`, '+gone'], [`#fi${slot}`, '+shown']);
   fDotRemove.push(`i${slot}`);
 }
@@ -443,21 +570,17 @@ function recCompact(slot) {
   vstate.gone.add(slot);
   fOps.push([`#i${slot}`, '+gone']);
   fDotRemove.push(`i${slot}`);
-  const lastEl = 3 + vstate.sparesSpawned;
-  for (let idx = slot + 1; idx <= lastEl; idx++) {
+  for (let idx = slot + 1; idx <= vstate.maxSlot; idx++) {
     if (vstate.gone.has(idx)) continue;
     const newUp = [...vstate.gone].filter((g) => g < idx).length;
     const oldUp = vstate.upLevel.get(idx) ?? 0;
     if (newUp !== oldUp) {
+      ensureUpClass(newUp);
       fOps.push([`#i${idx}`, `${oldUp > 0 ? `-up${oldUp} ` : ''}+up${newUp}`]);
       vstate.upLevel.set(idx, newUp);
     }
   }
-  if (vstate.sparesSpawned < 2) {
-    const spare = 4 + vstate.sparesSpawned++;
-    fOps.push([`#i${spare}`, `+up${vstate.gone.size} +shown`]);
-    vstate.upLevel.set(spare, vstate.gone.size);
-  }
+  ensureSlot(vstate.maxSlot + 1);   // spawn a fresh spare into the freed bottom row
 }
 function recResultSettle(row, kind, value) {  // kind: 'value' | 'done' | 'error'
   const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
@@ -498,17 +621,18 @@ function makeSession(helper) {
     helper,
     obj: null,
     results: [],                  // one per consumer .next(), in call order
-    pullCount: 0,                 // underlying rows handed out (u0..u3)
+    pullCount: 0,                 // underlying rows handed out (u0, u1, …)
     valueToSlot: new Map(),       // map: mapped value, filter: source value -> Internal slot
     innerValueToCell: new Map(),  // flatMap: inner token -> { slot, col }
     inners: new Map(),            // flatMap: Internal slot -> { pullCount }
+    vRows: 4,                     // grid rows the viewBox currently fits
     busy: false,
   };
   const source = {
     next() {
       const row = ix.pullCount++;
       const d = Promise.withResolvers();
-      if (row < MAX_ROWS) recPullPending(row, d);   // beyond the grid: still drive, just unshown
+      recPullPending(row, d);
       return d.promise;
     },
     return() {
@@ -519,7 +643,7 @@ function makeSession(helper) {
     [Symbol.asyncIterator]() { return this; },
   };
   const fn = (value) => {
-    const slot = LETTERS.indexOf(value);    // value is the source letter -> its row
+    const slot = letterIndex(value);        // value is the source letter -> its row
     const d = Promise.withResolvers();
     recFnPending(slot, value, d);
     return d.promise;
@@ -535,7 +659,7 @@ function makeInner(slot) {
     next() {
       const col = ix.inners.get(slot).pullCount++;
       const d = Promise.withResolvers();
-      if (col < MAX_ROWS) recInnerPullPending(slot, col, d);
+      recInnerPullPending(slot, col, d);
       return d.promise;
     },
     return() {
@@ -569,7 +693,7 @@ function settleStimulus(id, type) {           // type: 'value' | 'done' | 'error
   switch (st.kind) {
     case 'pull':
       recPullSettle(st.row, type);
-      if (type === 'value') st.deferred.resolve({ value: LETTERS[st.row], done: false });
+      if (type === 'value') st.deferred.resolve({ value: letterFor(st.row), done: false });
       else if (type === 'done') st.deferred.resolve({ value: undefined, done: true });
       else st.deferred.reject(new Error('boom'));
       break;
@@ -577,7 +701,7 @@ function settleStimulus(id, type) {           // type: 'value' | 'done' | 'error
       settleFn(st, type);
       break;
     case 'inner': {
-      const token = LETTERS[st.slot].toLowerCase() + st.col;
+      const token = letterFor(st.slot).toLowerCase() + st.col;
       recInnerSettle(st.slot, st.col, type, token);
       if (type === 'value') { ix.innerValueToCell.set(token, { slot: st.slot, col: st.col }); st.deferred.resolve({ value: token, done: false }); }
       else if (type === 'done') st.deferred.resolve({ value: undefined, done: true });
@@ -645,7 +769,7 @@ function addDot({ id, st }) {
   box.classList.add('stimulus');
   const dot = svgEl('circle', {
     class: 'stim-dot',
-    cx: +box.getAttribute('x') + 15,
+    cx: +box.getAttribute('x') + Math.min(15, +box.getAttribute('width') / 2),
     cy: +box.getAttribute('y') + 15,
     r: 7,
   });
@@ -661,10 +785,11 @@ function revealArrow(conn) {
   const key = conn[0] + '>' + conn[1];
   let el = arrowEls[key];
   if (!el) {
-    el = svgEl('path', { class: 'arrow', d: arrowD(conn) });
+    el = svgEl('path', { class: 'arrow' });
     (BAND[conn[0][0]] === 'closing' ? closingArrows : mainArrows).appendChild(el);
     arrowEls[key] = el;
   }
+  el.setAttribute('d', arrowD(conn));   // recomputed: inner boxes can move/resize
   el.classList.add('reveal');
 }
 
@@ -691,7 +816,7 @@ root.addEventListener('contextmenu', (e) => {
 function updateButtons() {
   const nb = root.querySelector('#next-btn');
   const rb = root.querySelector('#return-btn');
-  if (nb) nb.classList.toggle('disabled', !ix || ix.busy || ix.results.length >= 4);
+  if (nb) nb.classList.toggle('disabled', !ix || ix.busy);
   if (rb) rb.classList.toggle('disabled', !ix || ix.busy);
 }
 
@@ -705,7 +830,7 @@ function buildInteractiveButtons() {
   label.textContent = '.next()';
   g.append(bg, label);
   document.getElementById('main').appendChild(g);
-  g.addEventListener('click', () => { if (ix && !ix.busy && ix.results.length < 4) userAction(doNext); });
+  g.addEventListener('click', () => { if (ix && !ix.busy) userAction(doNext); });
 
   // Turn the result.return() column header into a button: wrap the existing
   // header text in a clickable group behind a backing pill (so the whole pill
@@ -780,6 +905,10 @@ function exitInteractive() {
   interactive = false;
   ix = null;
   stimuli.clear();
+  // tear down everything the live session materialized, and un-squeeze the
+  // static inner rows in case a 5th+ column re-laid them out
+  root.querySelectorAll('.dyn').forEach((el) => el.remove());
+  for (let s = 0; s < 4; s++) layoutInnerRow(s, 4);
   root.classList.remove('interactive');
   descEl.querySelector('#ix-desc')?.remove();
   root.querySelectorAll('.stim-dot').forEach((d) => d.remove());

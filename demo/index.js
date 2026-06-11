@@ -429,13 +429,18 @@ function makeValCol(id, x, row) {   // an Underlying/Result-style box group
   g.appendChild(svgEl('g', { class: 'val', 'data-cx': x + 65, 'data-cy': 130 + row * 120 }));
   document.getElementById('main').appendChild(g);
 }
-function ensureURow(row) {
-  if (!root.querySelector(`#u${row}`)) makeValCol(`u${row}`, 95, row);
-  growViewBox(row + 1);
-}
-function ensureRRow(row) {
-  if (!root.querySelector(`#r${row}`)) makeValCol(`r${row}`, 675, row);
-  growViewBox(row + 1);
+// All three columns grow together: when any column needs a row the grid
+// doesn't have yet, every column gets a box there — Underlying and Result
+// an idle box, the Internal stack one more slot shown at its bottom. That
+// keeps the invariant: non-gone Internal slots = grid rows.
+function ensureGridRows(rows) {
+  while (ix.gridRows < rows) {
+    const row = ix.gridRows++;
+    if (!root.querySelector(`#u${row}`)) makeValCol(`u${row}`, 95, row);
+    if (!root.querySelector(`#r${row}`)) makeValCol(`r${row}`, 675, row);
+    ensureSlot(vstate.maxSlot + 1);
+    growViewBox(ix.gridRows);
+  }
 }
 // Materialize Internal slots up to `slot`. Like the static spares, each
 // parks at its own base row and is shown climbed to the stack's current
@@ -505,11 +510,11 @@ function ensureInnerBox(slot, col) {   // inner pulls arrive in column order
 // ---- recorders (called as the helper reacts; they record class/content
 // effects for the commit, materializing any rows/boxes they target) ----
 function recResultPending(row) {
-  ensureRRow(row);
+  ensureGridRows(row + 1);
   fOps.push([`#r${row} .box`, '+pending']);
 }
 function recPullPending(row, d) {
-  ensureURow(row);
+  ensureGridRows(row + 1);
   fOps.push([`#u${row} .box`, '+pending']);
   fDotAdd.push({ id: `u${row}`, st: { kind: 'pull', deferred: d, row } });
 }
@@ -625,6 +630,7 @@ function makeSession(helper) {
     valueToSlot: new Map(),       // map: mapped value, filter: source value -> Internal slot
     innerValueToCell: new Map(),  // flatMap: inner token -> { slot, col }
     inners: new Map(),            // flatMap: Internal slot -> { pullCount }
+    gridRows: 4,                  // rows the grid currently has (all columns grow together)
     vRows: 4,                     // grid rows the viewBox currently fits
     busy: false,
   };

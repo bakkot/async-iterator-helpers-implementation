@@ -509,12 +509,14 @@ function ensureInnerBox(slot, col) {   // inner pulls arrive in column order
 
 // ---- recorders (called as the helper reacts; they record class/content
 // effects for the commit, materializing any rows/boxes they target) ----
+// Both row recorders grow the grid one row *past* the one they light, so
+// there's always an idle box visible below the highest highlighted row.
 function recResultPending(row) {
-  ensureGridRows(row + 1);
+  ensureGridRows(row + 2);
   fOps.push([`#r${row} .box`, '+pending']);
 }
 function recPullPending(row, d) {
-  ensureGridRows(row + 1);
+  ensureGridRows(row + 2);
   fOps.push([`#u${row} .box`, '+pending']);
   fDotAdd.push({ id: `u${row}`, st: { kind: 'pull', deferred: d, row } });
 }
@@ -528,6 +530,7 @@ function recFnPending(slot, arg, d) {
 }
 function recInnerPullPending(slot, col, d) {   // flatMap inner-iterator pull
   ensureInnerBox(slot, col);
+  ensureInnerBox(slot, col + 1);   // likewise: keep an idle box to the right
   fOps.push([`#m${slot}${col} .box`, '+pending']);
   fDotAdd.push({ id: `m${slot}${col}`, st: { kind: 'inner', deferred: d, slot, col } });
 }

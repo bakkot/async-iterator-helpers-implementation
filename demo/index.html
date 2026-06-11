@@ -20,6 +20,9 @@
     --errored-settled-fill: #efb0b0;
     --ink: #1f2933;
     --muted: #6b7280;
+    /* timeline transition durations; halved under #viz.interactive */
+    --anim: .4s;
+    --anim-arrow: .45s;
   }
 
   * { box-sizing: border-box; }
@@ -108,7 +111,7 @@
     font-size: 19px;
     text-anchor: start;
     opacity: 0;
-    transition: opacity .4s ease;
+    transition: opacity var(--anim) ease;
   }
 
   /* ============================================================
@@ -134,7 +137,7 @@
     stroke-width: 2;
     transform-box: fill-box;
     transform-origin: center;
-    transition: fill .4s ease, stroke .4s ease, stroke-width .4s ease, transform .4s ease, opacity .4s ease;
+    transition: fill var(--anim) ease, stroke var(--anim) ease, stroke-width var(--anim) ease, transform var(--anim) ease, opacity var(--anim) ease;
   }
   .box.pending {
     fill: var(--pending-fill);
@@ -186,7 +189,7 @@
     fill: var(--ink);
     text-anchor: middle;
     opacity: 0;
-    transition: opacity .4s ease;
+    transition: opacity var(--anim) ease;
   }
   .val  { font-size: 30px; font-weight: 600; }
   /* the return() boxes hold a small `{}`, sized like the Internal labels */
@@ -221,7 +224,7 @@
     stroke: var(--idle-stroke);
     stroke-width: 1.5;
     opacity: 0;
-    transition: opacity .4s ease;
+    transition: opacity var(--anim) ease;
   }
 
   /* arrows */
@@ -231,7 +234,7 @@
     fill: none;
     marker-end: url(#head);
     opacity: 0;
-    transition: opacity .45s ease;
+    transition: opacity var(--anim-arrow) ease;
   }
   #head path { fill: #475569; }
 
@@ -239,14 +242,14 @@
   .reveal { opacity: 1; }
 
   /* groups fade when discarded (.gone, declared below .shown) */
-  g { transition: opacity .4s ease; }
+  g { transition: opacity var(--anim) ease; }
 
   /* vertical compaction: move whole groups so their contents ride along.
      A box climbs one row (120 units) for each discarded box above it:
      .up1, .up2, .up3. Spare slots are parked below the stack (.spare,
      hidden) and a compaction spawns the next one into the freed bottom
      slot (.shown), climbing with the same .upN classes thereafter. */
-  g[id] { transition: transform .4s ease, opacity .4s ease; }
+  g[id] { transition: transform var(--anim) ease, opacity var(--anim) ease; }
   .up1 { transform: translateY(-120px); }
   .up2 { transform: translateY(-240px); }
   .up3 { transform: translateY(-360px); }
@@ -366,6 +369,9 @@
      overriding the other. */
   #viz.interactive #main > g:not(#next-btn) { translate: 0 20px; }
 
+  /* the live tab runs the box animations at 2x speed */
+  #viz.interactive { --anim: .2s; --anim-arrow: .225s; }
+
   /* Decorative/hidden overlays must not steal clicks meant for a box: arrows
      ride over the boxes, and the parked flatMap inner-iterator rows (.spare)
      sit on top of the Internal column. */
@@ -384,6 +390,9 @@
 
   /* the consumer's .next() button under the Result header */
   .ibtn { cursor: pointer; }
+  /* override the g[id] transform/opacity transition (higher specificity, so
+     g[id] doesn't win): the enabled<->disabled toggle should snap, not fade */
+  g[id].ibtn { transition: none; }
   .ibtn-bg { fill: #eef2ff; stroke: #6366f1; stroke-width: 2; transition: fill .15s; }
   .ibtn:hover .ibtn-bg, .ibtn:hover .ibtn-header-bg { fill: #e0e7ff; }
   .ibtn-label {

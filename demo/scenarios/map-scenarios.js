@@ -561,22 +561,19 @@ export const mapScenarios = [
     id: "map-error-underlying",
     helper: "map",
     label: "Error in underlying",
-    description: "TODO",
+    description: "An error while pulling from the underlying iterator causes it to be considered closed but as always does not prevent earlier calls from getting values.",
     display: { records: true },
     ticks: [
       { steps: [
         {
-          caption: "Idle. Same concurrent consumer — but this time the overlap lands in the underlying pulls, and values arrive out of order.",
           events: [],
         },
         {
-          caption: "Consumer calls <code>.next()</code> on the <b>Result</b> iterator. The request is <b>pending</b> on row 1.",
           events: [
             { type: "next", result: "r0" },
           ],
         },
         {
-          caption: "Result forwards a pull to the <b>Underlying</b> source. That request is now pending too.",
           events: [
             { type: "pull", pull: "u0" },
           ],
@@ -584,13 +581,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Without waiting for the first to settle, the consumer calls <code>.next()</code> <i>again</i>. <b>Result</b> row 2 goes pending.",
           events: [
             { type: "next", result: "r1" },
           ],
         },
         {
-          caption: "A <i>second</i> pull is forwarded to <b>Underlying</b> — two requests are now in flight <b>concurrently</b>.",
           events: [
             { type: "pull", pull: "u1" },
           ],
@@ -598,25 +593,22 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The <i>second</i> Underlying request settles first — but with an <b>error</b> instead of a value. The box settles red. (<code>A</code>’s request is still outstanding.)",
           events: [
             { type: "settle", pull: "u1", error: "boom" },
           ],
         },
         {
-          caption: "An error from the source <b>closes both iterators</b> — <b>Underlying</b> and <b>Result</b> get their tombstones. The error is forwarded into the second <b>Internal</b> row, which takes on the errored state, and on to the second <b>Result</b> row: the second <code>.next()</code> rejects with the error.",
+          caption: "As with values, errors can be delivered eagerly.",
           arrows: [["U1","I1"],["I1","R1"]],
           events: [
             { type: "tombstone", target: "underlying" },
             { type: "tombstone", target: "result" },
-            { type: "slot-error", pull: "u1" },
             { type: "result", result: "r1", error: "boom" },
           ],
         },
       ] },
       { steps: [
         {
-          caption: "The <i>first</i> Underlying request still settles normally — <code>A</code> arrives — and runs <code>f(A)</code> in the first <b>Internal</b> row.",
           events: [
             { type: "settle", pull: "u0", value: "A" },
             { type: "fn", call: "p0", arg: "A", from: "u0" },
@@ -625,14 +617,12 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(A)</code> resolves to <code>fA</code>, so the first <code>.next()</code> still delivers its value normally — <code>{ value: fA }</code> — even though the second already rejected.",
           events: [
             { type: "fn-settle", call: "p0", value: "fA" },
             { type: "result", result: "r0", value: "fA", from: "p0" },
           ],
         },
         {
-          caption: "<code>fA</code> is delivered and the second <code>.next()</code> has rejected — the run is complete.",
           events: [],
         },
       ] },
@@ -642,22 +632,19 @@ export const mapScenarios = [
     id: "map-error-mapper",
     helper: "map",
     label: "Error in mapper",
-    description: "TODO",
+    description: "An error from the mapper function causes <code>underlying.return()</code> to be called, and the Promise for the value which errored does not settle until that call completes.",
     display: { records: true },
     ticks: [
       { steps: [
         {
-          caption: "Idle. Same concurrent consumer — but this time the mapper itself throws.",
           events: [],
         },
         {
-          caption: "Consumer calls <code>.next()</code> on the <b>Result</b> iterator. The request is <b>pending</b> on row 1.",
           events: [
             { type: "next", result: "r0" },
           ],
         },
         {
-          caption: "Result forwards a pull to the <b>Underlying</b> source. That request is now pending too.",
           events: [
             { type: "pull", pull: "u0" },
           ],
@@ -665,13 +652,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Without waiting for the first to settle, the consumer calls <code>.next()</code> <i>again</i>. <b>Result</b> row 2 goes pending.",
           events: [
             { type: "next", result: "r1" },
           ],
         },
         {
-          caption: "A <i>second</i> pull is forwarded to <b>Underlying</b> — two requests are now in flight <b>concurrently</b>.",
           events: [
             { type: "pull", pull: "u1" },
           ],
@@ -679,7 +664,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The <i>second</i> Underlying request settles first — <code>{ done: false, value: B }</code> arrives — and runs <code>f(B)</code> in the second <b>Internal</b> row.",
           events: [
             { type: "settle", pull: "u1", value: "B" },
             { type: "fn", call: "p0", arg: "B", from: "u1" },
@@ -688,15 +672,13 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(B)</code> <b>throws</b>. The mapper erroring settles that slot red — the same representation as an error from the source. But the error doesn’t reach the consumer yet: <code>map</code> first closes the source.",
           events: [
             { type: "fn-settle", call: "p0", error: "boom" },
           ],
         },
         {
-          caption: "A mapper error also <b>closes both iterators</b> — <b>Underlying</b> and <b>Result</b> get their tombstones. The helper calls <code>underlying.return()</code> to close the source, but <i>not</i> <code>result.return()</code>.",
+          caption: "Note that the outstanding <code>result</code> is not settled here.",
           events: [
-            // { type: "open-closing" },
             { type: "close", target: "source" },
             { type: "tombstone", target: "underlying" },
             { type: "tombstone", target: "result" },
@@ -705,13 +687,12 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>underlying.return()</code> settles with <code>{}</code> — the source is closed.",
           events: [
             { type: "close-settled", target: "source" },
           ],
         },
         {
-          caption: "Only now — after <code>underlying.return()</code> has settled — does the error reach the consumer: the <i>second</i> <code>.next()</code> rejects with the mapper error, without waiting on the first.",
+          caption: "Only now that <code>underlying.return()</code> has settled do we settle the Promise for this call to <code>result.next()</code> with the error.",
           arrows: [["I1","R1"]],
           events: [
             { type: "result", result: "r1", error: "boom" },
@@ -720,7 +701,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The <i>first</i> Underlying request still settles normally — <code>A</code> arrives — and runs <code>f(A)</code> in the first <b>Internal</b> row.",
           events: [
             { type: "settle", pull: "u0", value: "A" },
             { type: "fn", call: "p1", arg: "A", from: "u0" },
@@ -729,14 +709,12 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(A)</code> resolves to <code>fA</code>, so the first <code>.next()</code> still delivers its value normally — <code>{ value: fA }</code> — even though the second already rejected.",
           events: [
             { type: "fn-settle", call: "p1", value: "fA" },
             { type: "result", result: "r0", value: "fA", from: "p1" },
           ],
         },
         {
-          caption: "<code>fA</code> is delivered and the second <code>.next()</code> has rejected with the mapper error — the run is complete.",
           events: [],
         },
       ] },
@@ -746,22 +724,19 @@ export const mapScenarios = [
     id: "map-error-mapper-2",
     helper: "map",
     label: "Error in mapper 2",
-    description: "TODO",
+    description: "As in <a href=\"#map-error-mapper\">Error in mapper</a>, but now we have a later outstanding Promise past the error. This case is not considered incoherent; we can deliver values past the error, although further requests are still settled immediately.",
     display: { records: true },
     ticks: [
       { steps: [
         {
-          caption: "Idle. Same concurrent consumer — but this time the mapper itself throws.",
           events: [],
         },
         {
-          caption: "Consumer calls <code>.next()</code> on the <b>Result</b> iterator. The request is <b>pending</b> on row 1.",
           events: [
             { type: "next", result: "r0" },
           ],
         },
         {
-          caption: "Result forwards a pull to the <b>Underlying</b> source. That request is now pending too.",
           events: [
             { type: "pull", pull: "u0" },
           ],
@@ -769,13 +744,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Without waiting for the first to settle, the consumer calls <code>.next()</code> <i>again</i>. <b>Result</b> row 2 goes pending.",
           events: [
             { type: "next", result: "r1" },
           ],
         },
         {
-          caption: "A <i>second</i> pull is forwarded to <b>Underlying</b> — two requests are now in flight <b>concurrently</b>.",
           events: [
             { type: "pull", pull: "u1" },
           ],
@@ -783,13 +756,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "TODO",
           events: [
             { type: "next", result: "r2" },
           ],
         },
         {
-          caption: "TODO",
           events: [
             { type: "pull", pull: "u2" },
           ],
@@ -797,7 +768,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The <i>second</i> Underlying request settles first — <code>{ done: false, value: B }</code> arrives — and runs <code>f(B)</code> in the second <b>Internal</b> row.",
           events: [
             { type: "settle", pull: "u1", value: "B" },
             { type: "fn", call: "p0", arg: "B", from: "u1" },
@@ -806,13 +776,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(B)</code> <b>throws</b>. The mapper erroring settles that slot red — the same representation as an error from the source. But the error doesn’t reach the consumer yet: <code>map</code> first closes the source.",
           events: [
             { type: "fn-settle", call: "p0", error: "boom" },
           ],
         },
         {
-          caption: "A mapper error also <b>closes both iterators</b> — <b>Underlying</b> and <b>Result</b> get their tombstones. The helper calls <code>underlying.return()</code> to close the source, but <i>not</i> <code>result.return()</code>.",
           events: [
             { type: "open-closing" },
             { type: "close", target: "source" },
@@ -823,13 +791,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>underlying.return()</code> settles with <code>{}</code> — the source is closed.",
           events: [
             { type: "close-settled", target: "source" },
           ],
         },
         {
-          caption: "Only now — after <code>underlying.return()</code> has settled — does the error reach the consumer: the <i>second</i> <code>.next()</code> rejects with the mapper error, without waiting on the others.",
           arrows: [["I1","R1"]],
           events: [
             { type: "result", result: "r1", error: "boom" },
@@ -838,7 +804,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The <i>first</i> Underlying request still settles normally — <code>A</code> arrives — and runs <code>f(A)</code> in the first <b>Internal</b> row.",
           events: [
             { type: "settle", pull: "u0", value: "A" },
             { type: "fn", call: "p1", arg: "A", from: "u0" },
@@ -847,7 +812,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(A)</code> resolves to <code>fA</code>, so the first <code>.next()</code> delivers its value normally — <code>{ value: fA }</code>.",
           events: [
             { type: "fn-settle", call: "p1", value: "fA" },
             { type: "result", result: "r0", value: "fA", from: "p1" },
@@ -856,7 +820,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "TODO",
           events: [
             { type: "settle", pull: "u2", value: "C" },
             { type: "fn", call: "p2", arg: "C", from: "u2" },
@@ -865,14 +828,24 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(C)</code> resolves to <code>fC</code>, so the <i>third</i> <code>.next()</code> delivers <code>{ value: fC }</code>.",
+          events: [
+            { type: "next", result: "r3" },
+          ],
+        },
+        {
+          events: [
+            { type: "result", result: "r3", done: true },
+          ],
+        },
+      ] },
+      { steps: [
+        {
           events: [
             { type: "fn-settle", call: "p2", value: "fC" },
             { type: "result", result: "r2", value: "fC", from: "p2" },
           ],
         },
         {
-          caption: "The run is complete: the first and third <code>.next()</code> delivered <code>fA</code> and <code>fC</code>; the second rejected with the mapper error.",
           events: [],
         },
       ] },

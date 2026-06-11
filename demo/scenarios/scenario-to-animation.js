@@ -29,12 +29,26 @@ export function scenarioToAnimation(scenario) {
     return records ? { done: 'false', value: display(ev.value) } : display(ev.value);
   };
 
+  // A scenario that uses the teardown band (a `return` or `close`) but never
+  // explicitly slides it in (`open-closing`) starts with the band already open,
+  // rather than having it pop in the instant the first close happens. We seed
+  // `bandOpen` so the implicit-open in `return` stays quiet and emit the open as
+  // base ops (applied at every step, including the idle step 0).
+  let usesClosing = false, hasExplicitOpen = false;
+  for (const tick of scenario.ticks)
+    for (const step of tick.steps)
+      for (const ev of step.events) {
+        if (ev.type === 'return' || ev.type === 'close') usesClosing = true;
+        if (ev.type === 'open-closing') hasExplicitOpen = true;
+      }
+  const startOpen = usesClosing && !hasExplicitOpen;
+
   // visual state
   const boxState = new Map(); // box key -> 'pending' | 'settled'
   const gone = new Set();     // compacted-away Internal element indices
   let sparesSpawned = 0;      // i4, i5
   const upLevel = new Map();  // Internal element index -> current +upN
-  let bandOpen = false;
+  let bandOpen = startOpen;
 
   const visualRow = (slot) => {
     let n = slot;
@@ -271,6 +285,9 @@ export function scenarioToAnimation(scenario) {
   }
 
   const animation = { id: scenario.id, label: scenario.label, content, steps: spaced };
+  // Base ops the player applies beneath every step (see render): hold the
+  // teardown band open from the start for scenarios that never slide it in.
+  if (startOpen) animation.baseOps = [['#main', '+shifted'], ['#closing', '+shown']];
   if (scenario.description != null) animation.description = scenario.description;
   return animation;
 }

@@ -659,7 +659,7 @@ export const mapScenarios = [
         {
           caption: "A mapper error also <b>closes both iterators</b> — <b>Underlying</b> and <b>Result</b> get their tombstones. The helper calls <code>underlying.return()</code> to close the source, but <i>not</i> <code>result.return()</code>.",
           events: [
-            { type: "open-closing" },
+            // { type: "open-closing" },
             { type: "close", target: "source" },
             { type: "tombstone", target: "underlying" },
             { type: "tombstone", target: "result" },

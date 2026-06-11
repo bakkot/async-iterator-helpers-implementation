@@ -177,6 +177,9 @@ function render(animate) {
   // replay this animation's diffs up to the current step
   root.querySelectorAll(RESET_SELECTOR)
       .forEach(el => el.classList.remove(...STATE_CLASSES));
+  // Base ops sit beneath every step (e.g. a teardown band held open from the
+  // start), so they apply at step 0 too — unlike per-step ops, replayed next.
+  applyStep(animations[animIndex].baseOps || []);
   const steps = stepsOf();
   for (let i = 1; i <= step; i++) applyStep(steps[i].ops);
 

@@ -2,6 +2,7 @@
 // scenarios/FORMAT.md) and compiled to step timelines at load time. The
 // same scenario files run as tests against the implementation repo.
 import { scenarioToAnimation } from './scenarios/scenario-to-animation.js';
+import { indexScenario } from '../scenario-core.js';
 import { mapScenarios } from './scenarios/map-scenarios.js';
 import { filterScenarios } from './scenarios/filter-scenarios.js';
 import { flatMapScenarios } from './scenarios/flatmap-scenarios.js';
@@ -1006,7 +1007,7 @@ async function exportCopy(btn) {
     flashLabel(btn, 'copy failed');
   }
 }
-function exportDownload() {
+function exportDownload(btn) {
   const text = serializeScenario(buildScenario());
   const url = URL.createObjectURL(new Blob([text], { type: 'text/javascript' }));
   const a = document.createElement('a');
@@ -1014,6 +1015,7 @@ function exportDownload() {
   a.download = `${currentSet}-interactive-scenario.js`;
   a.click();
   URL.revokeObjectURL(url);
+  flashLabel(btn, 'downloaded');
 }
 // The export toolbar lives in the caption strip (where step descriptions sit on
 // the recorded tabs), above the prev/step/next controls. Text now, icons later.
@@ -1037,6 +1039,140 @@ function buildExportBar() {
   mk('download', 'Download the steps so far as a scenario file (FORMAT.md)', exportDownload);
   caption.appendChild(bar);
 }
+
+// ---- loading a scenario (drag & drop a FORMAT.md file onto the page) ----
+// Scenario data is JS-object-literal-ish, not always strict JSON (unquoted
+// keys, trailing commas). We try JSON first, then a light coercion — never
+// eval. The parsed scenario is replayed on the matching helper's live tab:
+// only its *stimuli* become user actions (resolved to box ids via the shared
+// indexer); the implementation regenerates every observation, so the loaded
+// run drives the real helper exactly as if the user had clicked it out.
+function coerceToJSON(text) {
+  return text
+    .trim()
+    .replace(/^export\s+(default\s+|const\s+\w+\s*=\s*)/, '')   // tolerate a pasted `export …`
+    .replace(/;\s*$/, '')
+    .replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":')      // quote bare keys: { id: -> { "id":
+    .replace(/,(\s*[}\]])/g, '$1');                              // drop trailing commas before } or ]
+}
+function parseScenario(text) {
+  try { return JSON.parse(text); } catch { /* fall through to coercion */ }
+  return JSON.parse(coerceToJSON(text));   // throws on real syntax errors -> caller reports it
+}
+
+const settleType = (ev) => ('error' in ev ? 'error' : ev.done ? 'done' : 'value');
+function fnSettleType(helper, ev) {
+  if ('error' in ev) return 'error';
+  if (helper === 'filter') return ev.verdict ? 'value' : 'done';   // false = right-click = drop
+  return 'value';                                                   // map value / flatMap iterator
+}
+// Turn the scenario's stimuli (in flattened order) into the live tab's action
+// descriptors. Each stimulus is its own tick here — finer ticks are always
+// safe (see FORMAT.md) — and box ids are derived from the index, never from
+// handle spellings.
+function scenarioToActions(scenario, index) {
+  const actions = [];
+  for (const entry of index.events) {
+    if (entry.category !== 'stimulus') continue;
+    const ev = entry.ev;
+    switch (ev.type) {
+      case 'next': actions.push({ kind: 'next' }); break;
+      case 'return': actions.push({ kind: 'return' }); break;
+      case 'settle': {
+        const p = index.pulls.get(ev.pull);
+        actions.push({ kind: 'settle', id: p.kind === 'source' ? `u${p.row}` : `m${p.row}${p.col}`, type: settleType(ev) });
+        break;
+      }
+      case 'fn-settle': {
+        const c = index.calls.get(ev.call);
+        if (c.slot == null) throw new Error(`fn-settle ${ev.call} has no source pull to anchor it`);
+        actions.push({ kind: 'settle', id: `i${c.slot}`, type: fnSettleType(scenario.helper, ev) });
+        break;
+      }
+      case 'close-settled':
+        actions.push({ kind: 'settle', id: ev.target === 'source' ? 'c0' : 'c2', type: 'error' in ev ? 'error' : 'done' });
+        break;
+      default:
+        throw new Error(`'${ev.type}' stimuli can't be replayed in the interactive demo`);
+    }
+  }
+  return actions;
+}
+
+function loadScenarioText(text) {
+  let scenario;
+  try {
+    scenario = parseScenario(text);
+  } catch (err) {
+    showErrorModal('Could not parse the dropped file.', err.message);
+    return;
+  }
+  let actions;
+  try {
+    if (!scenario || typeof scenario !== 'object' || Array.isArray(scenario)) throw new Error('not a scenario object');
+    if (!['map', 'filter', 'flatMap'].includes(scenario.helper)) throw new Error(`unknown or missing "helper" (got ${JSON.stringify(scenario.helper)})`);
+    if (!Array.isArray(scenario.ticks)) throw new Error('missing "ticks" array');
+    const index = indexScenario(scenario);   // validates handles/ordering; throws with all errors
+    if (index.syncFn) throw new Error('fn-sync scenarios have no interactive equivalent');
+    actions = scenarioToActions(scenario, index);
+  } catch (err) {
+    showErrorModal('That file is not a usable scenario.', err.message);
+    return;
+  }
+  const helper = scenario.helper;
+  selectSet(helper);
+  selectInteractive();   // fresh live session at step 0
+  ixHistory = actions;   // …but primed with the loaded run, ready to step through
+  ixCaptured = [];
+  ixCursor = 0;
+  updateButtons();
+  showToast('loaded!');
+}
+
+// A brief confirmation toast, bottom-center.
+let toastTimer = 0;
+function showToast(msg) {
+  let el = document.getElementById('toast');
+  if (!el) { el = document.createElement('div'); el.id = 'toast'; document.body.appendChild(el); }
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+}
+// A dismissible modal for load failures.
+function showErrorModal(title, detail) {
+  let overlay = document.getElementById('error-modal');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'error-modal';
+    overlay.innerHTML =
+      '<div class="modal-box"><h3 class="modal-title"></h3><pre class="modal-msg"></pre>' +
+      '<div class="modal-actions"><button class="modal-close">Close</button></div></div>';
+    const close = () => overlay.classList.remove('show');
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector('.modal-close').addEventListener('click', close);
+    document.body.appendChild(overlay);
+  }
+  overlay.querySelector('.modal-title').textContent = title;
+  overlay.querySelector('.modal-msg').textContent = detail;
+  overlay.classList.add('show');
+}
+
+// Drag & drop: only react to file drags, and show a hint while one is over the
+// page. dragenter/leave can nest, so depth-count to avoid flicker.
+const dragHasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes('Files');
+let dragDepth = 0;
+window.addEventListener('dragenter', (e) => { if (dragHasFiles(e)) { dragDepth++; document.body.classList.add('dragging'); } });
+window.addEventListener('dragleave', (e) => { if (dragHasFiles(e) && --dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
+window.addEventListener('dragover', (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+window.addEventListener('drop', async (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove('dragging');
+  const file = e.dataTransfer.files[0];
+  if (file) loadScenarioText(await file.text());
+});
 
 // ---- building the consumer controls (.next() + result.return()) ----
 function buildInteractiveButtons() {

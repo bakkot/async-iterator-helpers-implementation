@@ -938,6 +938,9 @@ export const flatMapScenarios = [
     ticks: [
       { steps: [
         {
+          events: [],
+        },
+        {
           events: [
             { type: "next", result: "r0" },
             { type: "pull", pull: "u0" },
@@ -1034,5 +1037,109 @@ export const flatMapScenarios = [
         },
       ] },
     ],
-  }
+  },
+  {
+    id: "flatmap-error-in-non-active-iterator",
+    helper: "flatMap",
+    label: "Error in non-active inner",
+    description: "An error in a no-longer-active inner iterator closes both the active inner iterator and the underlying iterator (concurrently).",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", iterator: "A" },
+            { type: "inner-pull", pull: "a0", iterator: "A" },
+            { type: "inner-pull", pull: "a1", iterator: "A" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a1", done: true },
+            { type: "pull", pull: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u1", value: "B" },
+            { type: "fn", call: "p1", arg: "B", from: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p1", iterator: "B" },
+            { type: "inner-pull", pull: "b0", iterator: "B" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "open-closing" },
+          ],
+        },
+        {
+          events: [
+            { type: "settle", pull: "a0", error: "boom" },
+            { type: "close", target: "B" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "B" },
+            { type: "close", target: "source" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "source" },
+            { type: "result", result: "r0", error: "boom" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "b0", value: "b0" },
+            { type: "result", result: "r1", value: "b0", from: "b0" },
+          ],
+        },
+      ] },
+    ],
+  },
 ];

@@ -964,6 +964,7 @@ let exportBtns = [];
 function buildScenario() {
   const ticks = [];
   for (let i = 0; i < ixCursor; i++) ticks.push({ steps: [{ events: ixCaptured[i] ?? [] }] });
+  ticks[0]?.steps.unshift({ events: [] }); // All non-interactive scenarios have this so they can label the start state.
   return { id: `${currentSet}-interactive`, helper: currentSet, label: 'Interactive export', ticks };
 }
 // Render close to the hand-authored scenario style: structural keys unquoted,
@@ -981,9 +982,13 @@ function serializeScenario(s) {
     lines.push('    { steps: [');
     for (const step of tick.steps) {
       lines.push('      {');
-      lines.push('        events: [');
-      for (const ev of step.events) lines.push('          ' + renderEvent(ev) + ',');
-      lines.push('        ],');
+      if (step.events.length > 0) {
+        lines.push('        events: [');
+        for (const ev of step.events) lines.push('          ' + renderEvent(ev) + ',');
+        lines.push('        ],');
+      } else {
+        lines.push('        events: [],');
+      }
       lines.push('      },');
     }
     lines.push('    ] },');

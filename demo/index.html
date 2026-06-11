@@ -238,9 +238,8 @@
   /* generic "now visible" — wins over the opacity:0 defaults above */
   .reveal { opacity: 1; }
 
-  /* a discarded group fades out */
+  /* groups fade when discarded (.gone, declared below .shown) */
   g { transition: opacity .4s ease; }
-  .gone { opacity: 0; }
 
   /* vertical compaction: move whole groups so their contents ride along.
      A box climbs one row (120 units) for each discarded box above it:
@@ -253,6 +252,10 @@
   .up3 { transform: translateY(-360px); }
   .spare { opacity: 0; }   /* a not-yet-spawned spare slot, parked below the stack */
   .shown { opacity: 1; }   /* ...that spare has been spawned into view */
+  /* a discarded group fades out. Declared after .shown so it wins on a
+     spawned spare that is later dropped (or, for flatMap, replaced by its
+     inner-iterator run) — same specificity, so order decides. */
+  .gone { opacity: 0; }
 
   /* ---- closing teardown band ----
      A pair of return() columns that slides in above the main diagram. The

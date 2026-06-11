@@ -316,18 +316,14 @@ function selectAnimation(i) {
 //
 // Unlike `map`'s strict one-to-one, `filter` can *drop* a value (predicate
 // false): the Internal slot compacts away and the helper issues a fresh
-// underlying pull. `flatMap` replaces a settled mapper box with the inner
-// iterator it returned (a run of smaller pull boxes) and flattens those.
-//
-// The grid grows without bound: underlying/result rows are added as pulls and
-// `.next()`s arrive, and the Internal column gains a fresh box per element,
-// with dropped boxes' successors climbing up to close the gap. So the diagram
-// is built dynamically here (see the box factories above) rather than reusing
-// the fixed, spare-padded static markup the recorded animations rely on.
+// underlying pull — exactly as the recorded scenarios show. `flatMap`
+// replaces a settled mapper box with the inner iterator it returned (a run
+// of smaller pull boxes) and flattens those. The visual bookkeeping for
+// compaction (gone slots / climbing rows / spare slots) mirrors
+// scenario-to-animation.js.
 // ====================================================================
 const LETTERS = ['A', 'B', 'C', 'D'];
-const MAX_ROWS = 4;   // starting grid height, and the inner-run column count (a flatMap
-                      // inner iterator's pulls run horizontally, bounded by the Result column)
+const MAX_ROWS = 4;   // the diagram has rows 0..3 in each column
 const flush = async (rounds = 60) => { for (let i = 0; i < rounds; i++) await Promise.resolve(); };
 
 // Resolve once every CSS transition kicked off by the just-committed frame
@@ -379,101 +375,21 @@ const stimuli = new Map();    // boxId -> { kind, deferred, row?, slot?, col?, a
 // scenario-to-animation.js). Reset per session. `map`/`flatMap` never
 // compact, so for them `gone` stays empty and visualRow is the identity.
 let vstate;
-function resetVState() { vstate = { gone: new Set() }; }
+function resetVState() { vstate = { gone: new Set(), upLevel: new Map(), sparesSpawned: 0 }; }
 const visualRow = (slot) => { let n = slot; for (const g of vstate.gone) if (g < slot) n--; return n; };
-
-// ---- dynamic diagram boxes (live mode only) ----------------------------
-// Recorded animations use the static #cols markup (fixed rows 0..3 + a pair
-// of compaction spares). The live tab instead grows the grid without bound:
-// underlying/result rows are added as pulls/`.next()`s arrive, and the
-// Internal column grows a fresh box per element — with filter's compaction
-// closing the gaps by climbing later boxes up (an inline transform, so it has
-// no row ceiling, unlike the recorded path's .up1..3 classes). #cols is wiped
-// and rebuilt on entry and restored to its static markup on exit.
-const colsEl = document.getElementById('cols');
-const STATIC_COLS = [...colsEl.children].map((c) => c.cloneNode(true));   // for restore on exit
-const restoreStaticCols = () => colsEl.replaceChildren(...STATIC_COLS.map((c) => c.cloneNode(true)));
-const ROW_H = 120;            // vertical pitch between rows
-const ROW_Y = (row) => 85 + row * ROW_H;   // box top for a given row
-
-function buildColBox(id, x, valcx, row) {
-  const g = svgEl('g', { id });
-  g.append(
-    svgEl('rect', { class: 'box', x, y: ROW_Y(row), width: 130, height: 90, rx: 8 }),
-    svgEl('g', { class: 'val', 'data-cx': valcx, 'data-cy': 130 + row * ROW_H }),
-  );
-  return g;
-}
-function buildInternalBox(slot) {
-  const y = ROW_Y(slot);
-  const g = svgEl('g', { id: `i${slot}` });
-  g.append(
-    svgEl('rect', { class: 'box', x: 385, y, width: 130, height: 90, rx: 8 }),
-    svgEl('text', { class: 'label', x: 450, y: y + 28, 'dominant-baseline': 'central' }),
-    svgEl('line', { class: 'divider', x1: 397, y1: y + 46, x2: 503, y2: y + 46 }),
-    svgEl('text', { class: 'sub', x: 450, y: y + 70, 'dominant-baseline': 'central' }),
-    svgEl('text', { class: 'err', x: 450, y: y + 45, 'dominant-baseline': 'central' }),
-  );
-  const offset = visualOffset(slot);   // appear already climbed if rows above are gone
-  if (offset) g.style.transform = `translateY(${-offset * ROW_H}px)`;
-  return g;
-}
-function buildInnerIter(slot) {
-  const fi = svgEl('g', { id: `fi${slot}`, class: 'spare' });
-  for (let col = 0; col < MAX_ROWS; col++) {
-    const m = svgEl('g', { id: `m${slot}${col}`, class: 'fmbox' });
-    m.append(
-      svgEl('rect', { class: 'box', x: 261 + col * 98, y: 101 + slot * ROW_H, width: 84, height: 58, rx: 6 }),
-      svgEl('g', { class: 'val', 'data-cx': 303 + col * 98, 'data-cy': 130 + slot * ROW_H }),
-    );
-    fi.append(m);
-  }
-  return fi;
-}
-const visualOffset = (slot) => { let n = 0; for (const g of vstate.gone) if (g < slot) n++; return n; };
-
-// idempotent "create rows 0..n if missing" (and one inner run per slot)
-function ensureU(row) { for (let r = 0; r <= row; r++) if (!document.getElementById(`u${r}`)) colsEl.appendChild(buildColBox(`u${r}`, 95, 160, r)); }
-function ensureR(row) { for (let r = 0; r <= row; r++) if (!document.getElementById(`r${r}`)) colsEl.appendChild(buildColBox(`r${r}`, 675, 740, r)); }
-function ensureI(slot) {
-  for (let s = 0; s <= slot; s++) if (!document.getElementById(`i${s}`)) { colsEl.appendChild(buildInternalBox(s)); ix.internalSlots.add(s); }
-}
-function ensureFi(slot) { if (!document.getElementById(`fi${slot}`)) colsEl.appendChild(buildInnerIter(slot)); }
-
-// How many rows the grid currently spans: at least the starting 4, growing
-// with the underlying pulls and consumer `.next()`s.
-function gridRows() { return Math.max(MAX_ROWS, ix.pullCount, ix.results.length); }
-
-// Keep all three columns filled to the grid height with idle boxes. The
-// Internal column needs `gone.size` extra elements so that, after filter drops
-// climb the survivors up, fresh idle boxes still reach the bottom row — this is
-// what lets the middle column hand out new boxes indefinitely as it compacts.
-function topUpGrid() {
-  const n = gridRows();
-  ensureU(n - 1);
-  ensureR(n - 1);
-  ensureI(n - 1 + vstate.gone.size);
-}
-function updateViewBox() {
-  root.setAttribute('viewBox', `0 0 900 ${400 + (gridRows() - 1) * ROW_H}`);
-}
 
 // Per-tick frame: every effect is recorded here during the microtask
 // drain, then flushed to the DOM together by commitFrame().
-// fEnsure: box-creation thunks run first (so later ops can target them);
-// fTransforms: Internal-column climb updates ({ id, offset }).
-let fOps, fContent, fArrows, fDotAdd, fDotRemove, fEnsure, fTransforms;
-function resetFrame() { fOps = []; fContent = []; fArrows = []; fDotAdd = []; fDotRemove = []; fEnsure = []; fTransforms = []; }
+let fOps, fContent, fArrows, fDotAdd, fDotRemove;
+function resetFrame() { fOps = []; fContent = []; fArrows = []; fDotAdd = []; fDotRemove = []; }
 
 // ---- recorders (called as the helper reacts; pure data, no DOM) ----
-function recResultPending(row) { fEnsure.push(() => ensureR(row)); fOps.push([`#r${row} .box`, '+pending']); }
+function recResultPending(row) { fOps.push([`#r${row} .box`, '+pending']); }
 function recPullPending(row, d) {
-  fEnsure.push(() => ensureU(row));
   fOps.push([`#u${row} .box`, '+pending']);
   fDotAdd.push({ id: `u${row}`, st: { kind: 'pull', deferred: d, row } });
 }
 function recFnPending(slot, arg, d) {
-  fEnsure.push(() => ensureI(slot));
   fOps.push([`#i${slot} .box`, '+pending'], [`#i${slot} .label`, '+reveal']);
   if (HELPERS[ix.helper].divider) fOps.push([`#i${slot} .divider`, '+reveal']);
   fContent.push([`i${slot}`, 'label', `${HELPERS[ix.helper].fnDisplay}(${arg})`]);
@@ -481,7 +397,6 @@ function recFnPending(slot, arg, d) {
   fDotAdd.push({ id: `i${slot}`, st: { kind: 'fn', deferred: d, slot, arg } });
 }
 function recInnerPullPending(slot, col, d) {   // flatMap inner-iterator pull
-  fEnsure.push(() => ensureFi(slot));
   fOps.push([`#m${slot}${col} .box`, '+pending']);
   fDotAdd.push({ id: `m${slot}${col}`, st: { kind: 'inner', deferred: d, slot, col } });
 }
@@ -512,7 +427,6 @@ function recFnSettleValue(slot, sub) {        // map: mapped value; filter: 'tru
   fDotRemove.push(`i${slot}`);
 }
 function recFnSettleIterator(slot) {          // flatMap: box becomes the inner run
-  fEnsure.push(() => ensureFi(slot));
   fOps.push([`#i${slot} .box`, '-pending'], [`#i${slot}`, '+gone'], [`#fi${slot}`, '+shown']);
   fDotRemove.push(`i${slot}`);
 }
@@ -522,17 +436,27 @@ function recFnSettleError(slot) {
   fContent.push([`i${slot}`, 'err', 'Error']);
   fDotRemove.push(`i${slot}`);
 }
-// A filter drop (predicate false): the Internal slot fades out and every
-// later live slot climbs up one row to close the gap. The climb is an inline
-// transform recomputed from `gone`, so the column can grow and compact without
-// the row ceiling the recorded path's spare/up-class scheme imposes.
+// A filter drop (predicate false) or exhaustion-discard: the Internal slot
+// fades out, later slots climb, and a parked spare spawns into the freed
+// bottom row — exactly the compaction the recorded scenarios animate.
 function recCompact(slot) {
   vstate.gone.add(slot);
   fOps.push([`#i${slot}`, '+gone']);
   fDotRemove.push(`i${slot}`);
-  for (const idx of ix.internalSlots) {
-    if (idx <= slot || vstate.gone.has(idx)) continue;
-    fTransforms.push({ id: `i${idx}`, offset: visualOffset(idx) });
+  const lastEl = 3 + vstate.sparesSpawned;
+  for (let idx = slot + 1; idx <= lastEl; idx++) {
+    if (vstate.gone.has(idx)) continue;
+    const newUp = [...vstate.gone].filter((g) => g < idx).length;
+    const oldUp = vstate.upLevel.get(idx) ?? 0;
+    if (newUp !== oldUp) {
+      fOps.push([`#i${idx}`, `${oldUp > 0 ? `-up${oldUp} ` : ''}+up${newUp}`]);
+      vstate.upLevel.set(idx, newUp);
+    }
+  }
+  if (vstate.sparesSpawned < 2) {
+    const spare = 4 + vstate.sparesSpawned++;
+    fOps.push([`#i${spare}`, `+up${vstate.gone.size} +shown`]);
+    vstate.upLevel.set(spare, vstate.gone.size);
   }
 }
 function recResultSettle(row, kind, value) {  // kind: 'value' | 'done' | 'error'
@@ -578,14 +502,13 @@ function makeSession(helper) {
     valueToSlot: new Map(),       // map: mapped value, filter: source value -> Internal slot
     innerValueToCell: new Map(),  // flatMap: inner token -> { slot, col }
     inners: new Map(),            // flatMap: Internal slot -> { pullCount }
-    internalSlots: new Set(),     // Internal slots with a box (for re-climbing on compaction)
     busy: false,
   };
   const source = {
     next() {
       const row = ix.pullCount++;
       const d = Promise.withResolvers();
-      recPullPending(row, d);     // the grid grows a row to fit
+      if (row < MAX_ROWS) recPullPending(row, d);   // beyond the grid: still drive, just unshown
       return d.promise;
     },
     return() {
@@ -704,17 +627,10 @@ async function userAction(perform) {
 }
 
 function commitFrame() {
-  for (const make of fEnsure) make();   // create any newly-needed boxes first
-  topUpGrid();                          // ...refill idle rows (and the Internal column)...
-  updateViewBox();                      // ...and grow the canvas to fit them
   applyStep(fOps);
   for (const [id, field, val] of fContent) {
     if (field === 'val') buildVal(root.querySelector(`#${id} .val`), val);
     else { const el = root.querySelector(`#${id} .${field}`); if (el) el.textContent = val; }
-  }
-  for (const { id, offset } of fTransforms) {
-    const el = document.getElementById(id);
-    if (el) el.style.transform = offset ? `translateY(${-offset * ROW_H}px)` : '';
   }
   for (const id of fDotRemove) removeDot(id);
   for (const d of fDotAdd) addDot(d);
@@ -775,7 +691,7 @@ root.addEventListener('contextmenu', (e) => {
 function updateButtons() {
   const nb = root.querySelector('#next-btn');
   const rb = root.querySelector('#return-btn');
-  if (nb) nb.classList.toggle('disabled', !ix || ix.busy);   // the grid grows, so no row cap
+  if (nb) nb.classList.toggle('disabled', !ix || ix.busy || ix.results.length >= 4);
   if (rb) rb.classList.toggle('disabled', !ix || ix.busy);
 }
 
@@ -789,7 +705,7 @@ function buildInteractiveButtons() {
   label.textContent = '.next()';
   g.append(bg, label);
   document.getElementById('main').appendChild(g);
-  g.addEventListener('click', () => { if (ix && !ix.busy) userAction(doNext); });
+  g.addEventListener('click', () => { if (ix && !ix.busy && ix.results.length < 4) userAction(doNext); });
 
   // Turn the result.return() column header into a button: wrap the existing
   // header text in a clickable group behind a backing pill (so the whole pill
@@ -833,12 +749,9 @@ function selectInteractive() {
   root.querySelectorAll(RESET_SELECTOR).forEach((el) => el.classList.remove(...STATE_CLASSES));
   applyContent({});
   mainArrows.textContent = ''; closingArrows.textContent = ''; arrowEls = {};
-  makeSession(currentSet);                       // fresh session + visual state
-  colsEl.replaceChildren();                       // drop the static markup...
-  topUpGrid();                                    // ...and start from the familiar 4-row grid
   document.getElementById('main').classList.add('shifted');
   document.getElementById('closing').classList.add('shown');
-  updateViewBox();                                // sized to the grid; grows as rows are added
+  root.setAttribute('viewBox', '0 0 900 760');
   root.querySelectorAll('.stim-dot').forEach((d) => d.remove());
   stimuli.clear();
   buildInteractiveButtons();
@@ -856,6 +769,7 @@ function selectInteractive() {
   ixDesc.innerHTML = IX_INSTRUCTIONS(currentSet);
   ixDesc.classList.add('active');
 
+  makeSession(currentSet);
   updateButtons();
 
   if (urlSync) history.replaceState(null, '', '#' + currentSet + '-interactive');
@@ -867,7 +781,6 @@ function exitInteractive() {
   ix = null;
   stimuli.clear();
   root.classList.remove('interactive');
-  restoreStaticCols();                    // restore the static boxes for recorded animations
   descEl.querySelector('#ix-desc')?.remove();
   root.querySelectorAll('.stim-dot').forEach((d) => d.remove());
   root.querySelectorAll('.box.stimulus').forEach((b) => b.classList.remove('stimulus'));

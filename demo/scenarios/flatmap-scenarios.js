@@ -671,7 +671,7 @@ export const flatMapScenarios = [
     id: "flatmap-closing",
     helper: "flatMap",
     label: "Closing",
-    description: "TODO",
+    description: "If we call <code>result.return()</code> while an inner iterator is active, we close both it and the underlying iterator (sequentially), then resolve the Promise from <code>result.return()</code>. Outstanding values from the inner iterator may still settle.",
     ticks: [
       { steps: [
         {
@@ -789,7 +789,114 @@ export const flatMapScenarios = [
     id: "flatmap-closing-2",
     helper: "flatMap",
     label: "Closing 2",
-    description: "TODO",
+    description: "We close only the active inner iterator, but values from earlier ones may still be delivered.",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", iterator: "A" },
+            { type: "inner-pull", pull: "a0", iterator: "A" },
+            { type: "inner-pull", pull: "a1", iterator: "A" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a1", done: true },
+            { type: "pull", pull: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u1", value: "B" },
+            { type: "fn", call: "p1", arg: "B", from: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p1", iterator: "B" },
+            { type: "inner-pull", pull: "b0", iterator: "B" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "return", result: "ret" },
+            { type: "close", target: "B" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "B" },
+            { type: "close", target: "source" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "source" },
+            { type: "result", result: "ret", done: true },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "b0", value: "b0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a0", value: "a0" },
+            { type: "result", result: "r0", value: "a0", from: "a0" },
+            { type: "result", result: "r1", value: "b0", from: "b0" },
+          ],
+        },
+      ] },
+    ],
+  },
+  {
+    id: "flatmap-closing-during-pull",
+    helper: "flatMap",
+    label: "Closing during pull",
+    description: "When <code>result.return()</code> is called while we are blocked on pulling from the underlying iterator or on the mapper, we wait for that to settle and close the resulting iterator. Only once that completes does the <code>result.return()</code> Promise settle.<br><br>We hold open a Promise from <code>result.next()</code> in case the underlying pull or the mapper throws.",
     ticks: [
       { steps: [
         {
@@ -932,9 +1039,10 @@ export const flatMapScenarios = [
     ],
   },
   {
-    id: "flatmap-error-in-underlying-during-return",
+    id: "flatmap-during-pull-2",
     helper: "flatMap",
-    label: "Error in underlying during return",
+    label: "Closing during pull 2",
+    description: "Same scenario as \"Closing during pull\", except we have an extra pull. It resolves as soon as <code>result.return()</code> is invoked.",
     ticks: [
       { steps: [
         {
@@ -994,37 +1102,13 @@ export const flatMapScenarios = [
             { type: "pull", pull: "u1" },
           ],
         },
-        {
-          caption: "Now the consumer calls <code>.return()</code> on the <b>Result</b> iterator — it wants to stop early. The diagram shifts down and the teardown band slides in above.",
-          events: [
-            { type: "open-closing" },
-          ],
-        },
       ] },
       { steps: [
         {
           events: [
             { type: "return", result: "ret" },
-          ],
-        },
-        {
-          events: [
             { type: "close", target: "source" },
             { type: "result", result: "r2", done: true },
-            { type: "tombstone", target: "underlying" },
-            { type: "tombstone", target: "result" },
-          ],
-        },
-      ] },
-      { steps: [
-        {
-          events: [
-            { type: "settle", pull: "u1", error: "boom" },
-          ],
-        },
-        {
-          events: [
-            { type: "result", result: "r1", error: "boom" },
           ],
         },
       ] },
@@ -1032,7 +1116,165 @@ export const flatMapScenarios = [
         {
           events: [
             { type: "close-settled", target: "source" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u1", value: "B" },
+            { type: "fn", call: "p1", arg: "B", from: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p1", iterator: "B" },
+            { type: "close", target: "B" },
+            { type: "result", result: "r1", done: true },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "B" },
             { type: "result", result: "ret", done: true },
+          ],
+        },
+      ] },
+    ],
+  },
+  {
+    id: "flatmap-error-in-underlying-during-return",
+    helper: "flatMap",
+    label: "Error in underlying during return",
+    description: "Same scenario as <a href=\"#flatmap-closing-during-pull\">Closing during pull</a>, except now the underlying pull throws.",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", iterator: "A" },
+            { type: "inner-pull", pull: "a0", iterator: "A" },
+            { type: "inner-pull", pull: "a1", iterator: "A" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a0", value: "a0" },
+            { type: "result", result: "r0", value: "a0", from: "a0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a1", done: true },
+            { type: "pull", pull: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "return", result: "ret" },
+            { type: "close", target: "source" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "source" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u1", error: "boom" },
+            { type: "result", result: "r1", error: "boom" },
+            { type: "result", result: "ret", done: true },
+          ],
+        },
+      ] },
+    ],
+  },
+  {
+    id: "flatmap-error-in-active-iterator",
+    helper: "flatMap",
+    label: "Error in active inner",
+    description: "An error in the active inner iterator the underlying iterator. The result Promise where the error will ultimately land is held until closing finishes.",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", iterator: "A" },
+            { type: "inner-pull", pull: "a0", iterator: "A" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a0", error: "boom" },
+            { type: "close", target: "source" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "source" },
+            { type: "result", result: "r0", error: "boom" },
           ],
         },
       ] },

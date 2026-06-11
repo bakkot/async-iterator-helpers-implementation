@@ -1106,13 +1106,25 @@ export const flatMapScenarios = [
       { steps: [
         {
           events: [
+            { type: "settle", pull: "b0", value: "b0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
             { type: "open-closing" },
           ],
         },
         {
           events: [
             { type: "settle", pull: "a0", error: "boom" },
+          ],
+        },
+        {
+          events: [
             { type: "close", target: "B" },
+            { type: "result", result: "r1", value: "b0", from: "b0" },
           ],
         },
       ] },
@@ -1129,14 +1141,6 @@ export const flatMapScenarios = [
           events: [
             { type: "close-settled", target: "source" },
             { type: "result", result: "r0", error: "boom" },
-          ],
-        },
-      ] },
-      { steps: [
-        {
-          events: [
-            { type: "settle", pull: "b0", value: "b0" },
-            { type: "result", result: "r1", value: "b0", from: "b0" },
           ],
         },
       ] },

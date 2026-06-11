@@ -355,13 +355,12 @@
   .hint { color: var(--muted); font-size: 12.5px; }
 
   /* ---- Interactive (live) mode ---- */
-  /* In the live demo the three box columns are pushed down to clear the
-     .next() button that sits under the Result header. This uses the
-     independent `translate` property (not `transform`) on purpose: filter's
-     compaction climb is a `transform: translateY(...)` (.upN) on the very
-     same Internal-column groups, and the two must compose rather than one
-     overriding the other. */
-  #viz.interactive #main > g:not(#next-btn) { translate: 0 20px; }
+  /* In the live demo the columns are pushed down to clear the .next() button
+     that sits under the Result header. This shifts the #cols / #arrows
+     wrappers (direct #main children); the live tab's compaction climb is a
+     transform on the inner box groups *inside* #cols, so the two compose
+     (parent shift ∘ child climb) instead of fighting over one element. */
+  #viz.interactive #main > g:not(#next-btn) { transform: translateY(20px); }
 
   /* Decorative/hidden overlays must not steal clicks meant for a box: arrows
      ride over the boxes, and the parked flatMap inner-iterator rows (.spare)
@@ -430,6 +429,10 @@
       <!-- arrows are generated per step from each step's `arrows` list -->
       <g id="arrows"></g>
 
+      <!-- All the column boxes live in #cols. Recorded animations use the
+           static markup below; the live (Interactive) tab swaps in a
+           dynamically-grown set of boxes and restores this markup on exit. -->
+      <g id="cols">
       <!-- ===================== Underlying column ===================== -->
       <g id="u0">
         <rect class="box" x="95" y="85" width="130" height="90" rx="8"></rect>
@@ -530,6 +533,7 @@
         <rect class="box" x="675" y="445" width="130" height="90" rx="8"></rect>
         <g class="val" data-cx="740" data-cy="490"></g>
       </g>
+      </g><!-- /#cols -->
       </g><!-- /#main -->
 
       <!-- ===================== Closing teardown band =====================

@@ -360,6 +360,21 @@
   }
   .hint { color: var(--muted); font-size: 12.5px; }
 
+  /* the live tab's export toolbar, shown in the caption strip */
+  .export-bar { display: flex; gap: 8px; justify-content: center; align-items: center; }
+  .export-btn {
+    font-size: 13px;
+    padding: 4px 12px;
+    border: 1px solid #c9c9d2;
+    border-radius: 7px;
+    background: #fafafb;
+    color: #374151;
+    cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  .export-btn:hover:not(:disabled) { background: #f1f1f4; border-color: #b9b9c2; }
+  .export-btn:disabled { opacity: 0.4; cursor: default; }
+
   /* ---- Interactive (live) mode ---- */
   /* In the live demo the three box columns are pushed down to clear the
      .next() button that sits under the Result header. This uses the

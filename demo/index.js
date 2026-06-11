@@ -337,6 +337,13 @@ function letterIndex(s) {
 }
 const flush = async (rounds = 60) => { for (let i = 0; i < rounds; i++) await Promise.resolve(); };
 
+// An inner iterator lives at the Internal slot fed by its source value, so it
+// takes that source letter as its scenario handle (slot 0 -> 'A'); its pulls
+// are that letter lowercased plus the column (a0, a1, …). The demo also uses
+// this same token as the inner *value* the pull yields, so a delivered inner
+// value's `from` is just the pull handle.
+function innerPullHandle(slot, col) { return letterFor(slot).toLowerCase() + col; }
+
 // Resolve once every CSS transition kicked off by the just-committed frame
 // has finished — so input is gated for exactly as long as the effects take
 // to play out (and not at all when nothing actually moved). We count
@@ -393,8 +400,16 @@ const visualRow = (slot) => { let n = slot; for (const g of vstate.gone) if (g <
 
 // Per-tick frame: every effect is recorded here during the microtask
 // drain, then flushed to the DOM together by commitFrame().
-let fOps, fContent, fArrows, fDotAdd, fDotRemove;
-function resetFrame() { fOps = []; fContent = []; fArrows = []; fDotAdd = []; fDotRemove = []; }
+let fOps, fContent, fArrows, fDotAdd, fDotRemove, fEvents;
+function resetFrame() { fOps = []; fContent = []; fArrows = []; fDotAdd = []; fDotRemove = []; fEvents = []; }
+
+// Alongside the visual frame we capture the *semantic* events of the tick in
+// scenario-format terms (see scenarios/FORMAT.md), so the live session can be
+// exported as a runnable scenario. One user action is one tick (one step);
+// the stimulus is emitted first, then each observation/annotation as the
+// recorders fire — exactly the order the implementation produced them, which
+// is what both the test executor and the animation compiler expect.
+function emit(ev) { if (fEvents) fEvents.push(ev); }
 
 // ---- dynamic geometry --------------------------------------------------
 // The static markup bakes in four rows per column (and four inner-iterator
@@ -517,11 +532,15 @@ function recResultPending(row) {
 }
 function recPullPending(row, d) {
   ensureGridRows(row + 2);
+  emit({ type: 'pull', pull: `u${row}` });
   fOps.push([`#u${row} .box`, '+pending']);
   fDotAdd.push({ id: `u${row}`, st: { kind: 'pull', deferred: d, row } });
 }
 function recFnPending(slot, arg, d) {
   ensureSlot(slot);
+  const call = `p${ix.fnCalls++}`;          // fn-call handles p0, p1, … in invocation order
+  ix.slotToCall.set(slot, call);            // so settling this slot's box names the right call
+  emit({ type: 'fn', call, arg, from: `u${slot}` });
   fOps.push([`#i${slot} .box`, '+pending'], [`#i${slot} .label`, '+reveal']);
   if (HELPERS[ix.helper].divider) fOps.push([`#i${slot} .divider`, '+reveal']);
   fContent.push([`i${slot}`, 'label', `${HELPERS[ix.helper].fnDisplay}(${arg})`]);
@@ -531,13 +550,15 @@ function recFnPending(slot, arg, d) {
 function recInnerPullPending(slot, col, d) {   // flatMap inner-iterator pull
   ensureInnerBox(slot, col);
   ensureInnerBox(slot, col + 1);   // likewise: keep an idle box to the right
+  emit({ type: 'inner-pull', pull: innerPullHandle(slot, col), iterator: letterFor(slot) });
   fOps.push([`#m${slot}${col} .box`, '+pending']);
   fDotAdd.push({ id: `m${slot}${col}`, st: { kind: 'inner', deferred: d, slot, col } });
 }
-function recClosePending(box, kind, d) {       // box: 'c0' (underlying) | 'c2' (inner)
+function recClosePending(box, kind, d, target) {  // box: 'c0' (underlying) | 'c2' (inner)
+  emit({ type: 'close', target });
   fOps.push([`#${box} .box`, '+pending']);
   fContent.push([box, 'val', '{}']);
-  fDotAdd.push({ id: box, st: { kind, deferred: d } });
+  fDotAdd.push({ id: box, st: { kind, deferred: d, target } });
 }
 function recReturnPending() {                  // c1: the consumer's own result.return()
   fOps.push(['#c1 .box', '+pending']);
@@ -575,6 +596,7 @@ function recFnSettleError(slot) {
 // fades out, later slots climb, and a parked spare spawns into the freed
 // bottom row — exactly the compaction the recorded scenarios animate.
 function recCompact(slot) {
+  emit({ type: 'compact', pull: `u${slot}` });
   vstate.gone.add(slot);
   fOps.push([`#i${slot}`, '+gone']);
   fDotRemove.push(`i${slot}`);
@@ -592,12 +614,25 @@ function recCompact(slot) {
 }
 function recResultSettle(row, kind, value) {  // kind: 'value' | 'done' | 'error'
   const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
+  if (kind === 'value') emit({ type: 'result', result: `r${row}`, value, ...(deliveryFromHandle(value) ? { from: deliveryFromHandle(value) } : {}) });
+  else emit({ type: 'result', result: `r${row}`, ...(kind === 'done' ? { done: true } : { error: 'boom' }) });
   fOps.push([`#r${row} .box`, spec], [`#r${row} .val`, '+reveal']);
   fContent.push([`r${row}`, 'val', kind === 'value' ? value : kind === 'done' ? { done: 'true' } : 'Error']);
   if (kind === 'value') {
     const from = deliveryArrowFrom(value);
     if (from) fArrows.push([from, `R${row}`]);
   }
+}
+// The scenario `from` handle for a delivered value: the fn-call handle that
+// produced it (map/filter) or the inner-pull handle it came out of (flatMap).
+// Mirrors deliveryArrowFrom, which yields visual row ids rather than handles.
+function deliveryFromHandle(value) {
+  if (ix.helper === 'flatMap') {
+    const cell = ix.innerValueToCell.get(value);
+    return cell ? innerPullHandle(cell.slot, cell.col) : null;
+  }
+  const slot = ix.valueToSlot.get(value);
+  return slot != null ? ix.slotToCall.get(slot) : null;
 }
 // The cell a delivered value flowed from, for the Internal/inner -> Result
 // arrow: a predicate/mapper slot (map, filter) or an inner pull box (flatMap).
@@ -617,6 +652,8 @@ function recCloseSettle(box, kind) {          // c0 / c2: 'done' | 'error'
 }
 function recReturnSettle(kind) {              // c1 (result .return()): 'done' | 'error'
   const spec = kind === 'error' ? '-pending +settled +errored' : '-pending +settled';
+  const result = ix.returnHandles.shift() ?? 'ret';
+  emit({ type: 'result', result, ...(kind === 'error' ? { error: 'boom' } : { done: true }) });
   fOps.push(['#c1 .box', spec], ['#c1 .val', '+reveal']);
   if (kind === 'error') fContent.push(['c1', 'val', 'Error']);
 }
@@ -633,6 +670,10 @@ function makeSession(helper) {
     valueToSlot: new Map(),       // map: mapped value, filter: source value -> Internal slot
     innerValueToCell: new Map(),  // flatMap: inner token -> { slot, col }
     inners: new Map(),            // flatMap: Internal slot -> { pullCount }
+    slotToCall: new Map(),        // Internal slot -> fn-call handle (p0, p1, …) for export
+    fnCalls: 0,                   // fn invocations so far (names p0, p1, … for export)
+    returnHandles: [],            // outstanding result.return() handles (ret, ret1, …) for export
+    returnCount: 0,
     gridRows: 4,                  // rows the grid currently has (all columns grow together)
     vRows: 4,                     // grid rows the viewBox currently fits
     busy: false,
@@ -646,7 +687,7 @@ function makeSession(helper) {
     },
     return() {
       const d = Promise.withResolvers();
-      recClosePending('c0', 'return', d);
+      recClosePending('c0', 'return', d, 'source');
       return d.promise;
     },
     [Symbol.asyncIterator]() { return this; },
@@ -673,7 +714,7 @@ function makeInner(slot) {
     },
     return() {
       const d = Promise.withResolvers();
-      recClosePending('c2', 'inner-return', d);
+      recClosePending('c2', 'inner-return', d, letterFor(slot));
       return d.promise;
     },
     [Symbol.asyncIterator]() { return this; },
@@ -684,6 +725,7 @@ function makeInner(slot) {
 // ---- the user-action entry points ----
 function doNext() {
   const row = ix.results.length;
+  emit({ type: 'next', result: `r${row}` });
   recResultPending(row);
   const p = ix.obj.next();   // synchronously issues whatever pull the helper needs
   ix.results.push(p);
@@ -693,6 +735,9 @@ function doNext() {
   );
 }
 function doReturn() {
+  const result = ix.returnCount++ === 0 ? 'ret' : `ret${ix.returnCount - 1}`;
+  ix.returnHandles.push(result);
+  emit({ type: 'return', result });
   recReturnPending();
   ix.obj.return().then(() => recReturnSettle('done'), () => recReturnSettle('error'));
 }
@@ -701,6 +746,7 @@ function settleStimulus(id, type) {           // type: 'value' | 'done' | 'error
   if (!st) return;
   switch (st.kind) {
     case 'pull':
+      emit({ type: 'settle', pull: `u${st.row}`, ...settleFields(type, letterFor(st.row)) });
       recPullSettle(st.row, type);
       if (type === 'value') st.deferred.resolve({ value: letterFor(st.row), done: false });
       else if (type === 'done') st.deferred.resolve({ value: undefined, done: true });
@@ -710,7 +756,8 @@ function settleStimulus(id, type) {           // type: 'value' | 'done' | 'error
       settleFn(st, type);
       break;
     case 'inner': {
-      const token = letterFor(st.slot).toLowerCase() + st.col;
+      const token = innerPullHandle(st.slot, st.col);
+      emit({ type: 'settle', pull: token, ...settleFields(type, token) });
       recInnerSettle(st.slot, st.col, type, token);
       if (type === 'value') { ix.innerValueToCell.set(token, { slot: st.slot, col: st.col }); st.deferred.resolve({ value: token, done: false }); }
       else if (type === 'done') st.deferred.resolve({ value: undefined, done: true });
@@ -720,26 +767,32 @@ function settleStimulus(id, type) {           // type: 'value' | 'done' | 'error
     case 'return':        // underlying .return() (c0)
     case 'inner-return': {// inner-iterator .return() (c2)
       const box = st.kind === 'return' ? 'c0' : 'c2';
+      emit({ type: 'close-settled', target: st.target, ...(type === 'error' ? { error: 'boom' } : {}) });
       if (type === 'error') { recCloseSettle(box, 'error'); st.deferred.reject(new Error('boom')); }
       else { recCloseSettle(box, 'done'); st.deferred.resolve({ value: undefined, done: true }); }
       break;
     }
   }
 }
+// The value/done/error tail of a `settle` event, given the demo's settle type.
+function settleFields(type, value) {
+  return type === 'value' ? { value } : type === 'done' ? { done: true } : { error: 'boom' };
+}
 // Settling a mapper/predicate promise means different things per helper.
 function settleFn(st, type) {
+  const call = ix.slotToCall.get(st.slot);
   if (ix.helper === 'map') {
     if (type === 'done') return;              // a mapped value can't be `done`
-    if (type === 'value') { const m = 'f' + st.arg; ix.valueToSlot.set(m, st.slot); recFnSettleValue(st.slot, m); st.deferred.resolve(m); }
-    else { recFnSettleError(st.slot); st.deferred.reject(new Error('boom')); }
+    if (type === 'value') { const m = 'f' + st.arg; emit({ type: 'fn-settle', call, value: m }); ix.valueToSlot.set(m, st.slot); recFnSettleValue(st.slot, m); st.deferred.resolve(m); }
+    else { emit({ type: 'fn-settle', call, error: 'boom' }); recFnSettleError(st.slot); st.deferred.reject(new Error('boom')); }
   } else if (ix.helper === 'filter') {
-    if (type === 'value') { ix.valueToSlot.set(st.arg, st.slot); recFnSettleValue(st.slot, 'true'); st.deferred.resolve(true); }
-    else if (type === 'done') { recCompact(st.slot); st.deferred.resolve(false); }   // predicate false -> drop + re-pull
-    else { recFnSettleError(st.slot); st.deferred.reject(new Error('boom')); }
+    if (type === 'value') { emit({ type: 'fn-settle', call, verdict: true }); ix.valueToSlot.set(st.arg, st.slot); recFnSettleValue(st.slot, 'true'); st.deferred.resolve(true); }
+    else if (type === 'done') { emit({ type: 'fn-settle', call, verdict: false }); recCompact(st.slot); st.deferred.resolve(false); }   // predicate false -> drop + re-pull
+    else { emit({ type: 'fn-settle', call, error: 'boom' }); recFnSettleError(st.slot); st.deferred.reject(new Error('boom')); }
   } else {                                    // flatMap
     if (type === 'done') return;              // a mapper iterator can't be `done`
-    if (type === 'value') { recFnSettleIterator(st.slot); st.deferred.resolve(makeInner(st.slot)); }
-    else { recFnSettleError(st.slot); st.deferred.reject(new Error('boom')); }
+    if (type === 'value') { emit({ type: 'fn-settle', call, iterator: letterFor(st.slot) }); recFnSettleIterator(st.slot); st.deferred.resolve(makeInner(st.slot)); }
+    else { emit({ type: 'fn-settle', call, error: 'boom' }); recFnSettleError(st.slot); st.deferred.reject(new Error('boom')); }
   }
 }
 
@@ -753,6 +806,7 @@ function settleFn(st, type) {
 // the next recorded action as a normal animated tick. A fresh action from
 // an undone position truncates the history: the old future is forgotten.
 let ixHistory = [];   // action descriptors, in order
+let ixCaptured = [];  // per-action scenario events (aligned with ixHistory), for export
 let ixCursor = 0;     // how many of them are currently applied
 
 function performAction(a) {
@@ -771,6 +825,7 @@ async function runTick(action) {
   performAction(action);
   await flush();
   commitFrame();
+  ixCaptured[ixCursor - 1] = fEvents;   // this tick's scenario events, for export
   updateButtons();
   await waitForTransitions();   // gate input for exactly the effects' duration
   if (ix) { ix.busy = false; updateButtons(); }
@@ -779,6 +834,7 @@ async function runTick(action) {
 function userAction(action) {
   if (!ix || ix.busy) return;
   ixHistory.length = ixCursor;   // a new action forgets any undone future
+  ixCaptured.length = ixCursor;
   ixHistory.push(action);
   ixCursor++;
   runTick(action);
@@ -805,6 +861,7 @@ async function ixGo(n) {
     performAction(ixHistory[i]);
     await flush();
     commitFrame();
+    ixCaptured[i] = fEvents;   // re-derive each replayed tick's events (deterministic)
   }
   ixCursor = n;
   void root.getBoundingClientRect();   // commit the snap, then re-enable
@@ -892,7 +949,93 @@ function updateButtons() {
     stepmax.textContent = ixHistory.length;
     prevBtn.disabled = gated || ixCursor === 0;
     nextBtn.disabled = gated || ixCursor === ixHistory.length;
+    // export needs at least one *committed* action: nothing at step 0, and
+    // not mid-tick (the in-flight tick's events aren't captured until commit)
+    exportBtns.forEach((b) => { b.disabled = gated || ixCursor === 0; });
   }
+}
+
+// ---- export the live session as a scenario (see scenarios/FORMAT.md) ----
+// The captured per-action events become one tick (one step) each, up to the
+// current step — so stepping back and exporting yields just the prefix the
+// user is looking at. The result runs unchanged as an animation and as a test.
+let exportBtns = [];
+function buildScenario() {
+  const ticks = [];
+  for (let i = 0; i < ixCursor; i++) ticks.push({ steps: [{ events: ixCaptured[i] ?? [] }] });
+  return { id: `${currentSet}-interactive`, helper: currentSet, label: 'Interactive export', ticks };
+}
+// Render close to the hand-authored scenario style: structural keys unquoted,
+// one event object per line.
+function renderEvent(ev) {
+  return '{ ' + Object.keys(ev).map((k) => `${k}: ${JSON.stringify(ev[k])}`).join(', ') + ' }';
+}
+function serializeScenario(s) {
+  const lines = ['{'];
+  lines.push(`  id: ${JSON.stringify(s.id)},`);
+  lines.push(`  helper: ${JSON.stringify(s.helper)},`);
+  lines.push(`  label: ${JSON.stringify(s.label)},`);
+  lines.push('  ticks: [');
+  for (const tick of s.ticks) {
+    lines.push('    { steps: [');
+    for (const step of tick.steps) {
+      lines.push('      {');
+      lines.push('        events: [');
+      for (const ev of step.events) lines.push('          ' + renderEvent(ev) + ',');
+      lines.push('        ],');
+      lines.push('      },');
+    }
+    lines.push('    ] },');
+  }
+  lines.push('  ],');
+  lines.push('}');
+  return lines.join('\n');
+}
+function flashLabel(btn, text) {
+  const original = btn.dataset.label;
+  btn.textContent = text;
+  clearTimeout(+btn.dataset.timer || 0);
+  btn.dataset.timer = setTimeout(() => { btn.textContent = original; }, 1200);
+}
+async function exportCopy(btn) {
+  const text = serializeScenario(buildScenario());
+  try {
+    await navigator.clipboard.writeText(text);
+    flashLabel(btn, 'copied');
+  } catch {
+    flashLabel(btn, 'copy failed');
+  }
+}
+function exportDownload() {
+  const text = serializeScenario(buildScenario());
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/javascript' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${currentSet}-interactive-scenario.js`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+// The export toolbar lives in the caption strip (where step descriptions sit on
+// the recorded tabs), above the prev/step/next controls. Text now, icons later.
+function buildExportBar() {
+  caption.innerHTML = '';
+  exportBtns = [];
+  const bar = document.createElement('div');
+  bar.className = 'export-bar';
+  const mk = (label, title, handler) => {
+    const b = document.createElement('button');
+    b.className = 'export-btn';
+    b.textContent = label;
+    b.dataset.label = label;
+    b.title = title;
+    b.addEventListener('click', () => handler(b));
+    bar.appendChild(b);
+    exportBtns.push(b);
+    return b;
+  };
+  mk('copy', 'Copy the steps so far as a scenario (FORMAT.md) to the clipboard', exportCopy);
+  mk('download', 'Download the steps so far as a scenario file (FORMAT.md)', exportDownload);
+  caption.appendChild(bar);
 }
 
 // ---- building the consumer controls (.next() + result.return()) ----
@@ -973,8 +1116,9 @@ function selectInteractive() {
   // history (see ixGo); the usage instructions show in the top description
   // area rather than the bottom note.
   ixHistory = [];
+  ixCaptured = [];
   ixCursor = 0;
-  caption.innerHTML = '';
+  buildExportBar();
   descItems.forEach((d) => d.classList.remove('active'));
   let ixDesc = descEl.querySelector('#ix-desc');
   if (!ixDesc) { ixDesc = document.createElement('div'); ixDesc.id = 'ix-desc'; descEl.appendChild(ixDesc); }
@@ -992,6 +1136,8 @@ function exitInteractive() {
   interactive = false;
   ix = null;
   stimuli.clear();
+  caption.querySelector('.export-bar')?.remove();   // recorded tabs reuse the caption strip
+  exportBtns = [];
   // tear down everything the live session materialized, and un-squeeze the
   // static inner rows in case a 5th+ column re-laid them out
   root.querySelectorAll('.dyn').forEach((el) => el.remove());

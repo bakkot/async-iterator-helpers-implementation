@@ -28,8 +28,7 @@ let RESET_SELECTOR = STATE_CLASSES.map(c => '.' + c).join(',');
 
 let animIndex = 0;                              // which animation is selected
 let step = 0;                                   // which step within it
-let urlSync = false;                            // start writing the hash only after the first user switch
-let currentSet = 'map';                         // active helper set (for the Interactive tab)
+let currentSet = null;                          // active helper set (for the Interactive tab); null until the first route()
 let interactive = false;                        // the live Interactive tab is active
 const stepsOf = () => animations[animIndex].steps;
 const maxStep = () => stepsOf().length - 1;
@@ -268,10 +267,12 @@ function buildTabs() {
   descEl.replaceChildren();
   descItems = [];
   animations.forEach((a, i) => {
-    const b = document.createElement('button');
+    // Tabs are real links: clicking one just changes the hash, and route()
+    // (driven by hashchange) is what actually swaps the displayed animation.
+    const b = document.createElement('a');
     b.className = 'tab';
+    b.href = '#' + a.id;
     b.textContent = a.label;
-    b.addEventListener('click', () => selectAnimation(i));
     tabsEl.appendChild(b);
 
     // Render every description up front so the grid can size to the tallest.
@@ -285,10 +286,10 @@ function buildTabs() {
   // pre-baked scenario, it drives the real implementation and reflects the
   // user's stimuli (see the interactive driver below). Distinguished with a
   // sparkle + shimmer so it reads as the odd one out.
-  const ib = document.createElement('button');
+  const ib = document.createElement('a');
   ib.className = 'tab interactive';
+  ib.href = '#' + currentSet + '-interactive';
   ib.innerHTML = '✨ Interactive';
-  ib.addEventListener('click', () => selectInteractive());
   tabsEl.appendChild(ib);
 }
 
@@ -318,7 +319,29 @@ const setLinks = new Map([
   ['filter', document.getElementById('sel-filter')],
   ['flatMap', document.getElementById('sel-flatmap')],
 ]);
-setLinks.forEach((a, name) => a.addEventListener('click', () => selectSet(name)));
+// The helper links are real links too, each pointing at its set's first
+// animation; switching sets is just navigating there (route() handles it).
+setLinks.forEach((a, name) => { a.href = '#' + animationSets[name][0].id; });
+
+// Single source of truth for what's shown: the URL hash. Every selector (tab
+// links, helper links, keyboard switching) only changes the hash; this routes
+// that change to the matching display. A hash is either an animation id
+// ('map-non-concurrent') or '<set>-interactive' for a live tab; anything
+// unrecognized falls back to the map set's first animation.
+function route() {
+  const hash = decodeURIComponent((location.hash || '').slice(1));
+  if (hash.endsWith('-interactive')) {
+    const set = hash.slice(0, -'-interactive'.length);
+    if (animationSets[set]) {
+      if (set !== currentSet) selectSet(set);
+      selectInteractive();
+      return;
+    }
+  }
+  const { name, i } = locateAnim(hash) || { name: 'map', i: 0 };
+  if (name !== currentSet) selectSet(name, i);
+  else selectAnimation(i);
+}
 
 function selectAnimation(i) {
   exitInteractive();   // leaving the live tab (if we were on it)
@@ -329,11 +352,6 @@ function selectAnimation(i) {
   buildArrows(animations[i]);                  // generate this animation's arrow paths
   applyContent(animations[i].content || {});   // load this animation's box text
   render(false);   // render() wipes any state left from the prior animation
-  // Reflect the selection in the URL, in place (no new history entry, and
-  // replaceState doesn't scroll or fire hashchange). Suppressed for the
-  // initial paint so a fresh load doesn't immediately stamp the hash — we
-  // only start syncing once the user actually switches.
-  if (urlSync) history.replaceState(null, '', '#' + animations[i].id);
 }
 
 // ====================================================================
@@ -1173,6 +1191,9 @@ function loadScenarioText(text) {
   const helper = scenario.helper;
   selectSet(helper);
   selectInteractive();   // fresh live session at step 0
+  // Reflect the live tab in the URL without re-routing (replaceState doesn't
+  // fire hashchange) — route() would reset the session we're about to prime.
+  history.replaceState(null, '', '#' + helper + '-interactive');
   ixHistory = actions;   // …but primed with the loaded run, ready to step through
   ixCaptured = [];
   ixCursor = 0;
@@ -1314,8 +1335,6 @@ function selectInteractive() {
 
   makeSession(currentSet);
   updateButtons();
-
-  if (urlSync) history.replaceState(null, '', '#' + currentSet + '-interactive');
 }
 
 function exitInteractive() {
@@ -1363,11 +1382,11 @@ window.addEventListener('keydown', (e) => {
     switch (e.key) {
       case 'ArrowRight': case 'ArrowDown':
         e.preventDefault();
-        selectAnimation((animIndex + 1) % animations.length);
+        location.hash = animations[(animIndex + 1) % animations.length].id;
         return;
       case 'ArrowLeft': case 'ArrowUp':
         e.preventDefault();
-        selectAnimation((animIndex - 1 + animations.length) % animations.length);
+        location.hash = animations[(animIndex - 1 + animations.length) % animations.length].id;
         return;
     }
     return;
@@ -1394,16 +1413,7 @@ function placeTombstone(tombId, headerId) {
 placeTombstone('tomb-underlying', 'hdr-underlying');
 placeTombstone('tomb-result', 'hdr-result');
 
-// Initial paint: jump to the animation named in the URL hash if it's a known
-// id, otherwise fall back to the map set's first animation. A `#<set>-interactive`
-// hash lands on that set's live tab.
-const hash = decodeURIComponent((location.hash || '').slice(1));
-if (hash.endsWith('-interactive') && animationSets[hash.slice(0, -'-interactive'.length)]) {
-  selectSet(hash.slice(0, -'-interactive'.length));
-  selectInteractive();
-} else {
-  const initial = locateAnim(hash);
-  if (initial) selectSet(initial.name, initial.i);
-  else selectSet('map');
-}
-urlSync = true;   // from here on, switches update the hash
+// Initial paint and every subsequent navigation flow through the same router:
+// the hash decides what's shown, here and on every later hashchange.
+route();
+window.addEventListener('hashchange', route);

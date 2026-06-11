@@ -58,6 +58,12 @@ export function scenarioToAnimation(scenario) {
     tick.steps.forEach((step) => {
       const ops = [];
       const arrows = [];
+      // The stimuli this step performs, recorded as yellow-dot targets so the
+      // *previous* step can preview "you're about to poke this" — the same dot
+      // the Interactive tab puts on a settleable promise. A `box` target dots
+      // that box's corner; a `label` target ('result'/'return') dots just left
+      // of the Result / result.return() column header (no box exists yet).
+      const stim = [];
 
       for (const ev of step.events) {
         switch (ev.type) {
@@ -66,6 +72,7 @@ export function scenarioToAnimation(scenario) {
             if (r.row >= MAX_ROWS) notAnimatable(`result row ${r.row} out of range`);
             ops.push([`#r${r.row} .box`, '+pending']);
             boxState.set(`r${r.row}`, 'pending');
+            stim.push({ label: 'result' });
             break;
           }
           case 'return': {
@@ -76,6 +83,7 @@ export function scenarioToAnimation(scenario) {
             ops.push(['#c1 .box', '+pending']);
             boxState.set('c1', 'pending');
             setContent('c1', 'val', '{}');
+            stim.push({ label: 'return' });
             break;
           }
           case 'pull': {
@@ -101,6 +109,7 @@ export function scenarioToAnimation(scenario) {
             ops.push([`#${box} .box`, spec], [`#${box} .val`, '+reveal']);
             boxState.set(box, 'settled');
             setContent(box, 'val', valFor(ev));
+            stim.push({ box });
             break;
           }
           case 'fn': {
@@ -117,6 +126,7 @@ export function scenarioToAnimation(scenario) {
           case 'fn-settle': {
             const c = index.calls.get(ev.call);
             const el = `i${c.slot}`;
+            stim.push({ box: el });
             if ('error' in ev) {
               ops.push([`#${el} .box`, '-pending +settled +errored'], [`#${el} .label`, '-reveal']);
               if (scenario.helper !== 'flatMap') ops.push([`#${el} .divider`, '-reveal']);
@@ -176,6 +186,7 @@ export function scenarioToAnimation(scenario) {
           case 'close-settled': {
             const box = ev.target === 'source' ? 'c0' : 'c2';
             if (boxState.get(box) !== 'pending') break; // its close was never shown
+            stim.push({ box });
             const spec = 'error' in ev ? '-pending +settled +errored' : '-pending +settled';
             ops.push([`#${box} .box`, spec], [`#${box} .val`, '+reveal']);
             boxState.set(box, 'settled');
@@ -242,6 +253,7 @@ export function scenarioToAnimation(scenario) {
       const out = { caption: step.caption ?? tick.note ?? '', ops };
       const finalArrows = step.arrows ?? (arrows.length > 0 ? arrows : null);
       if (finalArrows) out.arrows = finalArrows;
+      if (stim.length) out.dots = stim;
       steps.push(out);
     });
   });

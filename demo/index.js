@@ -196,11 +196,54 @@ function render(animate) {
     root.classList.remove('no-anim');
   }
 
+  // Preview the *next* step's stimuli: wear the same yellow dot the
+  // Interactive tab puts on a settleable promise on whatever that step is
+  // about to poke. Recomputed every render (no animation owns it); the box
+  // geometry/visibility we read from the DOM we just rebuilt above.
+  root.querySelectorAll('.stim-dot').forEach((d) => d.remove());
+  for (const t of (steps[step + 1]?.dots || [])) previewDot(t);
+
   stepnum.textContent = step;
   stepmax.textContent = maxStep();
   caption.innerHTML = steps[step].caption;
   prevBtn.disabled = step === 0;
   nextBtn.disabled = step === maxStep();
+}
+
+// Place a non-interactive preview dot. A `box` target dots that box's corner
+// (matching addDot); a `label` target ('result'/'return') dots just left of a
+// column header, where the consumer's .next()/.return() will land — there is
+// no box for those yet. The header dot is parented into the same group as its
+// label (#main / #closing) so it shares that group's transform and, for the
+// closing band, its visibility (a dot for a return previewed before the band
+// has slid in simply stays hidden with the band).
+const LABEL_DOT = {
+  result: { sel: '#hdr-result',        parent: 'main' },
+  return: { sel: '#hdr-result-return', parent: 'closing' },
+};
+function previewDot(t) {
+  if (t.box) {
+    const g = root.querySelector(`#${t.box}`);
+    const box = g?.querySelector('.box');
+    if (!box) return;
+    g.appendChild(svgEl('circle', {
+      class: 'stim-dot',
+      cx: +box.getAttribute('x') + Math.min(15, +box.getAttribute('width') / 2),
+      cy: +box.getAttribute('y') + 15,
+      r: 7,
+    }));
+    return;
+  }
+  const spec = LABEL_DOT[t.label];
+  const label = root.querySelector(spec.sel);
+  if (!label) return;
+  const bb = label.getBBox();
+  root.querySelector('#' + spec.parent).appendChild(svgEl('circle', {
+    class: 'stim-dot',
+    cx: bb.x - 13,
+    cy: bb.y + bb.height / 2,
+    r: 7,
+  }));
 }
 
 function go(to) {

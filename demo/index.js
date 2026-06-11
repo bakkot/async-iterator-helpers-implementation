@@ -1388,6 +1388,26 @@ nextBtn.addEventListener('click', () => interactive ? ixGo(ixCursor + 1) : go(st
 prevBtn.addEventListener('click', () => interactive ? ixGo(ixCursor - 1) : go(step - 1));
 
 window.addEventListener('keydown', (e) => {
+  // Leave browser/OS chords (cmd/ctrl/shift + key) alone. Alt is ours — it
+  // switches between tabs in both recorded and live modes.
+  if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+
+  if (e.altKey) {
+    // Tab cycling spans the recorded animations plus the live Interactive tab
+    // as a final slot, so Alt+arrow walks into and out of the live tab.
+    const slots = animations.length + 1;                       // last slot is Interactive
+    const cur = interactive ? animations.length : animIndex;
+    const toSlot = (delta) => {
+      const n = (cur + delta + slots) % slots;
+      navigate(n < animations.length ? '#' + animations[n].id : '#' + currentSet + '-interactive');
+    };
+    switch (e.key) {
+      case 'ArrowRight': case 'ArrowDown': e.preventDefault(); toSlot(1);  return;
+      case 'ArrowLeft':  case 'ArrowUp':   e.preventDefault(); toSlot(-1); return;
+    }
+    return;
+  }
+
   if (interactive) {
     // on the live tab the stepper keys move through the action history
     switch (e.key) {
@@ -1400,19 +1420,7 @@ window.addEventListener('keydown', (e) => {
     }
     return;
   }
-  if (e.altKey) {
-    switch (e.key) {
-      case 'ArrowRight': case 'ArrowDown':
-        e.preventDefault();
-        navigate('#' + animations[(animIndex + 1) % animations.length].id);
-        return;
-      case 'ArrowLeft': case 'ArrowUp':
-        e.preventDefault();
-        navigate('#' + animations[(animIndex - 1 + animations.length) % animations.length].id);
-        return;
-    }
-    return;
-  }
+
   switch (e.key) {
     case 'ArrowRight': case 'ArrowDown': case ' ': case 'PageDown': case 'j':
       e.preventDefault(); go(step + 1); break;

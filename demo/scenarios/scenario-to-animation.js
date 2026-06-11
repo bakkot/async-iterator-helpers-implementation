@@ -258,7 +258,19 @@ export function scenarioToAnimation(scenario) {
     });
   });
 
-  const animation = { id: scenario.id, label: scenario.label, content, steps };
+  // Give every previewed stimulus its own beat: before each step that performs
+  // one (i.e. carries `dots`), splice in a do-nothing step that just repeats the
+  // prior visual state. Since the dot renders from the *next* step's `dots`, it
+  // lands on this quiet beat — so "about to poke X" reads as its own step rather
+  // than sharing the frame with the content that preceded it. The inserted step
+  // borrows the preceding step's caption (nothing changed but the dot).
+  const spaced = [];
+  for (const s of steps) {
+    if (s.dots) spaced.push({ caption: (spaced[spaced.length - 1] ?? s).caption, ops: [] });
+    spaced.push(s);
+  }
+
+  const animation = { id: scenario.id, label: scenario.label, content, steps: spaced };
   if (scenario.description != null) animation.description = scenario.description;
   return animation;
 }

@@ -757,6 +757,12 @@ async function userAction(perform) {
 }
 
 function commitFrame() {
+  // Anything minted during the drain (new rows, slots, inner boxes) has
+  // never been painted; force one style flush so its parked state becomes
+  // the transition's starting style — otherwise the ops below would land
+  // on it pre-paint and it would pop in fully applied instead of sliding
+  // and fading in like the statically parked spares do.
+  void root.getBoundingClientRect();
   applyStep(fOps);
   for (const [id, field, val] of fContent) {
     if (field === 'val') buildVal(root.querySelector(`#${id} .val`), val);

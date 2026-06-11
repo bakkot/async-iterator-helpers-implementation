@@ -740,20 +740,73 @@ function settleFn(st, type) {
   }
 }
 
-// Run one user action as a single tick: perform it, let the helper react
-// to quiescence, then commit every effect at once. Input is refused for
+// ---- action history (undo/redo) ----
+// Every user action is recorded as a small descriptor, and the stepper
+// under the diagram moves through that history. A live helper can't be
+// rewound, so undo (or any multi-step jump) rebuilds the session from
+// scratch and replays the prefix with animations off — actions are
+// deterministic (rows/slots/ids are assigned in a fixed order), so the
+// replay lands exactly where the user was. A single redo instead re-runs
+// the next recorded action as a normal animated tick. A fresh action from
+// an undone position truncates the history: the old future is forgotten.
+let ixHistory = [];   // action descriptors, in order
+let ixCursor = 0;     // how many of them are currently applied
+
+function performAction(a) {
+  if (a.kind === 'next') doNext();
+  else if (a.kind === 'return') doReturn();
+  else settleStimulus(a.id, a.type);
+}
+
+// Run one action as a single tick: perform it, let the helper react to
+// quiescence, then commit every effect at once. Input is refused for
 // the duration of the resulting transition.
-async function userAction(perform) {
-  if (!ix || ix.busy) return;
+async function runTick(action) {
   ix.busy = true;
   updateButtons();
   resetFrame();
-  perform();
+  performAction(action);
   await flush();
   commitFrame();
   updateButtons();
   await waitForTransitions();   // gate input for exactly the effects' duration
   if (ix) { ix.busy = false; updateButtons(); }
+}
+
+function userAction(action) {
+  if (!ix || ix.busy) return;
+  ixHistory.length = ixCursor;   // a new action forgets any undone future
+  ixHistory.push(action);
+  ixCursor++;
+  runTick(action);
+}
+
+// Move to position `n` in the action history (the stepper / arrow keys).
+async function ixGo(n) {
+  n = Math.max(0, Math.min(ixHistory.length, n));
+  if (!ix || ix.busy || n === ixCursor) return;
+  if (n === ixCursor + 1) {       // a single redo replays the action live
+    ixCursor = n;
+    runTick(ixHistory[n - 1]);
+    return;
+  }
+  // Backward (or multi-step) jump: rebuild the session and replay the
+  // first n actions snapped. Every await below is a microtask, so the
+  // whole replay happens before the browser can paint (or deliver any
+  // input event) — the diagram just appears in the target state.
+  root.classList.add('no-anim');
+  resetLiveCanvas();
+  makeSession(currentSet);
+  for (let i = 0; i < n; i++) {
+    resetFrame();
+    performAction(ixHistory[i]);
+    await flush();
+    commitFrame();
+  }
+  ixCursor = n;
+  void root.getBoundingClientRect();   // commit the snap, then re-enable
+  root.classList.remove('no-anim');
+  updateButtons();
 }
 
 function commitFrame() {
@@ -810,7 +863,7 @@ function revealArrow(conn) {
 root.addEventListener('click', (e) => {
   if (!interactive || !ix || ix.busy) return;
   const g = e.target.closest('[id]');
-  if (g && stimuli.has(g.id)) userAction(() => settleStimulus(g.id, e.shiftKey ? 'error' : 'value'));
+  if (g && stimuli.has(g.id)) userAction({ kind: 'settle', id: g.id, type: e.shiftKey ? 'error' : 'value' });
 });
 root.addEventListener('contextmenu', (e) => {
   if (!interactive || !ix) return;
@@ -821,15 +874,22 @@ root.addEventListener('contextmenu', (e) => {
   // right-click is `done`/`false`. A map/flatMap mapper result can't be done,
   // so right-clicking it does nothing; a filter predicate settles to `false`.
   if (st.kind === 'fn' && ix.helper !== 'filter') return;
-  if (!ix.busy) userAction(() => settleStimulus(g.id, 'done'));
+  if (!ix.busy) userAction({ kind: 'settle', id: g.id, type: 'done' });
 });
 
-// ---- enabling/disabling the consumer buttons ----
+// ---- enabling/disabling the consumer buttons + the history stepper ----
 function updateButtons() {
+  const gated = !ix || ix.busy;
   const nb = root.querySelector('#next-btn');
   const rb = root.querySelector('#return-btn');
-  if (nb) nb.classList.toggle('disabled', !ix || ix.busy);
-  if (rb) rb.classList.toggle('disabled', !ix || ix.busy);
+  if (nb) nb.classList.toggle('disabled', gated);
+  if (rb) rb.classList.toggle('disabled', gated);
+  if (interactive) {   // the stepper mirrors the action history (undo/redo)
+    stepnum.textContent = ixCursor;
+    stepmax.textContent = ixHistory.length;
+    prevBtn.disabled = gated || ixCursor === 0;
+    nextBtn.disabled = gated || ixCursor === ixHistory.length;
+  }
 }
 
 // ---- building the consumer controls (.next() + result.return()) ----
@@ -842,7 +902,7 @@ function buildInteractiveButtons() {
   label.textContent = '.next()';
   g.append(bg, label);
   document.getElementById('main').appendChild(g);
-  g.addEventListener('click', () => { if (ix && !ix.busy) userAction(doNext); });
+  g.addEventListener('click', () => { if (ix && !ix.busy) userAction({ kind: 'next' }); });
 
   // Turn the result.return() column header into a button: wrap the existing
   // header text in a clickable group behind a backing pill (so the whole pill
@@ -855,7 +915,7 @@ function buildInteractiveButtons() {
     hdr.parentNode.insertBefore(grp, hdr);
     grp.append(pill, hdr);                 // pill behind, header text in front
     hdr.classList.add('ibtn-header');
-    grp.addEventListener('click', () => { if (ix && !ix.busy) userAction(doReturn); });
+    grp.addEventListener('click', () => { if (ix && !ix.busy) userAction({ kind: 'return' }); });
   }
 }
 
@@ -872,17 +932,17 @@ const IX_INSTRUCTIONS = (h) =>
   'Press <code>.next()</code> (or <code>result.return()</code>) to act as the consumer. Any promise the helper is waiting on wears a glowing dot — settle it yourself: ' +
   '<b>click</b> = a value, <b>right-click</b> = <code>done</code>, <b>shift-click</b> = an error. ' +
   IX_FN_NOTE[h] +
-  ' Effects from one tick animate together; input is paused while they play out.';
+  ' Effects from one tick animate together; input is paused while they play out. ' +
+  'The stepper below (or ← / →) undoes and redoes your actions — acting from an undone point discards the old future.';
 
-function selectInteractive() {
-  exitInteractive();
-  interactive = true;
-  [...tabsEl.children].forEach((b) => b.classList.remove('active'));
-  tabsEl.querySelector('.tab.interactive')?.classList.add('active');
-
-  // Wipe to a clean diagram with the closing band permanently open and the
-  // box columns lowered (the `interactive` class drives both, via CSS).
-  root.classList.add('no-anim', 'interactive');
+// Wipe the diagram to the live tab's blank state: no dynamic elements, no
+// state classes/content/arrows/dots, the closing band permanently open and
+// the box columns lowered (the `interactive` class drives both, via CSS).
+// Used on entry and to rebuild for a history jump; callers wrap it in
+// .no-anim so the wipe snaps.
+function resetLiveCanvas() {
+  root.querySelectorAll('.dyn').forEach((el) => el.remove());
+  for (let s = 0; s < 4; s++) layoutInnerRow(s, 4);   // un-squeeze the static inner rows
   root.querySelectorAll(RESET_SELECTOR).forEach((el) => el.classList.remove(...STATE_CLASSES));
   applyContent({});
   mainArrows.textContent = ''; closingArrows.textContent = ''; arrowEls = {};
@@ -890,15 +950,27 @@ function selectInteractive() {
   document.getElementById('closing').classList.add('shown');
   root.setAttribute('viewBox', '0 0 900 760');
   root.querySelectorAll('.stim-dot').forEach((d) => d.remove());
+  root.querySelectorAll('.box.stimulus').forEach((b) => b.classList.remove('stimulus'));
   stimuli.clear();
+}
+
+function selectInteractive() {
+  exitInteractive();
+  interactive = true;
+  [...tabsEl.children].forEach((b) => b.classList.remove('active'));
+  tabsEl.querySelector('.tab.interactive')?.classList.add('active');
+
+  root.classList.add('no-anim', 'interactive');
+  resetLiveCanvas();
   buildInteractiveButtons();
   void root.getBoundingClientRect();
   root.classList.remove('no-anim');
 
-  // Hide the stepper (the live tab is click-driven) and show the usage
-  // instructions in the top description area rather than the bottom note.
-  document.querySelector('.controls').style.display = 'none';
-  document.querySelector('.hint').style.display = 'none';
+  // The stepper below the diagram steps through the user's own action
+  // history (see ixGo); the usage instructions show in the top description
+  // area rather than the bottom note.
+  ixHistory = [];
+  ixCursor = 0;
   caption.innerHTML = '';
   descItems.forEach((d) => d.classList.remove('active'));
   let ixDesc = descEl.querySelector('#ix-desc');
@@ -933,15 +1005,24 @@ function exitInteractive() {
     grp.parentNode.insertBefore(txt, grp);
     grp.remove();
   }
-  document.querySelector('.controls').style.display = '';
-  document.querySelector('.hint').style.display = '';
 }
 
-nextBtn.addEventListener('click', () => go(step + 1));
-prevBtn.addEventListener('click', () => go(step - 1));
+nextBtn.addEventListener('click', () => interactive ? ixGo(ixCursor + 1) : go(step + 1));
+prevBtn.addEventListener('click', () => interactive ? ixGo(ixCursor - 1) : go(step - 1));
 
 window.addEventListener('keydown', (e) => {
-  if (interactive) return;   // the stepper is inert on the live tab
+  if (interactive) {
+    // on the live tab the stepper keys move through the action history
+    switch (e.key) {
+      case 'ArrowRight': case 'ArrowDown': case ' ': case 'PageDown': case 'j':
+        e.preventDefault(); ixGo(ixCursor + 1); break;
+      case 'ArrowLeft': case 'ArrowUp': case 'PageUp': case 'k':
+        e.preventDefault(); ixGo(ixCursor - 1); break;
+      case 'Home': e.preventDefault(); ixGo(0); break;
+      case 'End':  e.preventDefault(); ixGo(ixHistory.length); break;
+    }
+    return;
+  }
   if (e.altKey) {
     switch (e.key) {
       case 'ArrowRight': case 'ArrowDown':

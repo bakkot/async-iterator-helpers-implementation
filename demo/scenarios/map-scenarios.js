@@ -18,21 +18,19 @@ export const mapScenarios = [
     id: "map-non-concurrent",
     helper: "map",
     label: "Simple non-concurrent",
-    description: "A baseline with no concurrency: the consumer calls <code>.next()</code>, waits for it to resolve, and only then calls again. At most one underlying pull and one mapper are ever in flight. The map pulls from the source, runs the mapper <code>f</code>, and forwards the mapped value <code>f(x)</code>. Unlike filter, every value passes through — nothing is dropped.",
+    description: "Arrows or buttons at the bottom to navigate, alt-arrow to switch to other animations, click the names of the other helpers at the top for theirs. Dots indicate where some external-to-the-machinery action is about to occur.<br><br>This is a baseline for <code>.map</code> with no concurrency. It works like you'd expect.",
     ticks: [
       { steps: [
         {
-          caption: "Idle. The mapped iterator is wired up; the consumer hasn’t asked for anything yet.",
           events: [],
         },
         {
-          caption: "Consumer calls <code>.next()</code> on the <b>Result</b> iterator. The request is <b>pending</b> — highlighted, but unsettled.",
           events: [
             { type: "next", result: "r0" },
           ],
         },
         {
-          caption: "Result forwards a pull to the <b>Underlying</b> source. That request is now pending too.",
+          caption: "Request is forwarded to underlying. This happens same tick. Animations will often split one tick across multiple animation steps for expository reasons.",
           events: [
             { type: "pull", pull: "u0" },
           ],
@@ -40,7 +38,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Underlying settles with value <code>A</code> and hands it to the <b>Internal</b> stage, which invokes the mapper <code>f(A)</code> — pending while it runs.",
           events: [
             { type: "settle", pull: "u0", value: "A" },
             { type: "fn", call: "p0", arg: "A", from: "u0" },
@@ -49,13 +46,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(A)</code> resolves to <code>fA</code>.",
           events: [
             { type: "fn-settle", call: "p0", value: "fA" },
           ],
         },
         {
-          caption: "Because <code>map</code> never drops a value, each result corresponds to exactly one element — so the mapped value is forwarded to <b>Result</b> the moment its mapper settles. The consumer’s <code>.next()</code> resolves with <code>{ value: fA, done: false }</code>.",
           events: [
             { type: "result", result: "r0", value: "fA", from: "p0" },
           ],
@@ -63,13 +58,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The consumer pulls again. A new request is <b>pending</b> on the second <b>Result</b> row.",
           events: [
             { type: "next", result: "r1" },
           ],
         },
         {
-          caption: "Result forwards the pull to the <b>Underlying</b> source for its next element. Pending.",
           events: [
             { type: "pull", pull: "u1" },
           ],
@@ -77,7 +70,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Underlying settles with <code>B</code> and hands it to the <b>Internal</b> stage, which invokes <code>f(B)</code> — pending.",
           events: [
             { type: "settle", pull: "u1", value: "B" },
             { type: "fn", call: "p1", arg: "B", from: "u1" },
@@ -86,14 +78,12 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(B)</code> resolves to <code>fB</code>, which is forwarded to the second <b>Result</b> row — the consumer’s second <code>.next()</code> resolves with <code>{ value: fB, done: false }</code>.",
           events: [
             { type: "fn-settle", call: "p1", value: "fB" },
             { type: "result", result: "r1", value: "fB", from: "p1" },
           ],
         },
         {
-          caption: "Both results are delivered, in source order — <code>fA</code> then <code>fB</code> — and the run is complete.",
           events: [],
         },
       ] },
@@ -102,22 +92,19 @@ export const mapScenarios = [
   {
     id: "map-concurrent",
     helper: "map",
-    label: "Simple concurrent",
-    description: "The consumer issues a second <code>.next()</code> before the first has resolved, so the map keeps two underlying pulls — and two mappers — running at once. Unlike filter, every element maps to exactly one result, so a result can resolve as soon as its <i>own</i> mapper settles — it need not wait for earlier ones. When a later value’s mapper settles first, that <code>.next()</code> resolves first too: delivery follows completion order, not source order.",
+    label: "Simple concurrent*",
+    description: "The distinguishing feature is that the consumer can call <code>.next()</code> again before previous calls have resolved.<br><br>For <code>.map</code>, uniquely, we can deliver values as they settle. <strong>Open question</strong>: should we?",
     ticks: [
       { steps: [
         {
-          caption: "Idle. Same wiring as before — but this consumer won’t wait for one pull to finish before issuing the next.",
           events: [],
         },
         {
-          caption: "Consumer calls <code>.next()</code> on the <b>Result</b> iterator. The request is <b>pending</b> on row 1.",
           events: [
             { type: "next", result: "r0" },
           ],
         },
         {
-          caption: "Result forwards a pull to the <b>Underlying</b> source. That request is now pending too.",
           events: [
             { type: "pull", pull: "u0" },
           ],
@@ -125,7 +112,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Underlying settles with <code>A</code> and hands it to the <b>Internal</b> stage, which invokes <code>f(A)</code> — pending while the mapper runs.",
           events: [
             { type: "settle", pull: "u0", value: "A" },
             { type: "fn", call: "p0", arg: "A", from: "u0" },
@@ -134,13 +120,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Without waiting for <code>f(A)</code> to settle, the consumer calls <code>.next()</code> <i>again</i>. <b>Result</b> row 2 goes pending.",
           events: [
             { type: "next", result: "r1" },
           ],
         },
         {
-          caption: "Result forwards a second pull to the <b>Underlying</b> source. Pending.",
           events: [
             { type: "pull", pull: "u1" },
           ],
@@ -148,7 +132,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Underlying settles with <code>B</code> and runs <code>f(B)</code> in the second <b>Internal</b> row. Now <i>two mappers</i> are in flight <b>concurrently</b> — <code>f(A)</code> is still pending.",
           events: [
             { type: "settle", pull: "u1", value: "B" },
             { type: "fn", call: "p1", arg: "B", from: "u1" },
@@ -157,7 +140,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(B)</code> resolves to <code>fB</code> first — even though <code>B</code> is the <i>second</i> element. No need to buffer: each result maps to exactly one element, so <code>fB</code> is delivered <i>immediately</i> — the <i>second</i> <code>.next()</code> resolves with <code>{ value: fB }</code> while the first is still pending.",
           events: [
             { type: "fn-settle", call: "p1", value: "fB" },
             { type: "result", result: "r1", value: "fB", from: "p1" },
@@ -166,39 +148,34 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Later, <code>f(A)</code> resolves to <code>fA</code> and is forwarded to the first <b>Result</b> row — the first <code>.next()</code> resolves with <code>{ value: fA }</code>, <i>after</i> the second one already did.",
           events: [
             { type: "fn-settle", call: "p0", value: "fA" },
             { type: "result", result: "r0", value: "fA", from: "p0" },
           ],
         },
         {
-          caption: "Both results are delivered — but in <b>completion order</b>, <code>fB</code> then <code>fA</code>, not source order. With <code>map</code>’s one-to-one correspondence each <code>.next()</code> resolves as soon as its own mapper does.",
           events: [],
         },
       ] },
     ],
   },
   {
-    id: "map-truncation",
+    id: "map-exhaustion",
     helper: "map",
-    label: "Truncation",
-    description: "Values are now shown as full iterator records (<code>done</code>/<code>value</code>). While two pulls are in flight, the source runs out: a <code>{ done: true }</code> result passes straight through the map — the mapper never runs on it — and resolves the second pending <code>.next()</code>, even though the first is still waiting on <code>A</code>.",
+    label: "Exhaustion",
+    description: "Values are now shown as full iterator records (<code>done</code>/<code>value</code>). Here, the underlying iterator returns <code>done: true</code> on its second pull. This does not discard the earlier pull.",
     display: { records: true },
     ticks: [
       { steps: [
         {
-          caption: "Idle. Wired up like “Simple concurrent”, except each Underlying and Result value now shows its full iterator record — <code>done</code> and <code>value</code>.",
           events: [],
         },
         {
-          caption: "Consumer calls <code>.next()</code> on the <b>Result</b> iterator. The request is <b>pending</b> on row 1.",
           events: [
             { type: "next", result: "r0" },
           ],
         },
         {
-          caption: "Result forwards a pull to the <b>Underlying</b> source. That request is now pending too.",
           events: [
             { type: "pull", pull: "u0" },
           ],
@@ -206,13 +183,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Without waiting for the first to settle, the consumer calls <code>.next()</code> <i>again</i>. <b>Result</b> row 2 goes pending.",
           events: [
             { type: "next", result: "r1" },
           ],
         },
         {
-          caption: "A <i>second</i> pull is forwarded to <b>Underlying</b> — two requests are now in flight <b>concurrently</b>.",
           events: [
             { type: "pull", pull: "u1" },
           ],
@@ -220,19 +195,18 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The <i>second</i> Underlying request settles first with <code>{ done: true }</code> — the source is exhausted. There’s no value to map, so nothing enters the <b>Internal</b> buffer. (<code>A</code>’s request is still outstanding.)",
           events: [
             { type: "settle", pull: "u1", done: true },
           ],
         },
         {
-          caption: "That completion passes straight through, bypassing the mapper: the <i>second</i> pending <code>.next()</code> resolves, so <b>Result</b> row 2 settles with <code>{ done: true }</code>.",
+          caption: "Even if we decide <code>.map</code> should not deliver values in general out of order, it can still eagerly deliver <code>done: true</code> results specifically.",
           events: [
             { type: "result", result: "r1", done: true },
           ],
         },
         {
-          caption: "The source is exhausted, so both iterators are now <b>closed</b> — marked with 🪦 beside their column headers.",
+          caption: "We internally track when iterators are closed, which we indicate with a 🪦 beside their column headers.",
           events: [
             { type: "tombstone", target: "underlying" },
             { type: "tombstone", target: "result" },
@@ -241,7 +215,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Meanwhile the <i>first</i> Underlying request finally settles — <code>{ done: false, value: A }</code> — and runs <code>f(A)</code> in the first <b>Internal</b> row.",
           events: [
             { type: "settle", pull: "u0", value: "A" },
             { type: "fn", call: "p0", arg: "A", from: "u0" },
@@ -250,7 +223,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(A)</code> resolves to <code>fA</code>, which is forwarded to the first <b>Result</b> row — the first <code>.next()</code> settles with <code>{ done: false, value: fA }</code>.",
           events: [
             { type: "fn-settle", call: "p0", value: "fA" },
             { type: "result", result: "r0", value: "fA", from: "p0" },
@@ -259,13 +231,13 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The consumer pulls once more. <b>Result</b> row 3 goes pending.",
+          caption: "You can continue to pull after the iterator is closed.",
           events: [
             { type: "next", result: "r2" },
           ],
         },
         {
-          caption: "The iterator is already closed, so the pull settles immediately with <code>{ done: true }</code> — once exhausted, it keeps reporting done.",
+          caption: "But such pulls are not forwarded; they simply settle immediately with <code>done: true</code>.",
           events: [
             { type: "result", result: "r2", done: true },
           ],
@@ -274,25 +246,22 @@ export const mapScenarios = [
     ],
   },
   {
-    id: "map-truncation-2",
+    id: "map-exhaustion-2",
     helper: "map",
-    label: "Truncation 2",
-    description: "A third <code>.next()</code> races the source running dry. The <code>{ done: true }</code> resolves the <i>second</i> call — but the first and third are each chained to their <i>own</i> still-outstanding pull, so they keep waiting. The slow <code>A</code> arrives and is mapped to <code>fA</code>; then the third pull settles with <code>C</code> — a value, after the source already reported done — which <code>map</code> runs through the mapper and delivers: the third call resolves <code>{ done: false, value: fC }</code> after the second already settled <code>{ done: true }</code>.<br><br><strong>Note</strong>: settling with a <code>done: false</code> after a <code>done: true</code> is unique to <code>map</code> and may be changed.",
+    label: "Exhaustion 2*",
+    description: "It is possible for the underlying iterator to be <em>incoherent</em>, that is, to produce a <code>done: false</code> after a <code>done: true</code>. For <code>.map</code>, if multiple pulls are in flight, this can be observed.<br><br><strong>Open question</strong>: What should we do in this case? The other helpers would have settled the 3rd pull with <code>done: true</code>. My inclination is to make this an <code>unhandledrejection</code> event.",
     display: { records: true },
     ticks: [
       { steps: [
         {
-          caption: "Idle. Same concurrent <code>map</code> as “Truncation”, but this consumer will pull a <i>third</i> time — and the slow first value races against the source running out.",
           events: [],
         },
         {
-          caption: "Consumer calls <code>.next()</code> on the <b>Result</b> iterator. The request is <b>pending</b> on row 1.",
           events: [
             { type: "next", result: "r0" },
           ],
         },
         {
-          caption: "Result forwards a pull to the <b>Underlying</b> source. That request is now pending too.",
           events: [
             { type: "pull", pull: "u0" },
           ],
@@ -300,13 +269,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Without waiting for the first to settle, the consumer calls <code>.next()</code> <i>again</i>. <b>Result</b> row 2 goes pending.",
           events: [
             { type: "next", result: "r1" },
           ],
         },
         {
-          caption: "A <i>second</i> pull is forwarded to <b>Underlying</b> — two requests are now in flight <b>concurrently</b>.",
           events: [
             { type: "pull", pull: "u1" },
           ],
@@ -314,13 +281,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The consumer calls <code>.next()</code> a <i>third</i> time — <b>Result</b> row 3 goes pending. The first two pulls are still unsettled.",
           events: [
             { type: "next", result: "r2" },
           ],
         },
         {
-          caption: "The map forwards a <i>third</i> pull to <b>Underlying</b> (row 3). Three pulls are now in flight at once — while <code>A</code>’s original request (row 1) is <i>still</i> outstanding.",
           events: [
             { type: "pull", pull: "u2" },
           ],
@@ -328,13 +293,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The <i>second</i> pull settles with <code>{ done: true }</code> — the source is exhausted. There’s no value to map, so nothing enters the <b>Internal</b> buffer. (<code>A</code>’s request is still outstanding.)",
           events: [
             { type: "settle", pull: "u1", done: true },
           ],
         },
         {
-          caption: "The <i>second</i> <code>.next()</code> has nothing more coming, so <b>Result</b> row 2 settles with <code>{ done: true }</code>, and both iterators are now <b>closed</b> — marked with 🪦 beside their column headers. But rows 1 and 3 are each chained to their <i>own</i> still-outstanding pull, so they keep waiting.",
           events: [
             { type: "result", result: "r1", done: true },
             { type: "tombstone", target: "underlying" },
@@ -344,7 +307,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "At last the row-1 pull settles — <code>{ done: false, value: A }</code> — and runs <code>f(A)</code> in the first <b>Internal</b> row.",
           events: [
             { type: "settle", pull: "u0", value: "A" },
             { type: "fn", call: "p0", arg: "A", from: "u0" },
@@ -353,7 +315,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(A)</code> resolves to <code>fA</code>, which is forwarded to the first <b>Result</b> row — the first <code>.next()</code> finally settles with <code>{ done: false, value: fA }</code>.",
           events: [
             { type: "fn-settle", call: "p0", value: "fA" },
             { type: "result", result: "r0", value: "fA", from: "p0" },
@@ -362,7 +323,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Long after the source reported <code>{ done: true }</code>, the <i>third</i> pull settles too — with a <i>value</i>: <code>{ done: false, value: C }</code>. <code>map</code> doesn’t track which pulls the completion superseded: the value is handed to the <b>Internal</b> stage and <code>f(C)</code> runs.",
           events: [
             { type: "settle", pull: "u2", value: "C" },
             { type: "fn", call: "p1", arg: "C", from: "u2" },
@@ -371,14 +331,109 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "<code>f(C)</code> resolves to <code>fC</code>, which is forwarded to the third <b>Result</b> row: the third <code>.next()</code> settles with <code>{ done: false, value: fC }</code> — a value, <i>after</i> the second <code>.next()</code> already reported <code>{ done: true }</code>.",
           events: [
             { type: "fn-settle", call: "p1", value: "fC" },
             { type: "result", result: "r2", value: "fC", from: "p1" },
           ],
         },
         {
-          caption: "All three results are delivered: <code>fA</code>, then <code>{ done: true }</code>, then <code>fC</code> — the run is complete.",
+          events: [],
+        },
+      ] },
+    ],
+  },
+  {
+    id: "map-exhaustion-3",
+    helper: "map",
+    label: "Exhaustion 3*",
+    description: "As in <a href=\"#map-exhaustion-2\">Exhaustion 2</a>, but now the 3rd value has already settled when we get the <code>done: true</code> from the second.<br><br><strong>Open question</strong>: What should we do in this case? In this case we could reject the outstanding pull with an error, rather than needing an <code>unhandledrejection</code> event.",
+    display: { records: true },
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+          ],
+        },
+        {
+          events: [
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+        {
+          events: [
+            { type: "pull", pull: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r2" },
+          ],
+        },
+        {
+          events: [
+            { type: "pull", pull: "u2" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u2", value: "C" },
+            { type: "fn", call: "p1", arg: "C", from: "u2" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p1", value: "fC" },
+            { type: "result", result: "r2", value: "fC", from: "p1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u1", done: true },
+          ],
+        },
+        {
+          events: [
+            { type: "result", result: "r1", done: true },
+            { type: "tombstone", target: "underlying" },
+            { type: "tombstone", target: "result" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", value: "fA" },
+            { type: "result", result: "r0", value: "fA", from: "p0" },
+          ],
+        },
+        {
           events: [],
         },
       ] },
@@ -388,22 +443,19 @@ export const mapScenarios = [
     id: "map-closing",
     helper: "map",
     label: "Closing",
-    description: "TODO",
+    description: "Consumers can also call <code>.return()</code> concurrently with one or more calls to <code>.next()</code>, which can be blocked either on the mapper or the underlying pull.",
     display: { records: true },
     ticks: [
       { steps: [
         {
-          caption: "Idle.",
           events: [],
         },
         {
-          caption: "TODO",
           events: [
             { type: "next", result: "r0" },
           ],
         },
         {
-          caption: "TODO",
           events: [
             { type: "pull", pull: "u0" },
           ],
@@ -411,13 +463,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "TODO",
           events: [
             { type: "next", result: "r1" },
           ],
         },
         {
-          caption: "TODO",
           events: [
             { type: "pull", pull: "u1" },
           ],
@@ -425,14 +475,13 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "TODO",
           events: [
             { type: "settle", pull: "u0", value: "A" },
             { type: "fn", call: "p0", arg: "A", from: "u0" },
           ],
         },
         {
-          caption: "The diagram shifts down and the <code>underlying.return()</code> / <code>result.return()</code> columns slide in above.",
+          caption: "Just in case you thought this diagram was too simple, here's the rest of it!",
           events: [
             { type: "open-closing" },
           ],
@@ -440,34 +489,27 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "TODO",
           events: [
             { type: "return", result: "ret" },
           ],
         },
         {
-          caption: "TODO",
-          events: [
-            { type: "tombstone", target: "result" },
-          ],
-        },
-        {
-          caption: "TODO",
+          caption: "Calling <code>.return()</code> when not closed will forward the call to the underlying iterator, and will cause the iterator to be considered closed.",
           events: [
             { type: "close", target: "source" },
+            { type: "tombstone", target: "result" },
             { type: "tombstone", target: "underlying" },
           ],
         },
       ] },
       { steps: [
         {
-          caption: "TODO",
+          caption: "Further calls to <code>.next()</code> settle with <code>done: true</code>, even if the call to <code>.return()</code> is not yet complete.",
           events: [
             { type: "next", result: "r2" },
           ],
         },
         {
-          caption: "TODO",
           events: [
             { type: "result", result: "r2", done: true },
           ],
@@ -475,13 +517,11 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "TODO",
           events: [
             { type: "close-settled", target: "source" },
           ],
         },
         {
-          caption: "TODO",
           events: [
             { type: "result", result: "ret", done: true },
           ],
@@ -489,7 +529,7 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "TODO",
+          caption: "Values from earlier calls can still be delivered.",
           events: [
             { type: "fn-settle", call: "p0", value: "fA" },
             { type: "result", result: "r0", value: "fA", from: "p0" },
@@ -498,7 +538,6 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "TODO",
           events: [
             { type: "settle", pull: "u1", value: "B" },
             { type: "fn", call: "p1", arg: "B", from: "u1" },
@@ -507,14 +546,12 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "TODO",
           events: [
             { type: "fn-settle", call: "p1", value: "fB" },
             { type: "result", result: "r1", value: "fB", from: "p1" },
           ],
         },
         {
-          caption: "TODO",
           events: [],
         },
       ] },

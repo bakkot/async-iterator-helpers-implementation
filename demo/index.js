@@ -343,6 +343,28 @@ function route() {
   else selectAnimation(i);
 }
 
+// Navigate in place: swap the current history entry (rather than push a new
+// one) and apply it. Internal navigation — clicking a tab/helper/description
+// link, or arrow-key switching — goes through here so flipping between
+// animations doesn't pile up back-button history; the demo stays a single
+// entry. Genuine back/forward still arrive via the hashchange listener.
+function navigate(hash) {
+  if (hash === location.hash) return;   // already there; clicking the active tab is a no-op
+  history.replaceState(null, '', hash);
+  route();
+}
+
+// Catch plain left-clicks on in-page hash links and route them in place.
+// Modified clicks (cmd/ctrl/shift, middle-click) fall through so "open in new
+// tab/window" keeps working.
+document.addEventListener('click', (e) => {
+  if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  const a = e.target.closest('a[href^="#"]');
+  if (!a) return;
+  e.preventDefault();
+  navigate(a.getAttribute('href'));
+});
+
 function selectAnimation(i) {
   exitInteractive();   // leaving the live tab (if we were on it)
   animIndex = i;
@@ -1382,11 +1404,11 @@ window.addEventListener('keydown', (e) => {
     switch (e.key) {
       case 'ArrowRight': case 'ArrowDown':
         e.preventDefault();
-        location.hash = animations[(animIndex + 1) % animations.length].id;
+        navigate('#' + animations[(animIndex + 1) % animations.length].id);
         return;
       case 'ArrowLeft': case 'ArrowUp':
         e.preventDefault();
-        location.hash = animations[(animIndex - 1 + animations.length) % animations.length].id;
+        navigate('#' + animations[(animIndex - 1 + animations.length) % animations.length].id);
         return;
     }
     return;
@@ -1413,7 +1435,8 @@ function placeTombstone(tombId, headerId) {
 placeTombstone('tomb-underlying', 'hdr-underlying');
 placeTombstone('tomb-result', 'hdr-result');
 
-// Initial paint and every subsequent navigation flow through the same router:
-// the hash decides what's shown, here and on every later hashchange.
+// Initial paint reads the hash; internal navigation goes through navigate()
+// (in place, no history growth), so hashchange now only fires for genuine
+// back/forward or a hand-edited URL — route those too.
 route();
 window.addEventListener('hashchange', route);

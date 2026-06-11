@@ -841,6 +841,15 @@ export const flatMapScenarios = [
       ] },
       { steps: [
         {
+          caption: "Meanwhile the first inner pull settles — it yields <code>a1</code>, forwarded to the first <code>.next()</code>: <b>Result</b> row 1 resolves with <code>{ value: a1 }</code>.",
+          events: [
+            { type: "settle", pull: "a0", value: "a1" },
+            { type: "result", result: "r0", value: "a1", from: "a0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
           caption: "The <i>second</i> inner pull settles first — with <code>{ done: true }</code>. The inner iterator had only one value, so it’s <b>exhausted</b>. That <code>done</code> isn’t forwarded; instead <code>flatMap</code> advances to the next source value, forwarding a fresh pull to <b>Underlying</b>. (The first inner pull is still in flight.)",
           events: [
             { type: "settle", pull: "a1", done: true },
@@ -875,15 +884,6 @@ export const flatMapScenarios = [
           caption: "<code>underlying.return()</code> settles with <code>{}</code> — the source is closed. <code>result.return()</code> is still in flight: it won’t settle until the inner iterator <code>flatMap</code> is about to acquire has been closed too.",
           events: [
             { type: "close-settled", target: "source" },
-          ],
-        },
-      ] },
-      { steps: [
-        {
-          caption: "Meanwhile the first inner pull settles — it yields <code>a1</code>, forwarded to the first <code>.next()</code>: <b>Result</b> row 1 resolves with <code>{ value: a1 }</code>.",
-          events: [
-            { type: "settle", pull: "a0", value: "a1" },
-            { type: "result", result: "r0", value: "a1", from: "a0" },
           ],
         },
       ] },
@@ -931,4 +931,108 @@ export const flatMapScenarios = [
       ] },
     ],
   },
+  {
+    id: "flatmap-error-in-underlying-during-return",
+    helper: "flatMap",
+    label: "Error in underlying during return",
+    ticks: [
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r2" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", iterator: "A" },
+            { type: "inner-pull", pull: "a0", iterator: "A" },
+            { type: "inner-pull", pull: "a1", iterator: "A" },
+            { type: "inner-pull", pull: "a2", iterator: "A" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a0", value: "a0" },
+            { type: "result", result: "r0", value: "a0", from: "a0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a1", done: true },
+            { type: "pull", pull: "u1" },
+          ],
+        },
+        {
+          caption: "Now the consumer calls <code>.return()</code> on the <b>Result</b> iterator — it wants to stop early. The diagram shifts down and the teardown band slides in above.",
+          events: [
+            { type: "open-closing" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "return", result: "ret" },
+          ],
+        },
+        {
+          events: [
+            { type: "close", target: "source" },
+            { type: "result", result: "r2", done: true },
+            { type: "tombstone", target: "underlying" },
+            { type: "tombstone", target: "result" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u1", error: "boom" },
+          ],
+        },
+        {
+          events: [
+            { type: "result", result: "r1", error: "boom" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "source" },
+            { type: "result", result: "ret", done: true },
+          ],
+        },
+      ] },
+    ],
+  }
 ];

@@ -51,7 +51,7 @@ type ReadingUnderlyingState = { type: 'reading underlying', requested: number /*
 // still-pending bound demand (the held call plus any demand a parked iterator freed).
 type DrainingState = {
   type: 'draining',
-  requested: number, // integer >= 1
+  requested: number, // integer >= 1 TODO I think we don't need this
   resolveReturn: (v: unknown) => void,
   rejectReturn: (e: unknown) => void,
   uCloseSettled: Promise<CloseOutcome>,

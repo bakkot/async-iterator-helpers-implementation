@@ -141,7 +141,18 @@ async function runSchedule(maxEvents, chooser) {
   // that pull (e.g. an inner done arrived first), in which case the helper lives
   // on. An inner *done* never ends the stream, so it is not part of this either.
   let consumerReturned = false;
-  const isFinished = () => consumerReturned || rec.underlying.finished != null || rec.underlying.returnCalls > 0;
+  // A terminal stream error -- an inner pull that errored, or a mapper that
+  // errored -- ends the helper just as much as a consumer return() or an
+  // underlying done/error. We track these causes DIRECTLY rather than inferring
+  // termination from `rec.underlying.returnCalls > 0` (flatMap closing the
+  // underlying): that proxy silently misses the case where the underlying has no
+  // .return() method, so flatMap's `return?.()` is a no-op and no close is
+  // recorded even though the helper has genuinely terminated. (An inner *done*
+  // still never ends the stream, so it is deliberately not included here.)
+  const streamErrored = () =>
+    rec.inners.some((inner) => inner.finished === 'error') ||
+    rec.mappers.some((m) => m.outcome === 'error');
+  const isFinished = () => consumerReturned || rec.underlying.finished != null || rec.underlying.returnCalls > 0 || streamErrored();
 
   let eventSeq = 0;
   const log = (line) => { rec.events.push(line); eventSeq++; };

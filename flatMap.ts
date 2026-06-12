@@ -49,7 +49,10 @@ type ReadingUnderlyingState = { type: 'reading underlying', requested: number /*
 // result.return() (resolveReturn/rejectReturn) waits for BOTH the underlying close
 // and any inner close, which can be outstanding concurrently. Draining always
 // logically requests exactly one value — the held call, which is the last of
-// #calls; the buffered parked values keep the calls before it.
+// #calls; the buffered parked values keep the calls before it. When parked slots
+// truncate (an inner reports done), the freed calls are the LAST ones — the held
+// position shifts earlier, since results deliver in call order and the rejection
+// lands on the first call not bound to a surviving buffered value.
 type DrainingState = {
   type: 'draining',
   resolveReturn: (v: unknown) => void,
@@ -193,14 +196,12 @@ class FlatMapHelper {
             this.#active.requested += removedCount;
           } else if (this.#active.type === 'draining') {
             // We will NOT pull anything more, so these parked slots can never receive
-            // a value: done their calls now. The last call is held for the in-flight
-            // pull/mapper (the position a rejection would land on) and must survive;
-            // the freed calls are the `removedCount` sitting just before it. (Draining
-            // always logically requests exactly that one held value.)
-            const firstFreed = this.#calls.length - 1 - removedCount;
-            for (const call of this.#calls.splice(firstFreed, removedCount)) {
-              call.resolve({ value: undefined, done: true });
-            }
+            // a value: done their calls now. Results deliver in call order, so the
+            // call held for the in-flight pull/mapper (the position a rejection would
+            // land on) is the first one not bound to a surviving buffered value — the
+            // freed calls are the LAST `removedCount`, shifting the held position
+            // earlier. (Draining always logically requests exactly one held value.)
+            this.#markSomeCallsAsNoLongerGettingValues(removedCount);
           } else {
             ASSERT(this.#active.type === 'error' || this.#active.type === 'finished', 'active is error or finished');
 

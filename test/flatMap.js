@@ -2829,20 +2829,24 @@ tests.push(scenarioTest({
 
 // The mirror of flatmap-test-060: a parked iterator's in-flight pull reports DONE
 // (rather than yielding) and the in-flight underlying pull then succeeds. After
-// return() while reading the underlying, the state is the same — a parked value
+// return() while reading the underlying, the state is the same — a parked pull
 // (r0's a0) ahead of one held call (r1, the position a pull/mapper rejection would
-// land on). When a0 reports done it can never receive a value (we're draining and
-// will not pull anything new), so r0 settles done RIGHT THEN — we already know at
-// most ONE more result can be produced (an error from the in-flight pull/mapper, or
-// nothing), and that one is reserved for the held call r1. r1 stays held until the
-// in-flight pull resolves and its mapper settles cleanly (no error), at which point
-// the produced iterator is closed without being pulled and r1 dones. (The bug this
-// guards against held r0 open until the second mapper settled, by rolling the freed
-// demand onto DrainingState.requested instead of doning it.)
+// land on). When a0 reports done its slot truncates and the freed demand can never
+// be filled (we're draining and will not pull anything new), so a call settles done
+// RIGHT THEN — and because results deliver in call order, the doned call is the
+// LAST one (r1): at most ONE more result can be produced (an error from the
+// in-flight pull/mapper, or nothing), and it must land on the head-most pending
+// call, so r0 becomes the held call. r0 stays held until the in-flight pull
+// resolves and its mapper settles cleanly (no error), at which point the produced
+// iterator is closed without being pulled and r0 dones. (Two bugs this guards
+// against: rolling the freed demand onto DrainingState.requested instead of doning
+// it, which held BOTH calls open until the second mapper settled; and doning the
+// head-most call while holding the last, which could deliver a rejection to r1
+// after r0 had already settled done — done must be terminal in call order.)
 tests.push(scenarioTest({
   id: "flatmap-test-061",
   helper: "flatMap",
-  label: "flatMap: return() while reading underlying dones a parked call as soon as its pull reports done",
+  label: "flatMap: return() while reading underlying dones the trailing call as soon as a parked pull reports done",
   ticks: [
     { note: "first next() pulls the underlying", steps: [
       { events: [] },
@@ -2875,23 +2879,23 @@ tests.push(scenarioTest({
       { type: "return", result: "ret" },
       { type: "close", target: "source" },
     ] } ] },
-    // A's parked pull #0 reports done. It can never receive a value now (we won't pull
-    // anything more), so r0 settles done immediately; r1 stays held for the in-flight
-    // pull/mapper.
-    { note: "the parked pull reporting done settles r0 immediately", steps: [ { events: [
+    // A's parked pull #0 reports done. The freed demand can never be filled (we won't
+    // pull anything more), so the trailing call r1 settles done immediately; r0 — the
+    // head-most pending call, where a rejection would land — becomes the held call.
+    { note: "the parked pull reporting done settles the trailing call r1 immediately", steps: [ { events: [
       { type: "settle", pull: "a0", done: true },
-      { type: "result", result: "r0", done: true },
+      { type: "result", result: "r1", done: true },
     ] } ] },
     { note: "the in-flight underlying value is mapped", steps: [ { events: [
       { type: "settle", pull: "u1", value: "B" },
       { type: "fn", call: "p1", arg: "B", from: "u1" },
     ] } ] },
     // The mapper settles cleanly: the produced iterator is closed without being pulled,
-    // and the held call r1 finally dones.
+    // and the held call r0 finally dones.
     { note: "the produced iterator is closed without being pulled; the held call dones", steps: [ { events: [
       { type: "fn-settle", call: "p1", iterator: "B" },
       { type: "close", target: "B" },
-      { type: "result", result: "r1", done: true },
+      { type: "result", result: "r0", done: true },
     ] } ] },
   ],
 }, { helper: flatMap, utils }));

@@ -209,11 +209,18 @@ function render(animate) {
   stepnum.textContent = step;
   stepmax.textContent = maxStep();
   caption.innerHTML = steps[step].caption;
-  // Narrate this step's changes for screen readers (the SVG is the visual
-  // channel; #sr-live is the textual one). Step 0 is always the resting state.
-  srLive.textContent = step === 0
-    ? `Step 0 of ${maxStep()}. Initial state.`
-    : `Step ${step} of ${maxStep()}. ${steps[step].aria || 'No change this step.'}`;
+  // Narrate this step for screen readers (the SVG is the visual channel;
+  // #sr-live is the textual one): the step's changes, then its "why" caption.
+  // The caption is announced only when it differs from the previous step's, so
+  // captions borrowed onto preview beats or held across steps aren't repeated;
+  // a step that only carries a caption drops the "No change" filler.
+  const newCaption = steps[step].caption && steps[step].caption !== (steps[step - 1]?.caption ?? '');
+  let changes = step === 0 ? 'Initial state.' : steps[step].aria;
+  if (!changes) changes = newCaption ? '' : 'No change this step.';
+  let msg = `Step ${step} of ${maxStep()}.`;
+  if (changes) msg += ` ${changes}`;
+  if (newCaption) msg += ` Caption: ${caption.textContent.trim()}`;
+  srLive.textContent = msg;
   prevBtn.disabled = step === 0;
   nextBtn.disabled = step === maxStep();
 }

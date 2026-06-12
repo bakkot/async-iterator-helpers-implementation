@@ -290,6 +290,17 @@
     white-space: nowrap;
   }
 
+  /* unncomment to make the screen-reader narration visible for manual review. */
+  #sr-live.sr-only {
+    position: fixed; top: 8px; left: 8px;
+    width: min(440px, 45vw); height: auto;
+    margin: 0; padding: 8px 12px; border: 1px solid #6366f1; border-radius: 8px;
+    overflow: visible; clip: auto; clip-path: none;
+    white-space: normal;
+    background: #fffbe6; color: #1f2933; font-size: 14px; line-height: 1.45;
+    z-index: 100; box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+  }
+
   /* ---- animation selector ---- */
   .tabs { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
   .tab {

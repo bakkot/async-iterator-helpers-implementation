@@ -132,12 +132,24 @@ export function scenarioToAnimation(scenario) {
     const box = t.box;
     if (box === 'c0') return "the underlying iterator's return() (about to settle)";
     if (box === 'c2') return "an inner iterator's return() (about to settle)";
-    if (box[0] === 'm') return 'an inner-iterator pull (about to settle)';
+    if (box[0] === 'm') {
+      // m{slot}{col}: resolve the slot back to the inner iterator sitting there
+      const slot = +box[1], col = +box[2];
+      let handle = null;
+      for (const [h, inner] of index.inners) if (inner.slot === slot) handle = h;
+      return handle != null
+        ? `the ${ord(col)} pull from inner iterator ${handle} (about to settle)`
+        : 'an inner-iterator pull (about to settle)';
+    }
     const colName = { u: 'Underlying', i: 'Internal', r: 'Result' }[box[0]] ?? '';
     return `the ${ord(+box.slice(1))} promise in the ${colName} column (about to settle)`;
   };
-  const ariaForDots = (dots) =>
-    `A marker shows where the next step will act: ${joinList(dots.map(describeDot))}.`;
+  // The first preview in an animation explains the marker; later ones, which
+  // recur every other beat, drop the boilerplate down to a terse "Next: …".
+  const ariaForDots = (dots, terse) => {
+    const list = joinList(dots.map(describeDot));
+    return terse ? `Next: ${list}.` : `A marker shows where the next step will act: ${list}.`;
+  };
 
   // A scenario that uses the teardown band (a `return` or `close`) but never
   // explicitly slides it in (`open-closing`) starts with the band already open,
@@ -389,8 +401,12 @@ export function scenarioToAnimation(scenario) {
   // than sharing the frame with the content that preceded it. The inserted step
   // borrows the preceding step's caption (nothing changed but the dot).
   const spaced = [];
+  let previewSeen = false;
   for (const s of steps) {
-    if (s.dots) spaced.push({ caption: (spaced[spaced.length - 1] ?? s).caption, ops: [], aria: ariaForDots(s.dots) });
+    if (s.dots) {
+      spaced.push({ caption: (spaced[spaced.length - 1] ?? s).caption, ops: [], aria: ariaForDots(s.dots, previewSeen) });
+      previewSeen = true;
+    }
     spaced.push(s);
   }
 

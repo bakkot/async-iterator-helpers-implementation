@@ -341,7 +341,13 @@ export function narrateEvents(events, index) {
       case 'compact':
         return `An exhausted internal slot is discarded; the remaining slots shift up.`;
       case 'void':
-        return `A pending promise is voided; it will never deliver a value.`;
+        if ('call' in ev) {
+          const p = index.calls.get(ev.call);
+          return `The ${ord(p.slot)} slot in the Internal column is voided; it will never deliver a value.`;
+        } else {
+          const p = index.pulls.get(ev.pull);
+          return `The ${ord(p.row)} underlying Promise is voided; it will never deliver a value.`;
+        }
       case 'slot-error': {
         const p = index.pulls.get(ev.pull);
         return `The error propagates into the ${ord(p.row)} promise in the Internal column.`;

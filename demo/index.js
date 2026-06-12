@@ -918,7 +918,7 @@ function performAction(a) {
 // Run one action as a single tick: perform it, let the helper react to
 // quiescence, then commit every effect at once. Input is refused for
 // the duration of the resulting transition.
-async function runTick(action) {
+async function runTick(action, live = false) {
   ix.busy = true;
   updateButtons();
   resetFrame();
@@ -927,7 +927,7 @@ async function runTick(action) {
   commitFrame();
   ixCaptured[ixCursor - 1] = fEvents;   // this tick's scenario events, for export
   updateButtons();
-  announceInteractive();        // speak what this action did
+  announceInteractive(live);    // speak what this action did
   await waitForTransitions();   // gate input for exactly the effects' duration
   if (ix) { ix.busy = false; updateButtons(); }
 }
@@ -938,7 +938,7 @@ function userAction(action) {
   ixCaptured.length = ixCursor;
   ixHistory.push(action);
   ixCursor++;
-  runTick(action);
+  runTick(action, true);   // a fresh stimulus: announce the outcome without the step prefix
 }
 
 // Move to position `n` in the action history (the stepper / arrow keys).
@@ -1067,15 +1067,20 @@ function updateButtons() {
 // scenario-format events the compiler narrates; we index the session-so-far to
 // resolve their handles, then run the shared narrator. Step 0 is the resting
 // state. The visible counter is ixCursor / ixHistory.length, so we match it.
-function announceInteractive() {
+// `live` distinguishes a fresh user stimulus (a .next()/.return()/dot-settle)
+// from scrubbing (the history stepper, undo/redo, jumps). When live, we drop
+// the "Step X of N" prefix: the user just acted and wants to hear the outcome,
+// not their position. Scrubbing keeps the prefix so they can orient — including
+// when scrubbing lands on the final step.
+function announceInteractive(live = false) {
   if (!interactive) return;
-  const max = ixHistory.length;
-  if (ixCursor === 0) { srLive.textContent = `Step 0 of ${max}. Initial state.`; return; }
+  const prefix = live ? '' : `Step ${ixCursor} of ${ixHistory.length}. `;
+  if (ixCursor === 0) { srLive.textContent = `${prefix}Initial state.`; return; }
   let aria = '';
   try {
     aria = narrateEvents(ixCaptured[ixCursor - 1] ?? [], indexScenario(buildScenario()));
   } catch { /* an indexing hiccup shouldn't break the demo; just say nothing */ }
-  srLive.textContent = `Step ${ixCursor} of ${max}. ${aria || 'No change this step.'}`;
+  srLive.textContent = `${prefix}${aria || 'No change this step.'}`;
 }
 
 // ---- export the live session as a scenario (see scenarios/FORMAT.md) ----

@@ -9,7 +9,7 @@
 // convention, like sync-throwing pulls). Such scenarios are still valid as
 // tests — they just can't be animated.
 
-import { indexScenario } from '../../scenario-core.js';
+import { indexScenario, narrateEvents } from '../../scenario-core.js';
 
 const MAX_ROWS = 4; // u0..u3, r0..r3, m{row}0..3
 
@@ -32,93 +32,10 @@ export function scenarioToAnimation(scenario) {
   // ---- screen-reader narration ----------------------------------------
   // Each step carries an `aria` sentence (or two) describing the changes it
   // makes, fed to the page's aria-live region so a non-visual consumer hears
-  // what the SVG just did. Built from the same structured events that drive
-  // the visuals, so the two never drift. Plain prose only (no code/markdown):
-  // the live region is read aloud verbatim.
+  // what the SVG just did. The per-event prose lives in scenario-core's
+  // narrateEvents (shared with the Interactive tab); the dot-preview wording
+  // below is animation-only, so it stays here.
   const ord = (n) => ['1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th'][n] ?? `${n + 1}th`;
-  const fnNoun = scenario.helper === 'filter' ? 'predicate' : 'mapper';
-  const valPhrase = (ev) => {
-    if ('error' in ev) return 'an error';
-    if (ev.done) return 'done: true';
-    return `value ${display(ev.value)}`;
-  };
-  // describe one event as a sentence, or null for events with no audible
-  // meaning (pure chrome like the band sliding open, or armings with no effect)
-  const describeEvent = (ev) => {
-    switch (ev.type) {
-      case 'next': {
-        const r = index.results.get(ev.result);
-        return `The consumer pulls a value; the ${ord(r.row)} promise in the Result column is now pending.`;
-      }
-      case 'return':
-        return `The consumer closes the result iterator (calls return); its promise is now pending.`;
-      case 'pull': {
-        if (ev.throws) return null;
-        const p = index.pulls.get(ev.pull);
-        return `The helper pulls from the underlying iterator; the ${ord(p.row)} promise in the Underlying column is now pending.`;
-      }
-      case 'inner-pull': {
-        if (ev.throws) return null;
-        const p = index.pulls.get(ev.pull);
-        return `The helper makes the ${ord(p.col)} pull from inner iterator ${ev.iterator}.`;
-      }
-      case 'settle': {
-        const p = index.pulls.get(ev.pull);
-        if (p.kind === 'inner')
-          return `The ${ord(p.col)} pull from inner iterator ${p.iterator} settles with ${valPhrase(ev)}.`;
-        return `The ${ord(p.row)} promise in the Underlying column settles with ${valPhrase(ev)}.`;
-      }
-      case 'fn': {
-        const c = index.calls.get(ev.call);
-        return `The ${fnNoun} ${names.fnDisplay} is called on ${display(ev.arg)}; the ${ord(c.slot)} promise in the Internal column is now pending.`;
-      }
-      case 'fn-settle': {
-        const c = index.calls.get(ev.call);
-        if ('error' in ev) return `The ${fnNoun} for the ${ord(c.slot)} value rejects with an error.`;
-        if ('iterator' in ev) return `The ${fnNoun} for the ${ord(c.slot)} value returns inner iterator ${ev.iterator}.`;
-        if ('verdict' in ev) return `The ${fnNoun} for the ${ord(c.slot)} value settles ${ev.verdict} (${ev.verdict ? 'keep it' : 'drop it'}).`;
-        return `The ${ord(c.slot)} promise in the Internal column settles with value ${display(ev.value)}.`;
-      }
-      case 'result': {
-        const r = index.results.get(ev.result);
-        if (r.kind === 'return') {
-          if ('error' in ev) return `The result iterator's return() promise rejects with an error.`;
-          return `The result iterator's return() promise resolves with done: true.`;
-        }
-        return `The ${ord(r.row)} promise in the Result column resolves with ${valPhrase(ev)}.`;
-      }
-      case 'close': {
-        if (ev.throws) return null;
-        const who = ev.target === 'source' ? 'the underlying iterator' : `inner iterator ${ev.target}`;
-        return `The helper calls return() on ${who}; its promise is now pending.`;
-      }
-      case 'close-settled': {
-        const tgt = ev.target === 'source' ? 'underlying iterator' : 'inner iterator';
-        if ('error' in ev) return `The ${tgt}'s return() rejects with an error.`;
-        return `The ${tgt}'s return() resolves with done: true.`;
-      }
-      case 'tombstone':
-        return `The ${ev.target === 'underlying' ? 'underlying' : 'result'} iterator is now marked closed.`;
-      case 'compact':
-        return `An exhausted internal slot is discarded; the remaining slots shift up.`;
-      case 'void':
-        return `A pending promise is voided; it will never deliver a value.`;
-      case 'slot-error': {
-        const p = index.pulls.get(ev.pull);
-        return `The error propagates into the ${ord(p.row)} promise in the Internal column.`;
-      }
-      default:
-        return null; // open-closing, arm-throw, fn-sync: nothing to announce
-    }
-  };
-  const ariaFor = (events) => {
-    const parts = [];
-    for (const ev of events) {
-      const s = describeEvent(ev);
-      if (s && !parts.includes(s)) parts.push(s); // dedupe (e.g. paired compacts)
-    }
-    return parts.join(' ');
-  };
 
   // A dot-preview beat (spliced in below) shows where the *next* step will act
   // but changes nothing itself. Narrate it by naming the dotted target(s).
@@ -386,7 +303,7 @@ export function scenarioToAnimation(scenario) {
         }
       }
 
-      const out = { caption: step.caption ?? tick.note ?? '', ops, aria: ariaFor(step.events) };
+      const out = { caption: step.caption ?? tick.note ?? '', ops, aria: narrateEvents(step.events, index) };
       const finalArrows = step.arrows ?? (arrows.length > 0 ? arrows : null);
       if (finalArrows) out.arrows = finalArrows;
       if (stim.length) out.dots = stim;

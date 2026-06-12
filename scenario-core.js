@@ -252,6 +252,98 @@ export function indexScenario(scenario) {
   return { scenario, names, events, pulls, calls, results, inners, syncFn: fnSync.length > 0, fnSync };
 }
 
+// Narrate a list of events (one animation step, or one Interactive-tab tick)
+// as a screen-reader sentence, using the resolved handle index from
+// indexScenario. Plain prose only — no code or markdown — since an aria-live
+// region reads it aloud verbatim. Returns '' when nothing in the list is
+// audible (e.g. a step of pure visual chrome). Shared by the animation
+// compiler (per step) and the live Interactive tab (per user action), so the
+// spoken narration and the visuals are driven from one source.
+export function narrateEvents(events, index) {
+  const { names, scenario } = index;
+  const display = (v) => String(v);
+  const ord = (n) => ['1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th'][n] ?? `${n + 1}th`;
+  const fnNoun = scenario.helper === 'filter' ? 'predicate' : 'mapper';
+  const valPhrase = (ev) => {
+    if ('error' in ev) return 'an error';
+    if (ev.done) return 'done: true';
+    return `value ${display(ev.value)}`;
+  };
+  const describe = (ev) => {
+    switch (ev.type) {
+      case 'next': {
+        const r = index.results.get(ev.result);
+        return `The consumer pulls a value; the ${ord(r.row)} promise in the Result column is now pending.`;
+      }
+      case 'return':
+        return `The consumer closes the result iterator (calls return); its promise is now pending.`;
+      case 'pull': {
+        if (ev.throws) return null;
+        const p = index.pulls.get(ev.pull);
+        return `The helper pulls from the underlying iterator; the ${ord(p.row)} promise in the Underlying column is now pending.`;
+      }
+      case 'inner-pull': {
+        if (ev.throws) return null;
+        const p = index.pulls.get(ev.pull);
+        return `The helper makes the ${ord(p.col)} pull from inner iterator ${ev.iterator}.`;
+      }
+      case 'settle': {
+        const p = index.pulls.get(ev.pull);
+        if (p.kind === 'inner')
+          return `The ${ord(p.col)} pull from inner iterator ${p.iterator} settles with ${valPhrase(ev)}.`;
+        return `The ${ord(p.row)} promise in the Underlying column settles with ${valPhrase(ev)}.`;
+      }
+      case 'fn': {
+        const c = index.calls.get(ev.call);
+        return `The ${fnNoun} ${names.fnDisplay} is called on ${display(ev.arg)}; the ${ord(c.slot)} promise in the Internal column is now pending.`;
+      }
+      case 'fn-settle': {
+        const c = index.calls.get(ev.call);
+        if ('error' in ev) return `The ${fnNoun} for the ${ord(c.slot)} value rejects with an error.`;
+        if ('iterator' in ev) return `The ${fnNoun} for the ${ord(c.slot)} value returns inner iterator ${ev.iterator}.`;
+        if ('verdict' in ev) return `The ${fnNoun} for the ${ord(c.slot)} value settles ${ev.verdict} (${ev.verdict ? 'keep it' : 'drop it'}).`;
+        return `The ${ord(c.slot)} promise in the Internal column settles with value ${display(ev.value)}.`;
+      }
+      case 'result': {
+        const r = index.results.get(ev.result);
+        if (r.kind === 'return') {
+          if ('error' in ev) return `The result iterator's return() promise rejects with an error.`;
+          return `The result iterator's return() promise resolves with done: true.`;
+        }
+        return `The ${ord(r.row)} promise in the Result column resolves with ${valPhrase(ev)}.`;
+      }
+      case 'close': {
+        if (ev.throws) return null;
+        const who = ev.target === 'source' ? 'the underlying iterator' : `inner iterator ${ev.target}`;
+        return `The helper calls return() on ${who}; its promise is now pending.`;
+      }
+      case 'close-settled': {
+        const tgt = ev.target === 'source' ? 'underlying iterator' : 'inner iterator';
+        if ('error' in ev) return `The ${tgt}'s return() rejects with an error.`;
+        return `The ${tgt}'s return() resolves with done: true.`;
+      }
+      case 'tombstone':
+        return `The ${ev.target === 'underlying' ? 'underlying' : 'result'} iterator is now marked closed.`;
+      case 'compact':
+        return `An exhausted internal slot is discarded; the remaining slots shift up.`;
+      case 'void':
+        return `A pending promise is voided; it will never deliver a value.`;
+      case 'slot-error': {
+        const p = index.pulls.get(ev.pull);
+        return `The error propagates into the ${ord(p.row)} promise in the Internal column.`;
+      }
+      default:
+        return null; // open-closing, arm-throw, fn-sync: nothing to announce
+    }
+  };
+  const parts = [];
+  for (const ev of events) {
+    const s = describe(ev);
+    if (s && !parts.includes(s)) parts.push(s); // dedupe (e.g. paired compacts/tombstones)
+  }
+  return parts.join(' ');
+}
+
 // The exact log line an observation produces, matching test/utils.js.
 export function renderLogLine(entry, index) {
   const { ev } = entry;

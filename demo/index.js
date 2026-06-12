@@ -2,7 +2,7 @@
 // scenarios/FORMAT.md) and compiled to step timelines at load time. The
 // same scenario files run as tests against the implementation repo.
 import { scenarioToAnimation } from './scenarios/scenario-to-animation.js';
-import { indexScenario } from '../scenario-core.js';
+import { indexScenario, narrateEvents } from '../scenario-core.js';
 import { mapScenarios } from './scenarios/map-scenarios.js';
 import { filterScenarios } from './scenarios/filter-scenarios.js';
 import { flatMapScenarios } from './scenarios/flatmap-scenarios.js';
@@ -927,6 +927,7 @@ async function runTick(action) {
   commitFrame();
   ixCaptured[ixCursor - 1] = fEvents;   // this tick's scenario events, for export
   updateButtons();
+  announceInteractive();        // speak what this action did
   await waitForTransitions();   // gate input for exactly the effects' duration
   if (ix) { ix.busy = false; updateButtons(); }
 }
@@ -967,6 +968,7 @@ async function ixGo(n) {
   void root.getBoundingClientRect();   // commit the snap, then re-enable
   root.classList.remove('no-anim');
   updateButtons();
+  announceInteractive();   // speak the step we landed on (a back/multi-step jump)
 }
 
 function commitFrame() {
@@ -1056,6 +1058,24 @@ function updateButtons() {
     // not mid-tick (the in-flight tick's events aren't captured until commit)
     exportBtns.forEach((b) => { b.disabled = gated || ixCursor === 0; });
   }
+}
+
+// Narrate the live tab for screen readers, mirroring render()'s #sr-live for
+// the recorded tabs: announce what the helper did in response to the user's
+// latest action (or loaded-scenario step), so a non-visual consumer can
+// confirm the outcome. The current tick's captured events are the same
+// scenario-format events the compiler narrates; we index the session-so-far to
+// resolve their handles, then run the shared narrator. Step 0 is the resting
+// state. The visible counter is ixCursor / ixHistory.length, so we match it.
+function announceInteractive() {
+  if (!interactive) return;
+  const max = ixHistory.length;
+  if (ixCursor === 0) { srLive.textContent = `Step 0 of ${max}. Initial state.`; return; }
+  let aria = '';
+  try {
+    aria = narrateEvents(ixCaptured[ixCursor - 1] ?? [], indexScenario(buildScenario()));
+  } catch { /* an indexing hiccup shouldn't break the demo; just say nothing */ }
+  srLive.textContent = `Step ${ixCursor} of ${max}. ${aria || 'No change this step.'}`;
 }
 
 // ---- export the live session as a scenario (see scenarios/FORMAT.md) ----
@@ -1236,6 +1256,7 @@ function loadScenarioText(text) {
   ixCaptured = [];
   ixCursor = 0;
   updateButtons();
+  announceInteractive();   // "Initial state" now reflecting the loaded step count
   showToast('loaded!');
 }
 
@@ -1367,6 +1388,7 @@ function selectInteractive() {
 
   makeSession(currentSet);
   updateButtons();
+  announceInteractive();   // "Initial state" for the fresh live session
 }
 
 function exitInteractive() {

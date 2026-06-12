@@ -38,6 +38,7 @@ const nextBtn = document.getElementById('next');
 const stepnum = document.getElementById('stepnum');
 const stepmax = document.getElementById('stepmax');
 const caption = document.getElementById('caption');
+const srLive = document.getElementById('sr-live');
 
 // Populate the box text for an animation. `content` maps a box id to its
 // text, keyed by text-class. `.label`/`.sub` (Internal column) are plain
@@ -208,6 +209,11 @@ function render(animate) {
   stepnum.textContent = step;
   stepmax.textContent = maxStep();
   caption.innerHTML = steps[step].caption;
+  // Narrate this step's changes for screen readers (the SVG is the visual
+  // channel; #sr-live is the textual one). Step 0 is always the resting state.
+  srLive.textContent = step === 0
+    ? `Step 0 of ${maxStep()}. Initial state.`
+    : `Step ${step} of ${maxStep()}. ${steps[step].aria || 'No change this step.'}`;
   prevBtn.disabled = step === 0;
   nextBtn.disabled = step === maxStep();
 }

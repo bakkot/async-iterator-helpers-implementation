@@ -279,6 +279,17 @@
   /* during multi-step jumps we suppress animation and snap to the target */
   .no-anim * { transition: none !important; }
 
+  /* Visually hidden but exposed to assistive tech. The dataflow is conveyed
+     visually by SVG boxes changing state; #sr-live mirrors each step's changes
+     as text for screen readers (see render() in index.js). */
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    margin: -1px; padding: 0; border: 0;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
   /* ---- animation selector ---- */
   .tabs { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
   .tab {
@@ -476,6 +487,10 @@
   <div class="tabs" id="tabs"></div>
 
   <div class="description" id="description"></div>
+
+  <!-- Spoken narration of each step's changes for screen readers; the SVG
+       itself conveys the dataflow visually. Updated by render() in index.js. -->
+  <div id="sr-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
 
   <div class="stage">
     <svg id="viz" viewBox="0 0 900 560" role="img" aria-label="filter dataflow">

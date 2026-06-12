@@ -322,8 +322,7 @@ export const filterScenarios = [
     id: "filter-exhaustion",
     helper: "filter",
     label: "Exhaustion",
-    description: "Values are now shown as full iterator records (<code>done</code>/<code>value</code>). When the underlying iterator is finished, we can settle some number of result Promises that we now know cannot receive a value.",
-    display: { records: true },
+    description: "When the underlying iterator is finished, we can settle some number of result Promises that we now know cannot receive a value.",
     ticks: [
       { steps: [
         {
@@ -420,7 +419,6 @@ export const filterScenarios = [
     helper: "filter",
     label: "Exhaustion 2",
     description: "As in <a href=\"#filter-exhaustion\">Exhaustion</a>, but now a predicate returns <code>false</code> after exhaustion. Because the iterator is closed, we do not pull again to replace the value which failed.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -512,7 +510,6 @@ export const filterScenarios = [
     helper: "filter",
     label: "Exhaustion 3*",
     description: "As in <a href=\"#filter-exhaustion-2\">Exhaustion 2</a>, but with one more pull outstanding. In this case, an underlying Promise settles with <code>done: true</code> while a later one is still outstanding. Unlike <code>map</code>, if it ends up being a <code>done: false</code> value, there is no reasonable place to put it, so it is essentially <span style=\"color:#8b5cf6\">voided</span>.<br><br><strong>Open question</strong>: What happens to that purple Promise if it ends up being something other than <code>done: true</code>? <code>unhandledrejection</code>?",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -616,7 +613,6 @@ export const filterScenarios = [
     helper: "filter",
     label: "Exhaustion 4",
     description: "As in <a href=\"#filter-exhaustion-3\">Exhaustion 3</a>, but the value that is beyond the <code>done: true</code> position has already settled and passed the predicate. This has the same effect; it is still <span style=\"color:#8b5cf6\">voided</span>.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -703,7 +699,6 @@ export const filterScenarios = [
     helper: "filter",
     label: "Closing",
     description: "As with <a href=\"#map-closing\"><code>map</code></a>, calls to <code>result.return()</code> can be made concurrently with calls to <code>result.next()</code>. This blocks future pulls but previous ones can still deliver values if they pass the predicate.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -816,7 +811,6 @@ export const filterScenarios = [
     helper: "filter",
     label: "Closing 2*",
     description: "As in <a href=\"#filter-closing\">Closing</a>, but now a predicate returns false after we have called <code>result.return()</code>. Because the iterator is closed at that point, we do not issue a pull to replace the missing value.<br><br><strong>Open question</strong>: does calling <code>result.return()</code> indicate only that we will no longer request <em>new</em> values, or also that we don't care about outstanding pulls? If the former, we can't call <code>underlying.return()</code> until we know we won't need a new value from it.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -934,7 +928,6 @@ export const filterScenarios = [
     helper: "filter",
     label: "Error in underlying",
     description: "Unlike <a href=\"#map-error-underlying\"><code>map</code></a>, errors cannot be delivered eagerly and must be held in the queue.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -1009,7 +1002,6 @@ export const filterScenarios = [
     helper: "filter",
     label: "Error in predicate",
     description: "As in <a href=\"#filter-error-in-underlying\">Error in underlying</a>, but the error occurs in the predicate. In this case we close the underlying iterator.",
-    display: { records: true },
     ticks: [
       { steps: [
         {

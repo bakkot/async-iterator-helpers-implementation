@@ -164,7 +164,6 @@ export const mapScenarios = [
     helper: "map",
     label: "Exhaustion",
     description: "Values are now shown as full iterator records (<code>done</code>/<code>value</code>). Here, the underlying iterator returns <code>done: true</code> on its second pull. This does not discard the earlier pull.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -250,7 +249,6 @@ export const mapScenarios = [
     helper: "map",
     label: "Exhaustion 2*",
     description: "It is possible for the underlying iterator to be <em>incoherent</em>, that is, to produce a <code>done: false</code> after a <code>done: true</code>. For <code>map</code>, if multiple pulls are in flight, this can be observed.<br><br><strong>Open question</strong>: What should we do in this case? The other helpers would have settled the 3rd pull with <code>done: true</code>. My inclination is to make this an <code>unhandledrejection</code> event.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -347,7 +345,6 @@ export const mapScenarios = [
     helper: "map",
     label: "Exhaustion 3*",
     description: "As in <a href=\"#map-exhaustion-2\">Exhaustion 2</a>, but now the 3rd value has already settled when we get the <code>done: true</code> from the second.<br><br><strong>Open question</strong>: What should we do in this case? In this case we could reject the outstanding pull with an error, rather than needing an <code>unhandledrejection</code> event.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -444,7 +441,6 @@ export const mapScenarios = [
     helper: "map",
     label: "Closing",
     description: "Consumers can also call <code>result.return()</code> concurrently with one or more calls to <code>result.next()</code>, which can be blocked either on the mapper or the underlying pull.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -562,7 +558,6 @@ export const mapScenarios = [
     helper: "map",
     label: "Error in underlying",
     description: "An error while pulling from the underlying iterator causes it to be considered closed but as always does not prevent earlier calls from getting values.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -633,7 +628,6 @@ export const mapScenarios = [
     helper: "map",
     label: "Error in mapper",
     description: "An error from the mapper function causes <code>underlying.return()</code> to be called, and the Promise for the value which errored does not settle until that call completes.",
-    display: { records: true },
     ticks: [
       { steps: [
         {
@@ -725,7 +719,6 @@ export const mapScenarios = [
     helper: "map",
     label: "Error in mapper 2",
     description: "As in <a href=\"#map-error-mapper\">Error in mapper</a>, but now we have a later outstanding Promise past the error. This case is not considered incoherent; we can deliver values past the error, although further requests are still settled immediately.",
-    display: { records: true },
     ticks: [
       { steps: [
         {

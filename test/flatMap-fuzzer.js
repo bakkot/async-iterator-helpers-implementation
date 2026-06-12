@@ -212,6 +212,51 @@ async function runSchedule(maxEvents, chooser) {
     }
   };
 
+  // Checked after each driving action's flush-to-quiescence:
+  // (I10) liveness at quiescence: if every promise the stubs ever handed out has
+  // settled (no pending pulls, no pending mapper, no pending returns) and the
+  // microtask queue has drained, every consumer call must have settled. An
+  // unsettled call at such a point can never settle on its own -- nothing remains
+  // that could wake the helper -- even if a later consumer call would mask the
+  // hang by re-driving the machinery (which is why the end-of-run hang check I9
+  // alone is not enough).
+  // (I11) close-gating, a partial converse: while a .return() that flatMap issued
+  // is still pending, some consumer promise must be unsettled -- result.return()
+  // awaits the closes it triggers, and an error that triggers a close surfaces
+  // only after that close settles, so a pending close with every consumer call
+  // settled means flatMap fired a close nothing can ever observe.
+  //
+  // DELIBERATE WEAKENING: there is one legitimate "orphaned close" -- an error
+  // triggers a close, and before that close settles an inner done at a lower
+  // pull index truncates the still-undelivered error; the calls then resolve
+  // done immediately and the close's outcome is swallowed (pinned by unit test
+  // flatmap-test-062). We exempt any run containing such a discarded
+  // (produced-but-never-delivered) error, which also exempts any OTHER pending
+  // close in that run -- a real loss of strength, accepted for now. If the
+  // implementation ever gates those dones on the close instead, remove the
+  // exemption (and flip the unit test).
+  const reportedSettlementViolations = new Set();
+  const reportSettlementViolation = (msg) => {
+    if (reportedSettlementViolations.has(msg)) return;
+    reportedSettlementViolations.add(msg);
+    violation(msg);
+  };
+  const checkSettlementInvariants = () => {
+    const unsettled = rec.calls.filter((c) => c.settle === null);
+    if (pendingPulls.length === 0 && pendingMapper === null && pendingReturns.length === 0) {
+      for (const c of unsettled) reportSettlementViolation(`liveness: ${c.kind}#${c.id} is unsettled at quiescence with nothing pending`);
+    }
+    if (pendingReturns.length > 0 && unsettled.length === 0) {
+      // Every call has settled, so any error that has not been delivered by now
+      // never will be: it was discarded, and may have orphaned a close.
+      const delivered = new Set(rec.calls.filter((c) => c.settle.type === 'reject').map((c) => c.settle.error));
+      const discardedErrorExists = [...realErrors(rec)].some((e) => !delivered.has(e));
+      if (!discardedErrorExists) {
+        reportSettlementViolation(`close-gating: ${pendingReturns.map((r) => r.id).join(', ')} pending but every consumer call has settled`);
+      }
+    }
+  };
+
   // A .return() method shared by the underlying and inner iterators. `entity` is
   // the record (rec.underlying or an inner) carrying its bookkeeping; `errTag` is
   // the close-error this iterator's return uses. The "return after this iterator
@@ -413,6 +458,7 @@ async function runSchedule(maxEvents, chooser) {
     log(`--- ${actionLabel(a)}`);
     apply(a);
     await flush();
+    checkSettlementInvariants();
   }
 
   // Snapshot the natural end-of-schedule state BEFORE finalization perturbs it.

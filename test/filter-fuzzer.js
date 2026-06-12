@@ -458,6 +458,7 @@ function runReal(schedule) {
   let nextPullId = 0, nextPredId = 0, nextReturnId = 0;
   let underlyingErrored = false;
   let invariantViolation = null;
+  const producedErrors = new Set(); // error messages the stubs actually produced
 
   const source = {
     next() {
@@ -467,7 +468,7 @@ function runReal(schedule) {
       if (shape === undefined) { log(`!! unexpected ${evUNext(id)}`); return Promise.resolve({ value: undefined, done: true }); }
       if (shape === 'syncValue') return { value: pullValue(id), done: false };
       if (shape === 'syncDone') return { value: undefined, done: true };
-      if (shape === 'syncThrow') { underlyingErrored = true; throw new Error(pullError(id)); }
+      if (shape === 'syncThrow') { underlyingErrored = true; producedErrors.add(pullError(id)); throw new Error(pullError(id)); }
       const d = Promise.withResolvers();
       pendingPulls.set(id, d);
       return d.promise;
@@ -495,7 +496,7 @@ function runReal(schedule) {
     if (shape === undefined) { log(`!! unexpected ${evPred(arg)}#${id}`); return false; }
     if (shape === 'syncTrue') return true;
     if (shape === 'syncFalse') return false;
-    if (shape === 'syncThrow') throw new Error(predError(arg));
+    if (shape === 'syncThrow') { producedErrors.add(predError(arg)); throw new Error(predError(arg)); }
     const d = Promise.withResolvers();
     pendingPreds.set(id, { d, arg });
     return d.promise;
@@ -504,15 +505,50 @@ function runReal(schedule) {
   const filteredIt = filter(source, pred);
   const realTrace = [];
   let callCount = 0;
+  const callSettled = []; // callId -> true once its promise settles
+  const deliveredErrors = new Set(); // error messages surfaced to a consumer call
 
   const trackNext = (callId, p) => p.then(
-    (r) => log(evNext(callId, fmtResult(r))),
-    (e) => log(evNextThrow(callId, e && e.message)),
+    (r) => { callSettled[callId] = true; log(evNext(callId, fmtResult(r))); },
+    (e) => { callSettled[callId] = true; deliveredErrors.add(e && e.message); log(evNextThrow(callId, e && e.message)); },
   );
   const trackReturn = (callId, p) => p.then(
-    (r) => log(evReturn(callId, fmtResult(r))),
-    (e) => log(evReturnThrow(callId, e && e.message)),
+    (r) => { callSettled[callId] = true; log(evReturn(callId, fmtResult(r))); },
+    (e) => { callSettled[callId] = true; deliveredErrors.add(e && e.message); log(evReturnThrow(callId, e && e.message)); },
   );
+
+  // Oracle-independent settlement invariants, checked at each action's quiescence:
+  // - liveness: with no underlying/predicate/return promise pending and microtasks
+  //   drained, an unsettled consumer call can never settle (nothing can wake the
+  //   machinery), even if a later consumer call would mask the hang.
+  // - close-gating: while an underlying .return() the machinery issued is still
+  //   pending, some consumer promise must be unsettled (return() results and
+  //   predicate-error rejections await their close).
+  //
+  // DELIBERATE WEAKENING of close-gating: there is one legitimate "orphaned
+  // close" -- a predicate error triggers a close, and before that close settles
+  // a terminal done at a lower pull index discards the still-undelivered error;
+  // the calls then resolve done immediately and the close's outcome is swallowed
+  // (pinned by unit test filter-test-049). We exempt any run containing such a
+  // discarded (produced-but-never-delivered) error, which also exempts any
+  // OTHER pending close in that run -- a real loss of strength, accepted for
+  // now. If the implementation ever gates those dones on the close instead,
+  // remove the exemption (and flip the unit test).
+  const checkSettlementInvariants = () => {
+    if (invariantViolation) return; // report the first violation only
+    let unsettledId = -1;
+    for (let i = 0; i < callCount; i++) if (!callSettled[i]) { unsettledId = i; break; }
+    if (!pendingPulls.size && !pendingPreds.size && !pendingReturns.size && unsettledId !== -1) {
+      invariantViolation = `liveness: call #${unsettledId} is unsettled at quiescence with nothing pending`;
+    } else if (pendingReturns.size && unsettledId === -1) {
+      // Every call has settled, so any error that has not been delivered by now
+      // never will be: it was discarded, and may have orphaned a close.
+      const discardedErrorExists = [...producedErrors].some((e) => !deliveredErrors.has(e));
+      if (!discardedErrorExists) {
+        invariantViolation = `close-gating: underlying .return() #${[...pendingReturns.keys()].join(', #')} pending but every consumer call has settled`;
+      }
+    }
+  };
 
   return (async () => {
     for (const act of schedule.actions) {
@@ -521,11 +557,11 @@ function runReal(schedule) {
       if (act.t === 'next') {
         const callId = callCount++;
         try { trackNext(callId, Promise.resolve(filteredIt.next())); }
-        catch (e) { log(evNextThrow(callId, e && e.message)); }
+        catch (e) { callSettled[callId] = true; log(evNextThrow(callId, e && e.message)); }
       } else if (act.t === 'return') {
         const callId = callCount++;
         try { trackReturn(callId, Promise.resolve(filteredIt.return())); }
-        catch (e) { log(evReturnThrow(callId, e && e.message)); }
+        catch (e) { callSettled[callId] = true; log(evReturnThrow(callId, e && e.message)); }
       } else if (act.t === 'settlePull') {
         const d = pendingPulls.get(act.id);
         if (!d) log(`!! settlePull#${act.id} not pending`);
@@ -533,7 +569,7 @@ function runReal(schedule) {
           pendingPulls.delete(act.id);
           if (act.o === 'value') d.resolve({ value: pullValue(act.id), done: false });
           else if (act.o === 'done') d.resolve({ value: undefined, done: true });
-          else { underlyingErrored = true; d.reject(new Error(pullError(act.id))); }
+          else { underlyingErrored = true; producedErrors.add(pullError(act.id)); d.reject(new Error(pullError(act.id))); }
         }
       } else if (act.t === 'settlePred') {
         const p = pendingPreds.get(act.id);
@@ -542,7 +578,7 @@ function runReal(schedule) {
           pendingPreds.delete(act.id);
           if (act.o === 'true') p.d.resolve(true);
           else if (act.o === 'false') p.d.resolve(false);
-          else p.d.reject(new Error(predError(p.arg)));
+          else { producedErrors.add(predError(p.arg)); p.d.reject(new Error(predError(p.arg))); }
         }
       } else if (act.t === 'settleReturn') {
         const d = pendingReturns.get(act.id);
@@ -550,6 +586,7 @@ function runReal(schedule) {
         else { pendingReturns.delete(act.id); d.resolve({ value: undefined, done: true }); }
       }
       await flush(() => cur.length);
+      checkSettlementInvariants();
       realTrace.push(cur.slice());
     }
     return { realTrace, invariantViolation };

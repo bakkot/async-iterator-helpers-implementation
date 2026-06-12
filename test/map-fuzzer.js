@@ -309,15 +309,34 @@ function runReal(schedule) {
   const mappedIt = map(source, fn);
   const realTrace = [];
   let callCount = 0;
+  const callSettled = []; // callId -> true once its promise settles
 
   const trackNext = (callId, p) => p.then(
-    (r) => log(evNext(callId, fmtResult(r))),
-    (e) => log(evNextThrow(callId, e && e.message)),
+    (r) => { callSettled[callId] = true; log(evNext(callId, fmtResult(r))); },
+    (e) => { callSettled[callId] = true; log(evNextThrow(callId, e && e.message)); },
   );
   const trackReturn = (callId, p) => p.then(
-    (r) => log(evReturn(callId, fmtResult(r))),
-    (e) => log(`return#${callId} -> throw ${e && e.message}`),
+    (r) => { callSettled[callId] = true; log(evReturn(callId, fmtResult(r))); },
+    (e) => { callSettled[callId] = true; log(`return#${callId} -> throw ${e && e.message}`); },
   );
+
+  // Oracle-independent settlement invariants, checked at each action's quiescence:
+  // - liveness: with no underlying/mapper/return promise pending and microtasks
+  //   drained, an unsettled consumer call can never settle (nothing can wake the
+  //   machinery), even if a later consumer call would mask the hang.
+  // - close-gating: while an underlying .return() the machinery issued is still
+  //   pending, some consumer promise must be unsettled (return() results and
+  //   mapper-error rejections await their close).
+  const checkSettlementInvariants = () => {
+    if (invariantViolation) return; // report the first violation only
+    let unsettledId = -1;
+    for (let i = 0; i < callCount; i++) if (!callSettled[i]) { unsettledId = i; break; }
+    if (!pendingPulls.size && !pendingMappers.size && !pendingReturns.size && unsettledId !== -1) {
+      invariantViolation = `liveness: call #${unsettledId} is unsettled at quiescence with nothing pending`;
+    } else if (pendingReturns.size && unsettledId === -1) {
+      invariantViolation = `close-gating: underlying .return() #${[...pendingReturns.keys()].join(', #')} pending but every consumer call has settled`;
+    }
+  };
 
   return (async () => {
     for (const act of schedule.actions) {
@@ -326,11 +345,11 @@ function runReal(schedule) {
       if (act.t === 'next') {
         const callId = callCount++;
         try { trackNext(callId, Promise.resolve(mappedIt.next())); }
-        catch (e) { log(evNextThrow(callId, e && e.message)); }
+        catch (e) { callSettled[callId] = true; log(evNextThrow(callId, e && e.message)); }
       } else if (act.t === 'return') {
         const callId = callCount++;
         try { trackReturn(callId, Promise.resolve(mappedIt.return())); }
-        catch (e) { log(`return#${callId} -> throw ${e && e.message}`); }
+        catch (e) { callSettled[callId] = true; log(`return#${callId} -> throw ${e && e.message}`); }
       } else if (act.t === 'settlePull') {
         const d = pendingPulls.get(act.id);
         if (!d) log(`!! settlePull#${act.id} not pending`);
@@ -354,6 +373,7 @@ function runReal(schedule) {
         else { pendingReturns.delete(act.id); d.resolve({ value: undefined, done: true }); }
       }
       await flush();
+      checkSettlementInvariants();
       realTrace.push(cur.slice().sort());
     }
     return { realTrace, invariantViolation };
@@ -475,7 +495,7 @@ async function main() {
   console.log(`N = ${N}`);
   console.log(`schedules explored: ${scheduleCount}`);
   console.log(`trace mismatches (real vs oracle): ${traceFailures}`);
-  console.log(`invariant violations (.return() after underlying error): ${invariantFailures}`);
+  console.log(`invariant violations: ${invariantFailures}`);
   console.log(`property violations (oracle vs sequential spec): ${propertyFailures}`);
   if (traceFailures === 0 && propertyFailures === 0 && invariantFailures === 0) {
     console.log('all schedules passed');

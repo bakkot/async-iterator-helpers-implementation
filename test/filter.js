@@ -1858,4 +1858,50 @@ tests.push(['filter: the value from the underlying .return() is ignored', async 
   ]);
 }]);
 
+// --- an orphaned close ------------------------------------------------------
+//
+// A terminal done can discard a buffered predicate error whose source close is
+// still in flight: pull #1's value fails the predicate (which closes the
+// source), but pull #0 then reports done -- the terminal wall discards the
+// never-delivered error, and BOTH calls resolve done immediately, NOT gated on
+// the still-pending close. The close's eventual outcome is then observed by
+// nothing (deliberately swallowed: the error that triggered it was discarded).
+// This pins the "orphaned close" semantics; the fuzzer's close-gating invariant
+// is weakened to exempt exactly this corner (see test/filter-fuzzer.js). If we
+// ever decide the dones should instead wait for the close, flip this test and
+// strengthen the fuzzer.
+tests.push(scenarioTest({
+  id: "filter-test-049",
+  helper: "filter",
+  label: "filter: a terminal done orphans the close of a discarded predicate error",
+  ticks: [
+    { note: "two concurrent pulls", steps: [ { events: [
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "pull", pull: "u0" },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    { note: "the later pull's predicate is invoked", steps: [ { events: [
+      { type: "settle", pull: "u1", value: 20 },
+      { type: "fn", call: "p0", arg: 20, from: "u1" },
+    ] } ] },
+    { note: "the predicate error closes the source; the error is held behind pull #0", steps: [ { events: [
+      { type: "fn-settle", call: "p0", error: "boom" },
+      { type: "close", target: "source" },
+    ] } ] },
+    { note: "the earlier done discards the held error; the dones do not wait for the close", steps: [ { events: [
+      { type: "settle", pull: "u0", done: true },
+      { type: "result", result: "r0", done: true },
+      { type: "result", result: "r1", done: true },
+    ] } ] },
+    { note: "the orphaned close settles; nothing observes it", steps: [ { events: [
+      { type: "close-settled", target: "source" },
+    ] } ] },
+    { note: "the helper is finished", steps: [ { events: [
+      { type: "next", result: "r2" },
+      { type: "result", result: "r2", done: true },
+    ] } ] },
+  ],
+}, { helper: filter, utils }));
+
 await runTests(tests, xfailed);

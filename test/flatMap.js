@@ -2900,4 +2900,54 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
+// --- an orphaned close ------------------------------------------------------
+//
+// An inner done can discard a buffered inner error whose source close is still
+// in flight: A's pull #1 rejects while pull #0 is still pending, so flatMap
+// terminates and closes the source; pull #0 then reports done, truncating the
+// never-delivered error. Both calls resolve done immediately, NOT gated on the
+// still-pending source close, and the close's eventual outcome is observed by
+// nothing (deliberately swallowed: the error that triggered it was discarded).
+// This pins the "orphaned close" semantics; the fuzzer's close-gating invariant
+// (I11) is weakened to exempt exactly this corner (see test/flatMap-fuzzer.js).
+// If we ever decide the dones should instead wait for the close, flip this test
+// and strengthen the fuzzer.
+tests.push(scenarioTest({
+  id: "flatmap-test-062",
+  helper: "flatMap",
+  label: "flatMap: an inner done orphans the close of a discarded inner error",
+  ticks: [
+    { note: "two calls, one underlying pull", steps: [ { events: [
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "pull", pull: "u0" },
+    ] } ] },
+    { note: "the mapper is invoked", steps: [ { events: [
+      { type: "settle", pull: "u0", value: 1 },
+      { type: "fn", call: "p0", arg: 1, from: "u0" },
+    ] } ] },
+    { note: "demand 2 fans out across A", steps: [ { events: [
+      { type: "fn-settle", call: "p0", iterator: "A" },
+      { type: "inner-pull", pull: "a0", iterator: "A" },
+      { type: "inner-pull", pull: "a1", iterator: "A" },
+    ] } ] },
+    { note: "the later pull's error terminates the stream and closes the source", steps: [ { events: [
+      { type: "settle", pull: "a1", error: "boom" },
+      { type: "close", target: "source" },
+    ] } ] },
+    { note: "the earlier done discards the held error; the dones do not wait for the close", steps: [ { events: [
+      { type: "settle", pull: "a0", done: true },
+      { type: "result", result: "r0", done: true },
+      { type: "result", result: "r1", done: true },
+    ] } ] },
+    { note: "the orphaned close settles; nothing observes it", steps: [ { events: [
+      { type: "close-settled", target: "source" },
+    ] } ] },
+    { note: "the helper is finished", steps: [ { events: [
+      { type: "next", result: "r2" },
+      { type: "result", result: "r2", done: true },
+    ] } ] },
+  ],
+}, { helper: flatMap, utils }));
+
 await runTests(tests, xfailed);

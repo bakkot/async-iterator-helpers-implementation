@@ -28,7 +28,7 @@ export const filterScenarios = [
     id: "filter-non-concurrent",
     helper: "filter",
     label: "Simple non-concurrent",
-    description: "Arrows or buttons at the bottom to navigate, alt-arrow to switch to other animations, click the names of the other helpers at the top for theirs. Dots indicate where some external-to-the-machinery action is about to occur.<br><br>This is a baseline for <code>.filter</code> with no concurrency. It works like you'd expect.",
+    description: "This is a baseline for <code>.filter</code> with no concurrency. It works like you'd expect.",
     ticks: [
       { steps: [
         {

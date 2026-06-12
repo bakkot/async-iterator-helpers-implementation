@@ -28,7 +28,7 @@ export const filterScenarios = [
     id: "filter-non-concurrent",
     helper: "filter",
     label: "Simple non-concurrent",
-    description: "This is a baseline for <code>.filter</code> with no concurrency. It works like you'd expect.",
+    description: "This is a baseline for <code>filter</code> with no concurrency. It works like you'd expect.",
     ticks: [
       { steps: [
         {
@@ -702,7 +702,7 @@ export const filterScenarios = [
     id: "filter-closing",
     helper: "filter",
     label: "Closing",
-    description: "As with <a href=\"#map-closing\"><code>map</code></a>, calls to <code>.return()</code> can be made concurrently with calls to <code>.next()</code>. This blocks future pulls but previous ones can still deliver values if they pass the predicate.",
+    description: "As with <a href=\"#map-closing\"><code>map</code></a>, calls to <code>result.return()</code> can be made concurrently with calls to <code>result.next()</code>. This blocks future pulls but previous ones can still deliver values if they pass the predicate.",
     display: { records: true },
     ticks: [
       { steps: [
@@ -737,11 +737,6 @@ export const filterScenarios = [
           events: [
             { type: "settle", pull: "u0", value: "A" },
             { type: "fn", call: "p0", arg: "A", from: "u0" },
-          ],
-        },
-        {
-          events: [
-            { type: "open-closing" },
           ],
         },
       ] },
@@ -820,7 +815,7 @@ export const filterScenarios = [
     id: "filter-closing-2",
     helper: "filter",
     label: "Closing 2*",
-    description: "As in <a href=\"#filter-closing\">Closing</a>, but now a predicate returns false after we have called <code>.return()</code>. Because the iterator is closed at that point, we do not issue a pull to replace the missing value.<br><br><strong>Open question</strong>: does calling <code>.return()</code> on the result iterator indicate only that we will no longer request <em>new</em> values, or also that we don't care about outstanding pulls? If the former, we can't call <code>underlying.return()</code> until we know we won't need a new value from it.",
+    description: "As in <a href=\"#filter-closing\">Closing</a>, but now a predicate returns false after we have called <code>result.return()</code>. Because the iterator is closed at that point, we do not issue a pull to replace the missing value.<br><br><strong>Open question</strong>: does calling <code>result.return()</code> indicate only that we will no longer request <em>new</em> values, or also that we don't care about outstanding pulls? If the former, we can't call <code>underlying.return()</code> until we know we won't need a new value from it.",
     display: { records: true },
     ticks: [
       { steps: [
@@ -855,11 +850,6 @@ export const filterScenarios = [
           events: [
             { type: "settle", pull: "u0", value: "A" },
             { type: "fn", call: "p0", arg: "A", from: "u0" },
-          ],
-        },
-        {
-          events: [
-            { type: "open-closing" },
           ],
         },
       ] },
@@ -1064,7 +1054,6 @@ export const filterScenarios = [
         },
         {
           events: [
-            { type: "open-closing" },
             { type: "close", target: "source" },
             { type: "tombstone", target: "underlying" },
             { type: "tombstone", target: "result" },
@@ -1105,7 +1094,7 @@ export const filterScenarios = [
     id: "filter-error-predicate-2",
     helper: "filter",
     label: "Error in predicate 2",
-    description: "Errors that cause <code>.return()</code> to be called cannot be delivered until the call to <code>.return()</code> settles.",
+    description: "Errors that cause <code>underlying.return()</code> to be called cannot be delivered until the call to <code>underlying.return()</code> settles.",
     ticks: [
       { steps: [
         {
@@ -1231,7 +1220,6 @@ export const filterScenarios = [
         },
         {
           events: [
-            { type: "open-closing" },
             { type: "close", target: "source" },
             { type: "tombstone", target: "underlying" },
             { type: "tombstone", target: "result" },
@@ -1279,7 +1267,6 @@ export const filterScenarios = [
           ],
         },
         {
-          caption: "<code>A</code> is delivered and the second <code>.next()</code> has rejected with the predicate error — the run is complete.",
           events: [],
         },
       ] },

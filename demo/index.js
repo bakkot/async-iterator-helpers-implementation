@@ -1408,7 +1408,7 @@ function buildInteractiveButtons() {
 // promise is, and what right-clicking it does) changes.
 const IX_FN_NOTE = {
   map: 'Promises in the middle column represent the result of the mapper function, not iterator results, so right-clicking / D does nothing.',
-  filter: 'Promises in the middle column represent the result of the predicate, not iterator results. Right-clicking / D resolves it with <code>false</code> instead of <code>true</code>.',
+  filter: 'Promises in the middle column represent the result of the predicate, not iterator results. Right-clicking / D resolves it with <code>false</code> instead of <code>done: true</code>.',
   flatMap: 'Promises in the middle column represent the result of the mapper function, not iterator results. These always settle with an iterator or an error, so right-clicking / D does nothing.',
 };
 const IX_INSTRUCTIONS = (h) =>

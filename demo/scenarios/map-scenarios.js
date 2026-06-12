@@ -18,7 +18,7 @@ export const mapScenarios = [
     id: "map-non-concurrent",
     helper: "map",
     label: "Simple non-concurrent",
-    description: "Arrows or buttons at the bottom to navigate, alt-arrow to switch to other animations, click the names of the other helpers at the top for theirs. Dots indicate where some external-to-the-machinery action is about to occur.<br><br>This is a baseline for <code>.map</code> with no concurrency. It works like you'd expect.",
+    description: "Arrows or buttons at the bottom to navigate, alt-arrow to switch to other animations, click the names of the other helpers at the top for theirs. Dots indicate where some external-to-the-machinery action is about to occur.<br><br>This is a baseline for <code>map</code> with no concurrency. It works like you'd expect.",
     ticks: [
       { steps: [
         {
@@ -93,7 +93,7 @@ export const mapScenarios = [
     id: "map-concurrent",
     helper: "map",
     label: "Simple concurrent*",
-    description: "The distinguishing feature is that the consumer can call <code>.next()</code> again before previous calls have resolved.<br><br>For <code>.map</code>, uniquely, we can deliver values as they settle. <strong>Open question</strong>: should we?",
+    description: "The distinguishing feature is that the consumer can call <code>result.next()</code> again before previous calls have resolved.<br><br>For <code>map</code>, uniquely, we can deliver values as they settle. <strong>Open question</strong>: should we?",
     ticks: [
       { steps: [
         {
@@ -200,7 +200,7 @@ export const mapScenarios = [
           ],
         },
         {
-          caption: "Even if we decide <code>.map</code> should not deliver values in general out of order, it can still eagerly deliver <code>done: true</code> results specifically.",
+          caption: "Even if we decide <code>map</code> should not deliver values in general out of order, it can still eagerly deliver <code>done: true</code> results specifically (and should do so for performance of <code>flatMap</code>).",
           events: [
             { type: "result", result: "r1", done: true },
           ],
@@ -249,7 +249,7 @@ export const mapScenarios = [
     id: "map-exhaustion-2",
     helper: "map",
     label: "Exhaustion 2*",
-    description: "It is possible for the underlying iterator to be <em>incoherent</em>, that is, to produce a <code>done: false</code> after a <code>done: true</code>. For <code>.map</code>, if multiple pulls are in flight, this can be observed.<br><br><strong>Open question</strong>: What should we do in this case? The other helpers would have settled the 3rd pull with <code>done: true</code>. My inclination is to make this an <code>unhandledrejection</code> event.",
+    description: "It is possible for the underlying iterator to be <em>incoherent</em>, that is, to produce a <code>done: false</code> after a <code>done: true</code>. For <code>map</code>, if multiple pulls are in flight, this can be observed.<br><br><strong>Open question</strong>: What should we do in this case? The other helpers would have settled the 3rd pull with <code>done: true</code>. My inclination is to make this an <code>unhandledrejection</code> event.",
     display: { records: true },
     ticks: [
       { steps: [
@@ -443,7 +443,7 @@ export const mapScenarios = [
     id: "map-closing",
     helper: "map",
     label: "Closing",
-    description: "Consumers can also call <code>.return()</code> concurrently with one or more calls to <code>.next()</code>, which can be blocked either on the mapper or the underlying pull.",
+    description: "Consumers can also call <code>result.return()</code> concurrently with one or more calls to <code>result.next()</code>, which can be blocked either on the mapper or the underlying pull.",
     display: { records: true },
     ticks: [
       { steps: [
@@ -494,7 +494,7 @@ export const mapScenarios = [
           ],
         },
         {
-          caption: "Calling <code>.return()</code> when not closed will forward the call to the underlying iterator, and will cause the iterator to be considered closed.",
+          caption: "Calling <code>result.return()</code> when not closed will forward the call to the underlying iterator, and will cause the iterator to be considered closed.",
           events: [
             { type: "close", target: "source" },
             { type: "tombstone", target: "result" },
@@ -504,7 +504,7 @@ export const mapScenarios = [
       ] },
       { steps: [
         {
-          caption: "Further calls to <code>.next()</code> settle with <code>done: true</code>, even if the call to <code>.return()</code> is not yet complete.",
+          caption: "Further calls to <code>result.next()</code> settle with <code>done: true</code>, even if the call to <code>result.return()</code> is not yet complete.",
           events: [
             { type: "next", result: "r2" },
           ],
@@ -677,7 +677,7 @@ export const mapScenarios = [
           ],
         },
         {
-          caption: "Note that the outstanding <code>result</code> is not settled here.",
+          caption: "Note that the outstanding <code>result.next()</code> Promise is not settled here.",
           events: [
             { type: "close", target: "source" },
             { type: "tombstone", target: "underlying" },
@@ -782,7 +782,6 @@ export const mapScenarios = [
         },
         {
           events: [
-            { type: "open-closing" },
             { type: "close", target: "source" },
             { type: "tombstone", target: "underlying" },
             { type: "tombstone", target: "result" },

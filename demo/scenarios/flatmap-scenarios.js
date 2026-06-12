@@ -23,7 +23,7 @@ export const flatMapScenarios = [
     id: "flatmap-non-concurrent",
     helper: "flatMap",
     label: "Simple non-concurrent",
-    description: "This is a baseline for <code>.flatMap</code> with no concurrency. It works like you'd expect.",
+    description: "This is a baseline for <code>flatMap</code> with no concurrency. It works like you'd expect.",
     ticks: [
       { steps: [
         {
@@ -689,7 +689,7 @@ export const flatMapScenarios = [
     id: "flatmap-closing-2",
     helper: "flatMap",
     label: "Closing 2",
-    description: "We close only the active inner iterator, because earlier inner iterators are definitionally closed. They may still have outstanding Promises, however, which can still be delivered.",
+    description: "We close only the underlying iterator and the active inner iterator, because earlier inner iterators are definitionally closed. They may still have outstanding Promises, however, which can still be delivered.",
     ticks: [
       { steps: [
         {
@@ -891,7 +891,7 @@ export const flatMapScenarios = [
           ],
         },
         {
-          caption: "Because we now know that the inner iterator did not error, we can resolve the outstanding <code>.next()</code> Promise. We also immediately close the inner iterator.",
+          caption: "Because we now know that the inner iterator did not error, we can resolve the outstanding <code>result.next()</code> Promise. We also immediately close the inner iterator.",
           events: [
             { type: "close", target: "B" },
             { type: "result", result: "r1", done: true },
@@ -1024,7 +1024,7 @@ export const flatMapScenarios = [
     id: "flatmap-error-in-underlying-during-return",
     helper: "flatMap",
     label: "Error in underlying during return",
-    description: "Same scenario as <a href=\"#flatmap-closing-during-pull\">Closing during pull</a>, except now the underlying pull throws. This demonstrates why we kept a Promise from <code>.next()</code> unresolved: so that it can surface this Error.",
+    description: "Same scenario as <a href=\"#flatmap-closing-during-pull\">Closing during pull</a>, except now the underlying pull throws. This demonstrates why we kept a Promise from <code>result.next()</code> unresolved: so that it can surface this Error.",
     ticks: [
       { steps: [
         {
@@ -1229,16 +1229,11 @@ export const flatMapScenarios = [
       { steps: [
         {
           events: [
-            { type: "open-closing" },
-          ],
-        },
-        {
-          events: [
             { type: "settle", pull: "a0", error: "boom" },
           ],
         },
         {
-          caption: "Because the error will occupy a slot, we now know where the queued value will land, and can resolve a <code>.next()</code> pull with that value. We also trigger a call of <code>inner.return()</code>; the Error cannot land until this and the subsequent call to <code>underlying.return()</code> settle.",
+          caption: "Because the error will occupy a slot, we now know where the queued value will land, and can resolve a <code>result.next()</code> pull with that value. We also trigger a call of <code>inner.return()</code>; the Error cannot land until this and the subsequent call to <code>underlying.return()</code> settle.",
           events: [
             { type: "close", target: "B" },
             { type: "result", result: "r1", value: "b0", from: "b0" },

@@ -47,11 +47,11 @@ type ReadingUnderlyingState = { type: 'reading underlying', requested: number /*
 // a pull/mapper rejection would land on. When the in-flight pull/mapper settle we
 // close the produced iterator (if any) WITHOUT pulling it and done the held call.
 // result.return() (resolveReturn/rejectReturn) waits for BOTH the underlying close
-// and any inner close, which can be outstanding concurrently. `requested` tracks the
-// still-pending bound demand (the held call plus any demand a parked iterator freed).
+// and any inner close, which can be outstanding concurrently. Draining always
+// logically requests exactly one value — the held call, which is the last of
+// #calls; the buffered parked values keep the calls before it.
 type DrainingState = {
   type: 'draining',
-  requested: number, // integer >= 1 TODO I think we don't need this
   resolveReturn: (v: unknown) => void,
   rejectReturn: (e: unknown) => void,
   uCloseSettled: Promise<CloseOutcome>,
@@ -79,7 +79,7 @@ class FlatMapHelper {
 
   #active: ActiveState = { type: 'unstarted' };
 
-  // invariant: calls.length == [sum of lengths of closedButStillHaveValuesInFlight] + [active.requested | active.values.length]
+  // invariant: calls.length == [sum of lengths of closedButStillHaveValuesInFlight] + [active.requested | active.values.length | (1 when draining)]
   #calls: { resolve: (v: unknown) => void, reject: (v: unknown) => void }[] = [];
 
   constructor(underlying: unknown, fn: unknown) {
@@ -196,7 +196,7 @@ class FlatMapHelper {
             // a value: done their calls now. The last call is held for the in-flight
             // pull/mapper (the position a rejection would land on) and must survive;
             // the freed calls are the `removedCount` sitting just before it. (Draining
-            // always logically requests exactly one value, so `requested` stays 1.)
+            // always logically requests exactly that one held value.)
             const firstFreed = this.#calls.length - 1 - removedCount;
             for (const call of this.#calls.splice(firstFreed, removedCount)) {
               call.resolve({ value: undefined, done: true });
@@ -299,7 +299,7 @@ class FlatMapHelper {
           // we're finished). The error itself still reaches the call at this slot's
           // position, and result.return() waits for the eager underlying close.
           const d = this.#active;
-          this.#markSomeCallsAsNoLongerGettingValues(d.requested);
+          this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
           this.#finalizeReturn(d, null);
           this.#active = { type: 'finished' };
           (slot as ErrorState).closeState = 'ready';
@@ -332,7 +332,7 @@ class FlatMapHelper {
   // waits for the eager underlying close. (Buffered parked values keep their calls.)
   #drainingDone(d: DrainingState) {
     ASSERT(this.#active === d, 'active is the draining state');
-    this.#markSomeCallsAsNoLongerGettingValues(d.requested);
+    this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
     this.#active = { type: 'finished' };
     this.#finalizeReturn(d, null);
   }
@@ -451,7 +451,7 @@ class FlatMapHelper {
               // inner close.
               const d = this.#active as DrainingState;
               const iCloseSettled = this.#captureClose(() => (actualIter as MaybeReturnable).return?.());
-              this.#markSomeCallsAsNoLongerGettingValues(d.requested);
+              this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
               this.#active = { type: 'finished' };
               this.#finalizeReturn(d, iCloseSettled);
               return;
@@ -654,7 +654,6 @@ class FlatMapHelper {
       const { resolve, reject, promise } = Promise.withResolvers();
       this.#active = {
         type: 'draining',
-        requested: 1,
         resolveReturn: resolve,
         rejectReturn: reject,
         uCloseSettled,

@@ -328,16 +328,6 @@ class FlatMapHelper {
     this.#active = { type: 'finished' };
   }
 
-  // The in-flight underlying pull we were draining reported a clean done — no inner
-  // iterator. The pending bound demand can never be filled, so done it; result.return()
-  // waits for the eager underlying close. (Buffered parked values keep their calls.)
-  #drainingDone(d: DrainingState) {
-    ASSERT(this.#active === d, 'active is the draining state');
-    this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
-    this.#active = { type: 'finished' };
-    this.#finalizeReturn(d, null);
-  }
-
   // A stream error reached us while draining: the underlying pull rejected
   // (`gateOnUnderlyingClose` false — the underlying exhausted itself), or a value was
   // produced that we then failed to map (`gateOnUnderlyingClose` true — like a mapper
@@ -368,7 +358,7 @@ class FlatMapHelper {
       if (s.reject) {
         s.reject(error);
       } else if ((slot as Slot).type !== 'removed') {
-        slot.closeState = 'ready';
+        (slot as ErrorState).closeState = 'ready';
       }
     });
   }
@@ -404,16 +394,13 @@ class FlatMapHelper {
 
     fastPromiseTry(() => (this.#underlying as Nextable).next()).then(
       r => {
-        // We may be 'reading underlying' (live) or 'draining' (return() landed while
-        // this pull was in flight). Anything else means the stream already ended via
-        // another path, so this value is discarded.
         const st = this.#active.type;
         if (st !== 'reading underlying' && st !== 'draining') return;
         if ((r as { done: boolean }).done) {
-          // Underlying exhausted. While draining the bound demand can never be
-          // filled; otherwise this is the normal terminal done.
           if (st === 'draining') {
-            this.#drainingDone(this.#active as DrainingState);
+            this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
+            this.#finalizeReturn(this.#active, null);
+            this.#active = { type: 'finished' };
           } else {
             this.#markUnderlyingAsFinished();
           }

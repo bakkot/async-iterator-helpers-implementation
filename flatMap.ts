@@ -187,12 +187,19 @@ class FlatMapHelper {
                 this.#issuePullFromCurrentActive();
               }
             }
-          } else if (this.#active.type === 'reading underlying' || this.#active.type === 'draining') {
+          } else if (this.#active.type === 'reading underlying') {
             // The freed demand is absorbed by the iterator the in-flight underlying
-            // pull will produce. (While draining we won't pull the underlying again,
-            // but we still pull that produced iterator `requested` times before
-            // closing it, so the freed demand rolls onto it just the same.)
+            // pull will produce.
             this.#active.requested += removedCount;
+          } else if (this.#active.type === 'draining') {
+            // We will NOT pull anything more, so these parked slots can never receive
+            // a value: done their calls now. Draining always logically requests
+            // exactly one value — the held call (the position a pull/mapper rejection
+            // would land on), which is the last call and must be left intact — so we
+            // done the freed calls sitting just before it. (`requested` stays 1.)
+            const held = this.#calls.pop()!;
+            this.#markSomeCallsAsNoLongerGettingValues(removedCount);
+            this.#calls.push(held);
           } else {
             ASSERT(this.#active.type === 'error' || this.#active.type === 'finished', 'active is error or finished');
 

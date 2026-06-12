@@ -2827,4 +2827,73 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
+// The mirror of flatmap-test-060: a parked iterator's in-flight pull reports DONE
+// (rather than yielding) and the in-flight underlying pull then succeeds. After
+// return() while reading the underlying, the state is the same — a parked value
+// (r0's a0) ahead of one held call (r1, the position a pull/mapper rejection would
+// land on). When a0 reports done it can never receive a value (we're draining and
+// will not pull anything new), so r0 settles done RIGHT THEN — we already know at
+// most ONE more result can be produced (an error from the in-flight pull/mapper, or
+// nothing), and that one is reserved for the held call r1. r1 stays held until the
+// in-flight pull resolves and its mapper settles cleanly (no error), at which point
+// the produced iterator is closed without being pulled and r1 dones. (The bug this
+// guards against held r0 open until the second mapper settled, by rolling the freed
+// demand onto DrainingState.requested instead of doning it.)
+tests.push(scenarioTest({
+  id: "flatmap-test-061",
+  helper: "flatMap",
+  label: "flatMap: return() while reading underlying dones a parked call as soon as its pull reports done",
+  ticks: [
+    { note: "first next() pulls the underlying", steps: [
+      { events: [] },
+      { events: [
+        { type: "next", result: "r0" },
+        { type: "pull", pull: "u0" },
+      ] },
+    ] },
+    { note: "the mapper is invoked", steps: [ { events: [
+      { type: "settle", pull: "u0", value: "A" },
+      { type: "fn", call: "p0", arg: "A", from: "u0" },
+    ] } ] },
+    { note: "a second call raises the demand", steps: [ { events: [
+      { type: "next", result: "r1" },
+    ] } ] },
+    { note: "demand 2 fans out across A", steps: [ { events: [
+      { type: "fn-settle", call: "p0", iterator: "A" },
+      { type: "inner-pull", pull: "a0", iterator: "A" },
+      { type: "inner-pull", pull: "a1", iterator: "A" },
+    ] } ] },
+    // A reports done at pull #1 with pull #0 still in flight: A is parked keeping #0
+    // (bound to r0), and the freed demand (1, bound to r1) reads the underlying again.
+    { note: "A parks; the freed demand reads the underlying again", steps: [ { events: [
+      { type: "settle", pull: "a1", done: true },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    // return() while reading the underlying: bound demand is 1 (r1, held); nothing to
+    // done eagerly; r0 keeps its parked pull a0; the underlying closes eagerly.
+    { note: "the underlying closes eagerly; the calls are held", steps: [ { events: [
+      { type: "return", result: "ret" },
+      { type: "close", target: "source" },
+    ] } ] },
+    // A's parked pull #0 reports done. It can never receive a value now (we won't pull
+    // anything more), so r0 settles done immediately; r1 stays held for the in-flight
+    // pull/mapper.
+    { note: "the parked pull reporting done settles r0 immediately", steps: [ { events: [
+      { type: "settle", pull: "a0", done: true },
+      { type: "result", result: "r0", done: true },
+    ] } ] },
+    { note: "the in-flight underlying value is mapped", steps: [ { events: [
+      { type: "settle", pull: "u1", value: "B" },
+      { type: "fn", call: "p1", arg: "B", from: "u1" },
+    ] } ] },
+    // The mapper settles cleanly: the produced iterator is closed without being pulled,
+    // and the held call r1 finally dones.
+    { note: "the produced iterator is closed without being pulled; the held call dones", steps: [ { events: [
+      { type: "fn-settle", call: "p1", iterator: "B" },
+      { type: "close", target: "B" },
+      { type: "result", result: "r1", done: true },
+    ] } ] },
+  ],
+}, { helper: flatMap, utils }));
+
 await runTests(tests, xfailed);

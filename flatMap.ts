@@ -301,7 +301,7 @@ class FlatMapHelper {
           // position, and result.return() waits for the eager underlying close.
           const d = this.#active;
           this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
-          this.#finalizeReturn(d, null);
+          this.#finalizeReturnAfterUnderlyingClose(d);
           this.#active = { type: 'finished' };
           (slot as ErrorState).closeState = 'ready';
           if (this.#isHeadOfQueue(slot)) {
@@ -338,8 +338,8 @@ class FlatMapHelper {
   #drainingError(d: DrainingState, error: unknown, gateOnUnderlyingClose: boolean) {
     ASSERT(this.#active === d, 'active is the draining state');
     this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#bufferedValueCount() - 1);
-    this.#finalizeReturn(d, null);
     if (!gateOnUnderlyingClose) {
+      this.#finalizeReturnAfterUnderlyingClose(d);
       this.#active = { type: 'error', error, closeState: 'ready' };
       if (this.#closedButStillHaveValuesInFlight.length === 0) {
         this.#processQueue();
@@ -361,6 +361,9 @@ class FlatMapHelper {
         (slot as ErrorState).closeState = 'ready';
       }
     });
+    // Registered after the rejection reaction above so the held call rejects
+    // before result.return() resolves.
+    this.#finalizeReturnAfterUnderlyingClose(d);
   }
 
   // Run `thunk` (a .return() call) and capture its outcome as a never-rejecting
@@ -372,19 +375,31 @@ class FlatMapHelper {
     );
   }
 
-  // Settle result.return() once both the eager underlying close and (if an inner was
-  // produced) the inner close have settled. It resolves done unless a close failed,
-  // in which case it rejects with that error — the inner close taking precedence.
-  #finalizeReturn(d: DrainingState, iCloseSettled: Promise<CloseOutcome> | null) {
-    const closes = iCloseSettled == null ? [d.uCloseSettled] : [iCloseSettled, d.uCloseSettled];
-    Promise.all(closes).then(outcomes => {
-      for (const outcome of outcomes) {
-        if (!outcome.ok) {
-          d.rejectReturn(outcome.error);
-          return;
-        }
+  // Settle result.return() once the eager underlying close has settled (no inner was
+  // produced). It resolves done unless that close failed, in which case it rejects
+  // with that error.
+  #finalizeReturnAfterUnderlyingClose(d: DrainingState) {
+    d.uCloseSettled.then(outcome => {
+      if (outcome.ok) {
+        d.resolveReturn({ value: undefined, done: true });
+      } else {
+        d.rejectReturn(outcome.error);
       }
-      d.resolveReturn({ value: undefined, done: true });
+    });
+  }
+
+  // Settle result.return() once both the inner close and the eager underlying close
+  // have settled. It resolves done unless a close failed, in which case it rejects
+  // with that error — the inner close taking precedence.
+  #finalizeReturnAfterBothCloses(d: DrainingState, iCloseSettled: Promise<CloseOutcome>) {
+    Promise.all([iCloseSettled, d.uCloseSettled]).then(([iOutcome, uOutcome]) => {
+      if (!iOutcome.ok) {
+        d.rejectReturn(iOutcome.error);
+      } else if (!uOutcome.ok) {
+        d.rejectReturn(uOutcome.error);
+      } else {
+        d.resolveReturn({ value: undefined, done: true });
+      }
     });
   }
 
@@ -399,7 +414,7 @@ class FlatMapHelper {
         if ((r as { done: boolean }).done) {
           if (st === 'draining') {
             this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
-            this.#finalizeReturn(this.#active, null);
+            this.#finalizeReturnAfterUnderlyingClose(this.#active);
             this.#active = { type: 'finished' };
           } else {
             this.#markUnderlyingAsFinished();
@@ -441,7 +456,7 @@ class FlatMapHelper {
               const iCloseSettled = this.#captureClose(() => (actualIter as MaybeReturnable).return?.());
               this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
               this.#active = { type: 'finished' };
-              this.#finalizeReturn(d, iCloseSettled);
+              this.#finalizeReturnAfterBothCloses(d, iCloseSettled);
               return;
             }
 
@@ -636,7 +651,7 @@ class FlatMapHelper {
       // pull/mapper rejection would land on). Close the underlying EAGERLY now, and
       // switch to 'draining': when the pull/mapper settle we close the produced
       // iterator (if any) without pulling it and done the held call. return() waits
-      // for both closes (see #finalizeReturn).
+      // for both closes (see #finalizeReturnAfterBothCloses).
       this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#bufferedValueCount() - 1);
       const uCloseSettled = this.#captureClose(() => (this.#underlying as MaybeReturnable).return?.());
       const { resolve, reject, promise } = Promise.withResolvers();

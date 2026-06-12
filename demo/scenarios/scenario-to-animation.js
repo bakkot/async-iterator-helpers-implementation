@@ -9,7 +9,7 @@
 // convention, like sync-throwing pulls). Such scenarios are still valid as
 // tests — they just can't be animated.
 
-import { indexScenario, narrateEvents } from '../../scenario-core.js';
+import { indexScenario, narrateEvents, ord } from '../../scenario-core.js';
 
 const MAX_ROWS = 4; // u0..u3, r0..r3, m{row}0..3
 
@@ -35,7 +35,6 @@ export function scenarioToAnimation(scenario) {
   // what the SVG just did. The per-event prose lives in scenario-core's
   // narrateEvents (shared with the Interactive tab); the dot-preview wording
   // below is animation-only, so it stays here.
-  const ord = (n) => ['1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th'][n] ?? `${n + 1}th`;
 
   // A dot-preview beat (spliced in below) shows where the *next* step will act
   // but changes nothing itself. Narrate it by naming the dotted target(s).

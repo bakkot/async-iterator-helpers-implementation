@@ -252,6 +252,21 @@ export function indexScenario(scenario) {
   return { scenario, names, events, pulls, calls, results, inners, syncFn: fnSync.length > 0, fnSync };
 }
 
+const pr = new Intl.PluralRules('en-US', { type: 'ordinal' });
+
+const suffixes = {
+  one: 'st',
+  two: 'nd',
+  few: 'rd',
+  other: 'th',
+};
+
+export function ord(n) {
+  const num = n + 1;
+  return `${num}${suffixes[pr.select(num)]}`;
+}
+
+
 // Narrate a list of events (one animation step, or one Interactive-tab tick)
 // as a screen-reader sentence, using the resolved handle index from
 // indexScenario. Plain prose only — no code or markdown — since an aria-live
@@ -262,7 +277,6 @@ export function indexScenario(scenario) {
 export function narrateEvents(events, index) {
   const { names, scenario } = index;
   const display = (v) => String(v);
-  const ord = (n) => ['1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th'][n] ?? `${n + 1}th`;
   const fnNoun = scenario.helper === 'filter' ? 'predicate' : 'mapper';
   const valPhrase = (ev) => {
     if ('error' in ev) return 'an error';

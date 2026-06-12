@@ -193,13 +193,14 @@ class FlatMapHelper {
             this.#active.requested += removedCount;
           } else if (this.#active.type === 'draining') {
             // We will NOT pull anything more, so these parked slots can never receive
-            // a value: done their calls now. Draining always logically requests
-            // exactly one value — the held call (the position a pull/mapper rejection
-            // would land on), which is the last call and must be left intact — so we
-            // done the freed calls sitting just before it. (`requested` stays 1.)
-            const held = this.#calls.pop()!;
-            this.#markSomeCallsAsNoLongerGettingValues(removedCount);
-            this.#calls.push(held);
+            // a value: done their calls now. The last call is held for the in-flight
+            // pull/mapper (the position a rejection would land on) and must survive;
+            // the freed calls are the `removedCount` sitting just before it. (Draining
+            // always logically requests exactly one value, so `requested` stays 1.)
+            const firstFreed = this.#calls.length - 1 - removedCount;
+            for (const call of this.#calls.splice(firstFreed, removedCount)) {
+              call.resolve({ value: undefined, done: true });
+            }
           } else {
             ASSERT(this.#active.type === 'error' || this.#active.type === 'finished', 'active is error or finished');
 

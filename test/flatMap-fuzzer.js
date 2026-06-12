@@ -149,13 +149,29 @@ async function runSchedule(maxEvents, chooser) {
   // .return() method, so flatMap's `return?.()` is a no-op and no close is
   // recorded even though the helper has genuinely terminated. (An inner *done*
   // still never ends the stream, so it is deliberately not included here.)
+  //
+  // BUT an inner-pull error only terminates the helper if flatMap actually
+  // OBSERVES it: a done from the SAME inner at a LOWER pull index that settled
+  // EARLIER truncates the later in-flight pulls, so their outcomes are post-end
+  // noise that flatMap discards -- the helper lives on. Both orders matter (a
+  // done at a HIGHER index does not truncate earlier pulls, and a done settling
+  // AFTER the error arrives too late), so we compare pull index and settlement
+  // order (`seq`, a global counter recording when each outcome became known).
+  const innerErrorObserved = (inner, p) =>
+    !inner.pulls.some((q) => q.status === 'done' && q.idx < p.idx && q.seq < p.seq);
   const streamErrored = () =>
-    rec.inners.some((inner) => inner.finished === 'error') ||
+    rec.inners.some((inner) => inner.pulls.some((p) => p.status === 'error' && innerErrorObserved(inner, p))) ||
     rec.mappers.some((m) => m.outcome === 'error');
   const isFinished = () => consumerReturned || rec.underlying.finished != null || rec.underlying.returnCalls > 0 || streamErrored();
 
   let eventSeq = 0;
   const log = (line) => { rec.events.push(line); eventSeq++; };
+  // Settlement order: bumped each time a pull's outcome becomes known (a sync
+  // response, or the chooser settling a pending one). Within one synchronous
+  // burst flatMap's .then callbacks run in issue order, and each settle action
+  // is flushed to quiescence before the next, so this matches the order flatMap
+  // observes the outcomes.
+  let settleSeq = 0;
   const violation = (msg) => { rec.violations.push(msg); log(`!! VIOLATION: ${msg}`); };
 
   // Outstanding (unsettled) consumer next() calls -- the live demand.
@@ -268,9 +284,9 @@ async function runSchedule(maxEvents, chooser) {
         const pull = { idx, status: 'pending' };
         inner.pulls.push(pull);
         const shape = (finalizing || idx >= maxPulls) ? 'syncDone' : PULL_SHAPES[chooser.choose(PULL_SHAPES.length)];
-        if (shape === 'syncValue') { pull.status = 'value'; pull.value = innerValue(id, idx); return { value: pull.value, done: false }; }
-        if (shape === 'syncDone') { pull.status = 'done'; inner.finished = 'done'; inner.finishedStep = stepNo; return { value: undefined, done: true }; }
-        if (shape === 'syncThrow') { pull.status = 'error'; inner.finished = 'error'; inner.finishedStep = stepNo; throw new Error(innerError(id, idx)); }
+        if (shape === 'syncValue') { pull.status = 'value'; pull.seq = settleSeq++; pull.value = innerValue(id, idx); return { value: pull.value, done: false }; }
+        if (shape === 'syncDone') { pull.status = 'done'; pull.seq = settleSeq++; inner.finished = 'done'; inner.finishedStep = stepNo; return { value: undefined, done: true }; }
+        if (shape === 'syncThrow') { pull.status = 'error'; pull.seq = settleSeq++; inner.finished = 'error'; inner.finishedStep = stepNo; throw new Error(innerError(id, idx)); }
         const d = Promise.withResolvers();
         pendingPulls.push({ id: `I${id}#${idx}`, kind: 'I', innerId: id, idx, d });
         return d.promise;
@@ -326,6 +342,7 @@ async function runSchedule(maxEvents, chooser) {
   const settlePull = (entry, outcome) => {
     pendingPulls.splice(pendingPulls.indexOf(entry), 1);
     const pull = entry.kind === 'U' ? rec.underlying.pulls[entry.idx] : rec.inners[entry.innerId].pulls[entry.idx];
+    pull.seq = settleSeq++;
     if (outcome === 'value') {
       pull.status = 'value';
       pull.value = entry.kind === 'U' ? underlyingValue(entry.idx) : innerValue(entry.innerId, entry.idx);

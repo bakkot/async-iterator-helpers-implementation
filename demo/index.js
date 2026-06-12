@@ -301,7 +301,7 @@ function buildTabs() {
   // sparkle + shimmer so it reads as the odd one out.
   const ib = document.createElement('a');
   ib.className = 'tab interactive';
-  ib.href = '#' + currentSet + '-interactive';
+  ib.href = '#' + currentSet.toLowerCase() + '-interactive';
   ib.innerHTML = '✨ Interactive';
   tabsEl.appendChild(ib);
 }
@@ -344,7 +344,8 @@ setLinks.forEach((a, name) => { a.href = '#' + animationSets[name][0].id; });
 function route() {
   const hash = decodeURIComponent((location.hash || '').slice(1));
   if (hash.endsWith('-interactive')) {
-    const set = hash.slice(0, -'-interactive'.length);
+    let set = hash.slice(0, -'-interactive'.length);
+    if (set === 'flatmap') set = 'flatMap';
     if (animationSets[set]) {
       if (set !== currentSet) selectSet(set);
       selectInteractive();
@@ -1154,7 +1155,7 @@ function buildScenario() {
   const ticks = [];
   for (let i = 0; i < ixCursor; i++) ticks.push({ steps: [{ events: ixCaptured[i] ?? [] }] });
   ticks[0]?.steps.unshift({ events: [] }); // All non-interactive scenarios have this so they can label the start state.
-  return { id: `${currentSet}-interactive`, helper: currentSet, label: 'Interactive export', ticks };
+  return { id: `${currentSet.toLowerCase()}-interactive`, helper: currentSet, label: 'Interactive export', ticks };
 }
 // Render close to the hand-authored scenario style: structural keys unquoted,
 // one event object per line.
@@ -1206,7 +1207,7 @@ function exportDownload(btn) {
   const url = URL.createObjectURL(new Blob([text], { type: 'text/javascript' }));
   const a = document.createElement('a');
   a.href = url;
-  a.download = `${currentSet}-interactive-scenario.js`;
+  a.download = `${currentSet.toLowerCase()}-interactive-scenario.js`;
   a.click();
   URL.revokeObjectURL(url);
   flashLabel(btn, 'downloaded');
@@ -1318,7 +1319,7 @@ function loadScenarioText(text) {
   selectInteractive();   // fresh live session at step 0
   // Reflect the live tab in the URL without re-routing (replaceState doesn't
   // fire hashchange) — route() would reset the session we're about to prime.
-  history.replaceState(null, '', '#' + helper + '-interactive');
+  history.replaceState(null, '', '#' + helper.toLowerCase() + '-interactive');
   ixHistory = actions;   // …but primed with the loaded run, ready to step through
   ixCaptured = [];
   ixCursor = 0;
@@ -1502,7 +1503,7 @@ window.addEventListener('keydown', (e) => {
     const cur = interactive ? animations.length : animIndex;
     const toSlot = (delta) => {
       const n = (cur + delta + slots) % slots;
-      navigate(n < animations.length ? '#' + animations[n].id : '#' + currentSet + '-interactive');
+      navigate(n < animations.length ? '#' + animations[n].id : '#' + currentSet.toLowerCase() + '-interactive');
     };
     switch (e.key) {
       case 'ArrowRight': case 'ArrowDown': e.preventDefault(); toSlot(1);  return;

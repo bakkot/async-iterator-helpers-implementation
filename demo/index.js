@@ -1019,7 +1019,9 @@ function addDot({ id, st }) {
   box.classList.add('stimulus');
   // Expose the box as a focusable button so it's reachable by Tab and operable
   // from the keyboard (see the root keydown handler); the dot is its visual cue.
-  g.setAttribute('tabindex', '0');
+  // tabindex 2 groups it with the diagram controls, after .next() (see
+  // buildInteractiveButtons) and ahead of the rest of the page.
+  g.setAttribute('tabindex', '2');
   g.setAttribute('role', 'button');
   g.setAttribute('aria-label', stimulusLabel(id, st));
   const dot = svgEl('circle', {
@@ -1374,7 +1376,11 @@ window.addEventListener('drop', async (e) => {
 function buildInteractiveButtons() {
   root.querySelector('#next-btn')?.remove();
   // A `.next()` button sits just under the Result column header.
-  const g = svgEl('g', { id: 'next-btn', class: 'ibtn', tabindex: '0', role: 'button', 'aria-label': 'next(). Pull the next value from the iterator.' });
+  // Positive tabindex puts the diagram controls ahead of the rest of the page:
+  // .next() first (1), then the settleable boxes and result.return() (2, tied
+  // so DOM order — boxes then return — decides), then everything else (the top
+  // links, tabs, export, and the scrubbing stepper) in normal order.
+  const g = svgEl('g', { id: 'next-btn', class: 'ibtn', tabindex: '1', role: 'button', 'aria-label': 'next(). Pull the next value from the iterator.' });
   const bg = svgEl('rect', { class: 'ibtn-bg', x: 683, y: 58, width: 114, height: 26, rx: 7 });
   const label = svgEl('text', { class: 'ibtn-label', x: 740, y: 71, 'text-anchor': 'middle', 'dominant-baseline': 'central' });
   label.textContent = '.next()';
@@ -1388,7 +1394,7 @@ function buildInteractiveButtons() {
   const hdr = [...root.querySelectorAll('#closing .header.ret')].find(t => t.textContent.includes('result.return'));
   if (hdr && !root.querySelector('#return-btn')) {
     const bb = hdr.getBBox();
-    const grp = svgEl('g', { id: 'return-btn', class: 'ibtn', tabindex: '0', role: 'button', 'aria-label': 'result.return(). Close the iterator.' });
+    const grp = svgEl('g', { id: 'return-btn', class: 'ibtn', tabindex: '2', role: 'button', 'aria-label': 'result.return(). Close the iterator.' });
     const pill = svgEl('rect', { class: 'ibtn-header-bg', x: bb.x - 12, y: bb.y - 5, width: bb.width + 24, height: bb.height + 10, rx: 8 });
     hdr.parentNode.insertBefore(grp, hdr);
     grp.append(pill, hdr);                 // pill behind, header text in front

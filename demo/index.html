@@ -465,6 +465,19 @@
   .arrow { pointer-events: none; }
   .spare:not(.shown) { pointer-events: none; }
 
+  /* keyboard focus on an interactive control (the .next()/return() buttons and
+     the settleable boxes are focusable in the live tab): draw a clear ring.
+     The boxes/buttons are SVG <g>s, so we emphasize their child rect rather
+     than rely on an outline around the group. */
+  #viz [tabindex]:focus { outline: none; }
+  #viz [tabindex]:focus-visible .box,
+  #viz .ibtn[tabindex]:focus-visible .ibtn-bg,
+  #viz .ibtn[tabindex]:focus-visible .ibtn-header-bg {
+    stroke: #1d4ed8;
+    stroke-width: 4;
+    stroke-dasharray: 7 4;
+  }
+
   /* a settleable promise: the box is clickable and wears a pulsing corner dot */
   .box.stimulus { cursor: pointer; }
   .stim-dot {

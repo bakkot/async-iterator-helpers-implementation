@@ -990,22 +990,55 @@ function commitFrame() {
 }
 
 // ---- stimulus dots ----
+// `D` (done) isn't meaningful for a map/flatMap mapper result (it can only
+// settle with a value/iterator), matching the mouse contextmenu guard.
+function canSettleDone(st) { return !(st.kind === 'fn' && ix.helper !== 'filter'); }
+// The accessible name for a settleable box: what promise it is, plus the keys
+// that settle it. Read aloud when a keyboard user tabs onto it.
+function stimulusLabel(id, st) {
+  switch (st.kind) {
+    case 'pull':
+      return `Underlying pull ${st.row + 1}, pending. Enter to settle with a value, E for an error, D for done.`;
+    case 'inner':
+      return `Inner iterator ${letterFor(st.slot)}, pull ${st.col + 1}, pending. Enter to settle with a value, E for an error, D for done.`;
+    case 'fn':
+      if (ix.helper === 'filter') return `Predicate result for value ${st.arg}, pending. Enter to keep it (true), D to drop it (false), E for an error.`;
+      if (ix.helper === 'flatMap') return `Mapper result for value ${st.arg}, pending. Enter to settle with an inner iterator, E for an error.`;
+      return `Mapper result for value ${st.arg}, pending. Enter to settle with a value, E for an error.`;
+    case 'return':
+      return `underlying.return() call, pending. Enter or D to resolve it, E for an error.`;
+    case 'inner-return':
+      return `inner.return() call, pending. Enter or D to resolve it, E for an error.`;
+  }
+  return 'Settleable promise, pending.';
+}
 function addDot({ id, st }) {
   stimuli.set(id, st);
-  const box = root.querySelector(`#${id} .box`);
+  const g = root.querySelector(`#${id}`);
+  const box = g.querySelector('.box');
   box.classList.add('stimulus');
+  // Expose the box as a focusable button so it's reachable by Tab and operable
+  // from the keyboard (see the root keydown handler); the dot is its visual cue.
+  g.setAttribute('tabindex', '0');
+  g.setAttribute('role', 'button');
+  g.setAttribute('aria-label', stimulusLabel(id, st));
   const dot = svgEl('circle', {
     class: 'stim-dot',
     cx: +box.getAttribute('x') + Math.min(15, +box.getAttribute('width') / 2),
     cy: +box.getAttribute('y') + 15,
     r: 7,
   });
-  root.querySelector(`#${id}`).appendChild(dot);
+  g.appendChild(dot);
 }
 function removeDot(id) {
   stimuli.delete(id);
-  root.querySelector(`#${id} .box`)?.classList.remove('stimulus');
-  root.querySelector(`#${id} .stim-dot`)?.remove();
+  const g = root.querySelector(`#${id}`);
+  if (!g) return;
+  g.querySelector('.box')?.classList.remove('stimulus');
+  g.querySelector('.stim-dot')?.remove();
+  g.removeAttribute('tabindex');
+  g.removeAttribute('role');
+  g.removeAttribute('aria-label');
 }
 
 function revealArrow(conn) {
@@ -1041,14 +1074,41 @@ root.addEventListener('contextmenu', (e) => {
   if (st.kind === 'fn' && ix.helper !== 'filter') return;
   if (!ix.busy) userAction({ kind: 'settle', id: g.id, type: 'done' });
 });
+// Keyboard equivalent of the pointer handling above: with focus on a control
+// (the .next()/return() buttons or a settleable box, all made focusable),
+// Enter/Space activates or settles with a value, E settles with an error, and D
+// settles with done (for a filter predicate, "false"/drop). stopPropagation
+// keeps Space/Enter from also reaching the window-level history stepper.
+root.addEventListener('keydown', (e) => {
+  if (!interactive || !ix || ix.busy) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;   // leave browser/tab chords alone
+  const g = e.target.closest?.('[id]');
+  if (!g) return;
+  if (stimuli.has(g.id)) {
+    const st = stimuli.get(g.id);
+    let type = null;
+    if (e.key === 'Enter' || e.key === ' ') type = 'value';
+    else if (e.key === 'e' || e.key === 'E') type = 'error';
+    else if (e.key === 'd' || e.key === 'D') type = canSettleDone(st) ? 'done' : null;
+    if (!type) return;
+    e.preventDefault();
+    e.stopPropagation();
+    userAction({ kind: 'settle', id: g.id, type });
+  } else if (g.id === 'next-btn' || g.id === 'return-btn') {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    e.stopPropagation();
+    userAction({ kind: g.id === 'next-btn' ? 'next' : 'return' });
+  }
+});
 
 // ---- enabling/disabling the consumer buttons + the history stepper ----
 function updateButtons() {
   const gated = !ix || ix.busy;
   const nb = root.querySelector('#next-btn');
   const rb = root.querySelector('#return-btn');
-  if (nb) nb.classList.toggle('disabled', gated);
-  if (rb) rb.classList.toggle('disabled', gated);
+  if (nb) { nb.classList.toggle('disabled', gated); nb.setAttribute('aria-disabled', String(gated)); }
+  if (rb) { rb.classList.toggle('disabled', gated); rb.setAttribute('aria-disabled', String(gated)); }
   if (interactive) {   // the stepper mirrors the action history (undo/redo)
     stepnum.textContent = ixCursor;
     stepmax.textContent = ixHistory.length;
@@ -1314,7 +1374,7 @@ window.addEventListener('drop', async (e) => {
 function buildInteractiveButtons() {
   root.querySelector('#next-btn')?.remove();
   // A `.next()` button sits just under the Result column header.
-  const g = svgEl('g', { id: 'next-btn', class: 'ibtn' });
+  const g = svgEl('g', { id: 'next-btn', class: 'ibtn', tabindex: '0', role: 'button', 'aria-label': 'next(). Pull the next value from the iterator.' });
   const bg = svgEl('rect', { class: 'ibtn-bg', x: 683, y: 58, width: 114, height: 26, rx: 7 });
   const label = svgEl('text', { class: 'ibtn-label', x: 740, y: 71, 'text-anchor': 'middle', 'dominant-baseline': 'central' });
   label.textContent = '.next()';
@@ -1328,7 +1388,7 @@ function buildInteractiveButtons() {
   const hdr = [...root.querySelectorAll('#closing .header.ret')].find(t => t.textContent.includes('result.return'));
   if (hdr && !root.querySelector('#return-btn')) {
     const bb = hdr.getBBox();
-    const grp = svgEl('g', { id: 'return-btn', class: 'ibtn' });
+    const grp = svgEl('g', { id: 'return-btn', class: 'ibtn', tabindex: '0', role: 'button', 'aria-label': 'result.return(). Close the iterator.' });
     const pill = svgEl('rect', { class: 'ibtn-header-bg', x: bb.x - 12, y: bb.y - 5, width: bb.width + 24, height: bb.height + 10, rx: 8 });
     hdr.parentNode.insertBefore(grp, hdr);
     grp.append(pill, hdr);                 // pill behind, header text in front
@@ -1346,7 +1406,7 @@ const IX_FN_NOTE = {
   flatMap: 'Promises in the middle column represent the result of the mapper function, not iterator results. These always settle with an iterator or an error, so right-clicking one does nothing.',
 };
 const IX_INSTRUCTIONS = (h) =>
-  `This drives a JS-based <code>${h}</code> implementation. You can poll or close with the corresponding buttons. Outstanding Promises which are not settled by internal machinery can be settled by you (these are marked with a dot): click to settle with a value, shift-click to settle with an error, right click to settle with <code>done: true</code>. ${IX_FN_NOTE[h]}`
+  `This drives a JS-based <code>${h}</code> implementation. You can poll or close with the corresponding buttons. Outstanding Promises which are not settled by internal machinery can be settled by you (these are marked with a dot): click to settle with a value, shift-click to settle with an error, right click to settle with <code>done: true</code>. Keyboard: <kbd>Tab</kbd> to a button or dotted promise, then <kbd>Enter</kbd> to pull/activate or settle with a value, <kbd>E</kbd> for an error, <kbd>D</kbd> for <code>done</code> (a filter predicate's <code>false</code>). ${IX_FN_NOTE[h]}`
 // Wipe the diagram to the live tab's blank state: no dynamic elements, no
 // state classes/content/arrows/dots, the closing band permanently open and
 // the box columns lowered (the `interactive` class drives both, via CSS).

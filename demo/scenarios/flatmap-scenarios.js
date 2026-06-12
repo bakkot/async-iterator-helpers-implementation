@@ -915,8 +915,8 @@ export const flatMapScenarios = [
   {
     id: "flatmap-during-pull-2",
     helper: "flatMap",
-    label: "Closing during pull 2",
-    description: "Same scenario as <a href=\"#flatmap-closing-during-pull\">Closing during pull</a>, except we have an extra pull. This one can resolve as soon as <code>result.return()</code> is invoked: we only need to delay resolving a single Promise to hold possible errors.",
+    label: "Closing during pull 2*",
+    description: "Same scenario as <a href=\"#flatmap-closing-during-pull\">Closing during pull</a>, except we have an extra pull. This one can resolve as soon as <code>result.return()</code> is invoked: we only need to delay resolving a single Promise to hold possible errors.<br><br><strong>Open question</strong>: the call to <code>underlying.return()</code> here (and in the previous case) happens before the call to <code>inner.return()</code>, which makes it unlike the <a href=\"#flatmap-closing\">simple case</a>. Should we delay calling <code>underlying.return()</code>?",
     ticks: [
       { steps: [
         {

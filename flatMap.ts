@@ -657,7 +657,7 @@ class FlatMapHelper {
     // active is an inner iterator. Park it (its in-flight pulls keep delivering),
     // then close it and the underlying in sequence — active iterator first.
     // TODO order of truncation vs resolving this Promise
-    const active = this.#active;
+    const active = this.#active as InFlight;
     this.#markUnderlyingAsFinished();
     const activeIter = active.iter;
 

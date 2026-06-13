@@ -1409,9 +1409,9 @@ function buildInteractiveButtons() {
 // the same for every helper; only the per-element note (what the Internal
 // promise is, and what right-clicking it does) changes.
 const IX_FN_NOTE = {
-  map: 'Promises in the middle column represent the result of the mapper function, not iterator results, so right-clicking / D does nothing.',
-  filter: 'Promises in the middle column represent the result of the predicate, not iterator results. Right-clicking / D resolves it with <code>false</code> instead of <code>done: true</code>.',
-  flatMap: 'Promises in the middle column represent the result of the mapper function, not iterator results. These always settle with an iterator or an error, so right-clicking / D does nothing.',
+  map: 'Promises in the middle column represent the result of the mapper function, not iterator results, so right-clicking / <kbd>D</kbd> does nothing.',
+  filter: 'Promises in the middle column represent the result of the predicate, not iterator results. Right-clicking / <kbd>D</kbd> resolves it with <code>false</code> instead of <code>done: true</code>.',
+  flatMap: 'Promises in the middle column represent the result of the mapper function, not iterator results. These always settle with an iterator or an error, so right-clicking / <kbd>D</kbd> does nothing.',
 };
 const IX_INSTRUCTIONS = (h) =>
   `This drives a JS-based <code>${h}</code> implementation. You can poll or close with the corresponding buttons. Outstanding Promises which are not settled by internal machinery can be settled by you (these are marked with a dot): click to settle with a value, shift-click to settle with an error, right click to settle with <code>done: true</code>. Keyboard: <kbd>Tab</kbd> to a button or dotted Promise, then <kbd>Enter</kbd> to settle with a value, <kbd>E</kbd> for an error, <kbd>D</kbd> for <code>done</code>. ${IX_FN_NOTE[h]}`

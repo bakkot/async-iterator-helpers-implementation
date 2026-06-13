@@ -25,7 +25,10 @@ type Slot =
   | ErrorState
   | { type: 'removed' }
 
-type InFlight = { type: 'iter', iter: unknown, readonly values: Slot[] }
+// The active inner iterator. Its in-flight values live as the last entry of
+// #innerIterators (not here), so that when it stops being active we don't have to
+// move anything — the entry simply becomes a closed one.
+type ActiveIter = { type: 'iter', iter: unknown }
 
 // For errors from the mapper or from result iterators, we invoke .return() on
 // whatever is still open (the underlying, and possibly an active inner iterator).
@@ -58,8 +61,8 @@ type ActiveState =
   | ReadingUnderlyingState
   | DrainingState
   | ErrorState // specifically this means an error when reading from underlying or invoking the mapper
-  | InFlight
-  | { type: 'finished' } // but still might be outstanding earlier calls, to be settled by closedButStillHaveValuesInFlight
+  | ActiveIter
+  | { type: 'finished' } // but still might be outstanding earlier calls, to be settled by innerIterators
 
 
 type Nextable = { next: () => unknown };
@@ -69,13 +72,19 @@ class FlatMapHelper {
   #underlying: unknown;
   #fn: unknown;
 
-  // holds the .values arrays of closed iterators (not the InFlight objects, so the iterators themselves can be GC'd)
-  // invariant: index [0] is non-empty
-  readonly #closedButStillHaveValuesInFlight: Slot[][] = [];
+  // The values arrays of inner iterators that still have values in flight, in queue
+  // order. When #active is an iterator, the last entry is that (active) iterator's
+  // values; every other entry belongs to a closed iterator. We hold only the values
+  // arrays, not the iterators, so the iterators can be GC'd once closed.
+  // invariant: the first entry is non-empty (so [0][0] is the head of the queue),
+  // except transiently while the active iterator is the sole entry with no pulls yet.
+  readonly #innerIterators: Slot[][] = [];
 
   #active: ActiveState = { type: 'unstarted' };
 
-  // invariant: calls.length == [sum of lengths of closedButStillHaveValuesInFlight] + [active.requested | active.values.length | (1 when draining)]
+  // invariant: calls.length == [sum of lengths of innerIterators, which already
+  // includes the active iterator's values when active is an iterator] + [active.requested
+  // (reading underlying) | 1 (draining) | 0 (active is an iterator)]
   #calls: { resolve: (v: unknown) => void, reject: (v: unknown) => void }[] = [];
 
   constructor(underlying: unknown, fn: unknown) {
@@ -87,9 +96,22 @@ class FlatMapHelper {
     return this.#active.type === 'error' || this.#active.type === 'finished';
   }
 
-  // total values buffered in closed iterators (the first term of the #calls invariant)
+  // total values buffered across all tracked inner iterators — including the active
+  // one's, when active is an iterator (the first term of the #calls invariant)
   #bufferedValueCount() {
-    return this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.length, 0);
+    return this.#innerIterators.reduce((acc, x) => acc + x.length, 0);
+  }
+
+  // the active iterator's values array (its in-flight pulls), which is the last entry
+  get #activeValues(): Slot[] {
+    ASSERT(this.#active.type === 'iter', 'active is iter');
+    return this.#innerIterators[this.#innerIterators.length - 1];
+  }
+
+  // whether `values` is the active iterator's values array (the last entry, with an
+  // active iterator). This is how we ask "is this iterator the active one".
+  #isActiveValues(values: Slot[]): boolean {
+    return this.#active.type === 'iter' && this.#innerIterators[this.#innerIterators.length - 1] === values;
   }
 
   #markSomeCallsAsNoLongerGettingValues(removedCount: number) {
@@ -102,16 +124,20 @@ class FlatMapHelper {
   }
 
   #isHeadOfQueue(slot: Slot) {
-    return this.#closedButStillHaveValuesInFlight.length === 0
-      ? this.#active.type === 'iter' && this.#active.values[0] === slot
-        || this.#active.type === 'error' && this.#active === slot
-      : this.#closedButStillHaveValuesInFlight[0][0] === slot; // assert: this.#closedButStillHaveValuesInFlight[0].length > 0
+    if (this.#innerIterators.length === 0) {
+      // no buffered inner values; the only possible head is an active error
+      return this.#active.type === 'error' && this.#active === slot;
+    }
+    return this.#innerIterators[0][0] === slot; // invariant: this.#innerIterators[0].length > 0
   }
 
-  #truncateInFlightFrom(inFlight: InFlight, index: number) {
-    ASSERT(index >= 0 && index < inFlight.values.length, 'index in range');
-    for (let i = index; i < inFlight.values.length; ++i) {
-      const slot = inFlight.values[i];
+  // Drop `values` (some inner iterator's values array) and everything after it, marking
+  // the dropped slots removed. Leading empties exposed at the front of the queue are
+  // popped by #processQueue, so this does not touch #innerIterators itself.
+  #truncateInFlightFrom(values: Slot[], index: number) {
+    ASSERT(index >= 0 && index < values.length, 'index in range');
+    for (let i = index; i < values.length; ++i) {
+      const slot = values[i];
       if (slot.type === 'value') {
         slot.value = null; // for memory reasons
       } else if (slot.type === 'error') {
@@ -121,25 +147,17 @@ class FlatMapHelper {
       }
       slot.type = 'removed';
     }
-    inFlight.values.length = index;
-    if (index === 0) {
-      if (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight.values) {
-        do {
-          this.#closedButStillHaveValuesInFlight.shift();
-        } while (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0].length === 0);
-      }
-    }
+    values.length = index;
   }
 
   #issuePullFromCurrentActive() {
     ASSERT(this.#active.type === 'iter', 'active is iter');
 
     const slot: Slot = { type: 'awaiting' } as Slot; // the cast is not a no-op
-    const inFlight = this.#active as InFlight;
-    const thisIterValues = inFlight.values;
+    const thisIterValues = this.#activeValues;
     thisIterValues.push(slot);
 
-    const actualIter = inFlight.iter as Nextable;
+    const actualIter = (this.#active as ActiveIter).iter as Nextable;
 
     fastPromiseTry(() => actualIter.next()).then(
       iterResult => {
@@ -158,30 +176,31 @@ class FlatMapHelper {
 
           // Does removing these slots change the head of the queue (revealing
           // something that was buffered behind this iterator)? Only if this pull was
-          // the head of its own iterator (currentIndex === 0) AND that iterator is
-          // the front of the closed queue — then truncation pops it and the next
-          // entry becomes the head. (While `inFlight` is still the active iterator it
-          // isn't in the closed queue, so this is false; and nothing is buffered
-          // behind the active iterator anyway.) Capture before truncating pops it.
-          const exposedNewHead = currentIndex === 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight.values;
+          // the head of its own iterator (currentIndex === 0) AND that iterator is the
+          // front of the queue and not the active one — then truncation empties the
+          // front entry, which #processQueue pops to expose the next entry. (Nothing is
+          // buffered behind the active iterator, since it's always the last entry.)
+          const exposedNewHead = currentIndex === 0 && this.#innerIterators[0] === thisIterValues && !this.#isActiveValues(thisIterValues);
 
-          ASSERT(this.#closedButStillHaveValuesInFlight.includes(inFlight.values) || this.#active === inFlight, 'inFlight is still tracked');
+          ASSERT(this.#innerIterators.includes(thisIterValues), 'this iterator is still tracked');
 
-          this.#truncateInFlightFrom(inFlight, currentIndex);
+          this.#truncateInFlightFrom(thisIterValues, currentIndex);
 
-          if (this.#active.type === 'iter') {
-            if (this.#active === inFlight) {
-              if (thisIterValues.length > 0) {
-                this.#closedButStillHaveValuesInFlight.push(this.#active.values);
-              }
-              this.#issuePullFromUnderlying(removedCount);
-            } else {
-              // strictly speaking, if thisIterValues is now empty we could remove it
-              // but, no real reason to; we'll pop when it gets to the head of the queue
+          if (this.#isActiveValues(thisIterValues)) {
+            // this iterator is still the active one; it just reported done. Its (now
+            // possibly-empty) values stay in place as a soon-to-be-closed entry; drop
+            // it only if empty, so we don't leave an empty entry behind.
+            if (thisIterValues.length === 0) {
+              this.#innerIterators.pop();
+            }
+            this.#issuePullFromUnderlying(removedCount);
+          } else if (this.#active.type === 'iter') {
+            // a parked iterator finished while a *different* iterator is active.
+            // strictly speaking, if thisIterValues is now empty we could remove it
+            // but, no real reason to; we'll pop when it gets to the head of the queue
 
-              for (let i = 0; i < removedCount; ++i) {
-                this.#issuePullFromCurrentActive();
-              }
+            for (let i = 0; i < removedCount; ++i) {
+              this.#issuePullFromCurrentActive();
             }
           } else if (this.#active.type === 'reading underlying') {
             // The freed demand is absorbed by the iterator the in-flight underlying
@@ -227,25 +246,26 @@ class FlatMapHelper {
         slotButWithTypeScript.closeState = 'awaiting-return';
 
         if (this.#active.type === 'iter') {
-          const active = this.#active;
-          this.#closedButStillHaveValuesInFlight.push(active.values);
+          // The (formerly) active iterator's values are already the last entry of
+          // #innerIterators; they stay there as a closed entry once we mark finished.
+          const erroredIterIsActive = this.#isActiveValues(thisIterValues);
+          const activeIter = (this.#active as ActiveIter).iter;
           this.#active = { type: 'finished' };
 
-          if (active === inFlight) {
+          if (erroredIterIsActive) {
             // just gotta close underlying
             this.#closeUnderlyingForError(slotButWithTypeScript as ErrorState);
           } else {
             // The errored slot lives in an iterator that already reported done (it's
-            // parked in the closed queue); a *different* iterator (`active`) is still
-            // live. Two things are open: `active` and the underlying. Close them
-            // sequentially — the active inner iterator first, then the underlying,
+            // parked in the queue); a *different* iterator (the active one) is still
+            // live. Two things are open: the active iterator and the underlying. Close
+            // them sequentially — the active inner iterator first, then the underlying,
             // matching the order return() uses — and surface the error only once both
             // closes have settled. Errors from either .return() are swallowed.
             //
-            // `active`'s already-requested pulls are NOT discarded: an error stops new
-            // pulls, but values already in flight still deliver to their calls, so
-            // `active` stays parked above (as an explicit return() would leave them).
-            const activeIter = active.iter;
+            // The active iterator's already-requested pulls are NOT discarded: an error
+            // stops new pulls, but values already in flight still deliver to their
+            // calls, so it stays parked above (as an explicit return() would leave them).
             // Commit the call (if any) waiting on this slot before the closes settle,
             // so onClosed has a rejector to invoke; otherwise we mark it ready.
             if (this.#isHeadOfQueue(slot)) {
@@ -309,8 +329,10 @@ class FlatMapHelper {
 
   #markUnderlyingAsFinished() {
     ASSERT(this.#active.type === 'reading underlying' || this.#active.type === 'iter', 'active is reading underlying or iter'); // latter only via return()
-    if (this.#active.type === 'iter' && this.#active.values.length > 0) {
-      this.#closedButStillHaveValuesInFlight.push(this.#active.values);
+    // When active is an iterator its values are already the last entry; they stay there
+    // as a closed entry (drop it only if empty, so we don't leave an empty entry).
+    if (this.#active.type === 'iter' && this.#activeValues.length === 0) {
+      this.#innerIterators.pop();
     }
     this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#bufferedValueCount());
     this.#active = { type: 'finished' };
@@ -422,7 +444,8 @@ class FlatMapHelper {
             }
 
             const { requested } = active;
-            this.#active = { type: 'iter', iter: actualIter, values: [] };
+            this.#innerIterators.push([]); // this iterator's values; the active iterator is always the last entry
+            this.#active = { type: 'iter', iter: actualIter };
 
             // ok, time to actually pull
             for (let i = 0; i < requested; ++i) {
@@ -449,7 +472,7 @@ class FlatMapHelper {
           // closed and result.return() has nothing to wait for; the error surfaces
           // to the held call immediately (after any buffered values).
           this.#active = { type: 'error', error, closeState: 'ready' };
-          if (this.#closedButStillHaveValuesInFlight.length === 0) {
+          if (this.#innerIterators.length === 0) {
             this.#processQueue();
           }
           active.resolveReturn({ value: undefined, done: true });
@@ -465,7 +488,7 @@ class FlatMapHelper {
         this.#active = { type: 'error', error, closeState: 'ready' };
         // keep one call per buffered value and one more for the error
         this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#bufferedValueCount() - 1);
-        if (this.#closedButStillHaveValuesInFlight.length === 0) {
+        if (this.#innerIterators.length === 0) {
           this.#processQueue();
         }
         return;
@@ -546,14 +569,19 @@ class FlatMapHelper {
 
   #processQueue() {
     // assert: we are going to do at least one unit of work
-    while (this.#closedButStillHaveValuesInFlight.length > 0) {
-      const head = this.#closedButStillHaveValuesInFlight[0];
+    while (this.#innerIterators.length > 0) {
+      const head = this.#innerIterators[0];
       while (head.length > 0) {
         if (!this.#dispatchHeadOfInFlight(head)) {
           return;
         }
       }
-      this.#closedButStillHaveValuesInFlight.shift();
+      // `head` is now empty. If it's the active iterator (always the last entry), leave
+      // it in place to receive future pulls; otherwise drop the drained closed entry.
+      if (this.#isActiveValues(head)) {
+        return;
+      }
+      this.#innerIterators.shift();
     }
     if (this.#active.type === 'error') {
       if (this.#active.closeState === 'ready') {
@@ -562,15 +590,8 @@ class FlatMapHelper {
         this.#active.reject = this.#calls.shift()!.reject;
       }
       this.#active = { type: 'finished' };
-      // TODO maybe errors just go as a length-1 entry on top of closedButStillHaveValuesInFlight?
+      // TODO maybe errors just go as a length-1 entry on top of innerIterators?
       return;
-    }
-    if (this.#active.type === 'iter') {
-      while (this.#active.values.length > 0) {
-        if (!this.#dispatchHeadOfInFlight(this.#active.values)) {
-          return;
-        }
-      }
     }
   }
 
@@ -622,8 +643,8 @@ class FlatMapHelper {
     // active is an inner iterator. Park it (its in-flight pulls keep delivering),
     // then close it and the underlying in sequence — active iterator first.
     // TODO order of truncation vs resolving this Promise
-    const active = this.#active as InFlight;
+    const activeIter = (this.#active as ActiveIter).iter;
     this.#markUnderlyingAsFinished();
-    return this.#closeInnerThenUnderlying(active.iter);
+    return this.#closeInnerThenUnderlying(activeIter);
   }
 }

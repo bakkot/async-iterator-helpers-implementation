@@ -41,18 +41,11 @@ import { scenarioTest } from './scenario-to-test.js';
 //     count), which produces the next inner iterator. Only the UNDERLYING running
 //     out (`done`) ends the stream.
 //
-//   * The concatenation order is fixed, but delivery is NOT forced to be in time
-//     order. Within the head-of-queue inner iterator a settled value/error is
-//     delivered to its own call right away (out of order, like .map): the head
-//     iterator's slot i sits at queue position i, so its destination call is known.
-//     A LATER iterator's values must still wait — its base position depends on the
-//     head iterator's final length, which is not yet fixed — so they stay buffered
-//     until the head iterator drains. When an inner iterator reports `done` while
-//     some of its own earlier pulls are still in flight, those pulls stay queued so
-//     cross-iterator order is preserved. (One edge case: if a later pull of the head
-//     iterator was already delivered when an earlier pull then reports `done`,
-//     truncating would discard a delivered value, so for now that `done` is simply
-//     delivered "like a value" to its own call — provisional, to be redesigned.)
+//   * Because the concatenation order is fixed, a later value can never be
+//     delivered before an earlier position's fate is known — exactly like filter.
+//     When an inner iterator reports `done` while some of its own earlier pulls
+//     are still in flight, those pulls stay queued ahead of the next iterator's
+//     values so delivery order is preserved.
 //
 // Throughout, the mapper is driven by a controlledFn whose call we settle with an
 // inner controlledSource's `.iterator`; that lets us control both *when* the
@@ -199,14 +192,14 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// Out-of-order settlement within the head inner iterator is delivered out of
-// order, like .map. Two concurrent inner pulls are in flight; the LATER one
-// settles first and is delivered to its OWN call immediately — the head iterator's
-// positions are known, so it needn't wait for the earlier (still-pending) pull.
+// Out-of-order settlement within a single inner iterator is reordered before
+// delivery. Two concurrent inner pulls are in flight; the LATER one settles
+// first, but it cannot be delivered ahead of the earlier (still-pending) one —
+// each consumer call receives its own in-call-order value.
 tests.push(scenarioTest({
   id: "flatmap-test-004",
   helper: "flatMap",
-  label: "flatMap: out-of-order inner settlement is delivered out of order",
+  label: "flatMap: out-of-order inner settlement is delivered in order",
   ticks: [
     { note: "two concurrent calls, one underlying pull", steps: [ { events: [
       { type: "next", result: "r0" },
@@ -222,15 +215,14 @@ tests.push(scenarioTest({
       { type: "inner-pull", pull: "a0", iterator: "A" },
       { type: "inner-pull", pull: "a1", iterator: "A" },
     ] } ] },
-    // The second inner pull settles first; it is delivered to its own call (r1) right
-    // away, out of order, without waiting for the still-pending earlier pull.
-    { note: "a later inner value is delivered out of order to its own call", steps: [ { events: [
+    // The second inner pull settles first; it must wait for the first.
+    { note: "a later inner value cannot settle ahead of an earlier one", steps: [ { events: [
       { type: "settle", pull: "a1", value: "a1" },
-      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
-    { note: "the earlier value is then delivered to the first call", steps: [ { events: [
+    { note: "once the earlier value arrives, both settle in call order", steps: [ { events: [
       { type: "settle", pull: "a0", value: "a0" },
       { type: "result", result: "r0", value: "a0", from: "a0" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
   ],
 }, { helper: flatMap, utils }));
@@ -1120,13 +1112,12 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// Out-of-order delivery survives return(): an already-requested value that settles
-// out of order is delivered to its own call right away (the iterator being closed
-// is still the head), without waiting for the earlier pull.
+// The in-order delivery guarantee survives return(): an already-requested value
+// that settles out of order still waits for the earlier one.
 tests.push(scenarioTest({
   id: "flatmap-test-027",
   helper: "flatMap",
-  label: "flatMap: after return(), already-requested values are still delivered out of order",
+  label: "flatMap: after return(), already-requested values are still delivered in order",
   ticks: [
     { note: "two concurrent calls, one underlying pull", steps: [ { events: [
       { type: "next", result: "r0" },
@@ -1154,14 +1145,14 @@ tests.push(scenarioTest({
       { type: "close-settled", target: "source" },
       { type: "result", result: "ret", done: true },
     ] } ] },
-    // The second pull settles first; it is delivered to its own call out of order.
-    { note: "a later value is delivered out of order to its own call", steps: [ { events: [
+    // The second pull settles first; it must still wait for the first.
+    { note: "a later value cannot settle ahead of the earlier one", steps: [ { events: [
       { type: "settle", pull: "a1", value: "a1" },
-      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
-    { note: "the earlier value is then delivered to the first call", steps: [ { events: [
+    { note: "both already-requested values settle in call order", steps: [ { events: [
       { type: "settle", pull: "a0", value: "a0" },
       { type: "result", result: "r0", value: "a0", from: "a0" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
   ],
 }, { helper: flatMap, utils }));
@@ -2628,15 +2619,16 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// A later pull of the head iterator yields and is delivered to its own call out of
-// order; the earlier (head) pull then errors, closing the underlying via
-// it.return(). Only the errored call waits for that close to settle — the
-// already-delivered later value is unaffected. This pins that an inner-error close
-// gates ONLY its own call, never the other deliveries of the same iterator.
+// A head inner-iterator error closes the underlying via it.return(); while that
+// close is still PENDING, a value already buffered behind the error (from a later
+// pull of the same iterator) is delivered immediately to its call — the committed
+// head error's recipient is fixed, so following values needn't wait for the close.
+// Only the errored call waits for it.return() to settle. (The flatMap analogue of
+// filter's "head predicate-error close delivers the value behind it immediately".)
 tests.push(scenarioTest({
   id: "flatmap-test-057",
   helper: "flatMap",
-  label: "flatMap: a held inner-error close gates only its own call, not values delivered out of order",
+  label: "flatMap: a held inner-error close delivers a value buffered behind it without waiting",
   ticks: [
     { note: "two coalesced calls, one underlying pull", steps: [ { events: [
       { type: "next", result: "r0" },
@@ -2652,18 +2644,18 @@ tests.push(scenarioTest({
       { type: "inner-pull", pull: "a0", iterator: "A" },
       { type: "inner-pull", pull: "a1", iterator: "A" },
     ] } ] },
-    // The later pull (#1) yields first: a1 is delivered to its own call (r1) right
-    // away, out of order, even though the earlier head pull (#0) is still pending.
-    { note: "the later value is delivered out of order to its own call", steps: [ { events: [
+    // The later pull (#1) yields first: a1 is buffered behind the still-pending head
+    // pull (#0).
+    { note: "the later value is buffered behind the pending head", steps: [ { events: [
       { type: "settle", pull: "a1", value: "a1" },
-      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
     // The head pull (#0) errors with the underlying close held pending. The error is
-    // committed to r0, withheld until it.return() settles; the already-delivered a1
-    // is unaffected.
-    { note: "the head pull errors and the close is held; only its own call waits", steps: [ { events: [
+    // committed to r0 (withheld), and the buffered a1 is delivered to r1 immediately
+    // — without waiting for it.return() to settle.
+    { note: "the close is pending; the buffered value delivers while the error waits", steps: [ { events: [
       { type: "settle", pull: "a0", error: "boom" },
       { type: "close", target: "source" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
     // Only once it.return() settles does the errored call reject.
     { note: "the errored call rejects once the close settles", steps: [ { events: [
@@ -2970,21 +2962,22 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// --- the done edge case -----------------------------------------------------
+// --- an orphaned close ------------------------------------------------------
 //
-// A later pull of the head iterator (A#1) rejects while the earlier pull (A#0) is
-// still pending. Because A is the head iterator, the error is delivered out of
-// order: it is committed to r1 and the source is closed, with r1 withheld until
-// that close settles. A#0 then reports done — but A#1 was ALREADY delivered, so
-// truncating from A#0 would discard it. This is the provisional edge case: rather
-// than truncate, the done is delivered "like a value" to its own call (r0 dones),
-// and the already-committed error to r1 still surfaces once the close settles. (The
-// fuzzer exempts schedules that hit this edge case from its call-order invariants;
-// see test/flatMap-fuzzer.js. This behavior is provisional and slated to change.)
+// An inner done can discard a buffered inner error whose source close is still
+// in flight: A's pull #1 rejects while pull #0 is still pending, so flatMap
+// terminates and closes the source; pull #0 then reports done, truncating the
+// never-delivered error. Both calls resolve done immediately, NOT gated on the
+// still-pending source close, and the close's eventual outcome is observed by
+// nothing (deliberately swallowed: the error that triggered it was discarded).
+// This pins the "orphaned close" semantics; the fuzzer's close-gating invariant
+// (I11) is weakened to exempt exactly this corner (see test/flatMap-fuzzer.js).
+// If we ever decide the dones should instead wait for the close, flip this test
+// and strengthen the fuzzer.
 tests.push(scenarioTest({
   id: "flatmap-test-062",
   helper: "flatMap",
-  label: "flatMap: a done after a later pull was delivered is itself delivered like a value (edge case)",
+  label: "flatMap: an inner done orphans the close of a discarded inner error",
   ticks: [
     { note: "two calls, one underlying pull", steps: [ { events: [
       { type: "next", result: "r0" },
@@ -3000,22 +2993,17 @@ tests.push(scenarioTest({
       { type: "inner-pull", pull: "a0", iterator: "A" },
       { type: "inner-pull", pull: "a1", iterator: "A" },
     ] } ] },
-    // A#1 errors out of order: the error is committed to r1, the source is closed,
-    // and r1 is withheld until that close settles.
-    { note: "the later pull errors out of order; the source closes and r1 is withheld", steps: [ { events: [
+    { note: "the later pull's error terminates the stream and closes the source", steps: [ { events: [
       { type: "settle", pull: "a1", error: "boom" },
       { type: "close", target: "source" },
     ] } ] },
-    // A#0 reports done. A#1 was already delivered, so truncating would discard it:
-    // the done is delivered "like a value" to its own call, so r0 dones.
-    { note: "the earlier done is delivered like a value to its own call", steps: [ { events: [
+    { note: "the earlier done discards the held error; the dones do not wait for the close", steps: [ { events: [
       { type: "settle", pull: "a0", done: true },
       { type: "result", result: "r0", done: true },
+      { type: "result", result: "r1", done: true },
     ] } ] },
-    // The close settles: the committed error now reaches r1.
-    { note: "the held close settles and the committed error reaches r1", steps: [ { events: [
+    { note: "the orphaned close settles; nothing observes it", steps: [ { events: [
       { type: "close-settled", target: "source" },
-      { type: "result", result: "r1", error: "boom" },
     ] } ] },
     { note: "the helper is finished", steps: [ { events: [
       { type: "next", result: "r2" },

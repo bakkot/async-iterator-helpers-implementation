@@ -22,7 +22,6 @@ function fastPromiseTry<T>(cb: () => T): Promise<Awaited<T>> {
 type Slot =
   | { type: 'awaiting' }
   | { type: 'value', value: unknown }
-  | { type: 'done' } // edge case: a { done: true } delivered "like a value" (see the done handler)
   | ErrorState
   | { type: 'removed' }
 
@@ -77,11 +76,7 @@ class FlatMapHelper {
   #active: ActiveState = { type: 'unstarted' };
 
   // invariant: calls.length == [sum of lengths of closedButStillHaveValuesInFlight] + [active.requested | active.values.length | (1 when draining)]
-  // A call is set to `null` once its value/error has been delivered out of order
-  // (see #processQueue): it keeps its position so the lockstep with the slot queue
-  // is preserved, and is spliced away when the leading run of delivered slots is
-  // compacted. Trailing calls (bound to not-yet-existing slots) are never null.
-  #calls: ({ resolve: (v: unknown) => void, reject: (v: unknown) => void } | null)[] = [];
+  #calls: { resolve: (v: unknown) => void, reject: (v: unknown) => void }[] = [];
 
   constructor(underlying: unknown, fn: unknown) {
     this.#underlying = underlying;
@@ -101,37 +96,16 @@ class FlatMapHelper {
     ASSERT(removedCount <= this.#calls.length, 'removedCount <= calls.length');
     const mightStillGetValues = this.#calls.length - removedCount;
     for (let i = 0; i < removedCount; ++i) {
-      // trailing calls are bound to not-yet-delivered demand, so never null
-      this.#calls[mightStillGetValues + i]!.resolve({ value: undefined, done: true });
+      this.#calls[mightStillGetValues + i].resolve({ value: undefined, done: true });
     }
     this.#calls.length = mightStillGetValues;
   }
 
-  // The values array of the head-of-queue iterator: the first parked iterator, or
-  // the active iterator if none are parked (null if neither — e.g. reading the
-  // underlying with nothing parked, or finished/errored). The head iterator's slot
-  // at index i sits at global queue position i, so it binds to #calls[i] — which is
-  // why its settled values/errors can be delivered out of order (like .map): we
-  // already know which call each goes to. A non-head iterator's base position is
-  // not yet fixed (the head iterator's length can still change), so its values stay
-  // buffered until it reaches the head.
-  #headValues(): Slot[] | null {
-    if (this.#closedButStillHaveValuesInFlight.length > 0) return this.#closedButStillHaveValuesInFlight[0];
-    if (this.#active.type === 'iter') return this.#active.values;
-    return null;
-  }
-
-  // Would #processQueue act on this (just-settled) slot? Only if it is deliverable
-  // now: an iterator slot is deliverable when its iterator (`values`) is at the head
-  // — then it goes out of order — and the active-error slot (passed `values: null`)
-  // when nothing is buffered ahead of it. A settled slot in a NON-head iterator is
-  // buffered and #processQueue would not touch it, so callers guard on this to skip a
-  // no-op sweep when they can tell they haven't disturbed the head. O(1): the caller
-  // supplies the slot's own iterator array, so this is a reference check, not a scan.
-  #slotIsDeliverable(slot: Slot, values: Slot[] | null): boolean {
-    if (slot.type === 'removed') return false;
-    if (values === null) return this.#active === slot && this.#closedButStillHaveValuesInFlight.length === 0;
-    return this.#headValues() === values;
+  #isHeadOfQueue(slot: Slot) {
+    return this.#closedButStillHaveValuesInFlight.length === 0
+      ? this.#active.type === 'iter' && this.#active.values[0] === slot
+        || this.#active.type === 'error' && this.#active === slot
+      : this.#closedButStillHaveValuesInFlight[0][0] === slot; // assert: this.#closedButStillHaveValuesInFlight[0].length > 0
   }
 
   #truncateInFlightFrom(inFlight: InFlight, index: number) {
@@ -179,37 +153,16 @@ class FlatMapHelper {
           // delivered (and shifted off) since this pull was issued, so an index
           // captured at issue time would be stale.
           const currentIndex = thisIterValues.indexOf(slot);
-          ASSERT(currentIndex >= 0, 'slot still present');
-
-          // EDGE CASE: this iterator is at the head of the queue and a LATER pull of
-          // it was already delivered out of order (its call is null). Truncating from
-          // this done would discard that already-delivered value (and could clobber a
-          // committed-but-still-closing error). So for now we punt: mark this slot as
-          // a `done` and let #processQueue deliver it "like a value" to its own call.
-          // We do NOT truncate, redirect demand, or close anything — the bookkeeping
-          // is left as-is, which puts a done ahead of a later value in call order and
-          // can leave a self-finished iterator nominally active. This is provisional
-          // and slated to change; the fuzzer exempts runs that hit it (and the harmless
-          // close/re-pull of an already-done inner it can cause). See flatMap-fuzzer.js.
-          if (this.#headValues() === thisIterValues) {
-            for (let j = currentIndex + 1; j < thisIterValues.length; ++j) {
-              if (this.#calls[j] == null) {
-                slot.type = 'done';
-                this.#processQueue();
-                return;
-              }
-            }
-          }
-
           const removedCount = thisIterValues.length - currentIndex;
           ASSERT(removedCount > 0, 'have not already truncated this value');
 
-          // Does removing these slots pop the front of the queue, revealing something
-          // buffered behind this iterator? Only if this pull is the head of its own
-          // iterator (currentIndex === 0) AND that iterator is the front of the closed
-          // queue. Within-iterator out-of-order delivery already happened as slots
-          // settled, so a done only newly enables delivery when it exposes a new head.
-          // Capture before truncating pops it.
+          // Does removing these slots change the head of the queue (revealing
+          // something that was buffered behind this iterator)? Only if this pull was
+          // the head of its own iterator (currentIndex === 0) AND that iterator is
+          // the front of the closed queue — then truncation pops it and the next
+          // entry becomes the head. (While `inFlight` is still the active iterator it
+          // isn't in the closed queue, so this is false; and nothing is buffered
+          // behind the active iterator anyway.) Capture before truncating pops it.
           const exposedNewHead = currentIndex === 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight.values;
 
           ASSERT(this.#closedButStillHaveValuesInFlight.includes(inFlight.values) || this.#active === inFlight, 'inFlight is still tracked');
@@ -258,10 +211,7 @@ class FlatMapHelper {
           slot.type = 'value';
           (slot as Extract<Slot, { type: 'value' }>).value = value;
 
-          // Deliver it now if it is in the head iterator (out of order if earlier
-          // pulls are still outstanding); if it is buffered behind another iterator,
-          // #processQueue would do nothing, so don't bother.
-          if (this.#slotIsDeliverable(slot, thisIterValues)) {
+          if (this.#isHeadOfQueue(slot)) {
             this.#processQueue();
           }
         }
@@ -283,7 +233,7 @@ class FlatMapHelper {
 
           if (active === inFlight) {
             // just gotta close underlying
-            this.#closeUnderlyingForError(slotButWithTypeScript as ErrorState, thisIterValues);
+            this.#closeUnderlyingForError(slotButWithTypeScript as ErrorState);
           } else {
             // The errored slot lives in an iterator that already reported done (it's
             // parked in the closed queue); a *different* iterator (`active`) is still
@@ -296,10 +246,9 @@ class FlatMapHelper {
             // pulls, but values already in flight still deliver to their calls, so
             // `active` stays parked above (as an explicit return() would leave them).
             const activeIter = active.iter;
-            // Commit the call waiting on this slot before the closes settle (if it is
-            // deliverable now), so onClosed has a rejector to invoke; otherwise we
-            // mark it ready and it surfaces when its iterator reaches the head.
-            if (this.#slotIsDeliverable(slot, thisIterValues)) {
+            // Commit the call (if any) waiting on this slot before the closes settle,
+            // so onClosed has a rejector to invoke; otherwise we mark it ready.
+            if (this.#isHeadOfQueue(slot)) {
               this.#processQueue();
             }
             const onClosed = () => {
@@ -310,7 +259,7 @@ class FlatMapHelper {
               } else {
                 if ((slot as Slot).type === 'removed') return; // TODO make sure this is really what we want
                 (slot as ErrorState).closeState = 'ready';
-                ASSERT(!this.#slotIsDeliverable(slot, thisIterValues), 'not deliverable');
+                ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
               }
             };
             const closeUnderlying = () => {
@@ -331,7 +280,7 @@ class FlatMapHelper {
           // error and was never bound to a pull, so it can never be filled: done it.
           this.#markSomeCallsAsNoLongerGettingValues(this.#active.requested);
           this.#active = { type: 'finished' };
-          this.#closeUnderlyingForError(slotButWithTypeScript as ErrorState, thisIterValues);
+          this.#closeUnderlyingForError(slotButWithTypeScript as ErrorState);
           return;
           // TODO do exceptions from the fn call at this point go into unhandled promise rejection
         }
@@ -343,7 +292,7 @@ class FlatMapHelper {
           // nothing to close for it, since the closes are the draining flow's
           // responsibility.
           (slot as ErrorState).closeState = 'ready';
-          if (this.#slotIsDeliverable(slot, thisIterValues)) {
+          if (this.#isHeadOfQueue(slot)) {
             this.#processQueue();
           }
           return;
@@ -351,7 +300,7 @@ class FlatMapHelper {
         ASSERT(this.#active.type === 'error' || this.#active.type === 'finished', 'active is error or finished');
         // nothing to close in this case
         (slot as ErrorState).closeState = 'ready';
-        if (this.#slotIsDeliverable(slot, thisIterValues)) {
+        if (this.#isHeadOfQueue(slot)) {
           this.#processQueue();
         }
       },
@@ -376,9 +325,9 @@ class FlatMapHelper {
     ASSERT(this.#active === d, 'active is the draining state');
     const slot: ErrorState = { type: 'error', error, closeState: 'awaiting-return', reject: null };
     this.#active = slot;
-    // Commit the call (if this error is deliverable now) via the active-error tail so
-    // the close reaction has a rejector; otherwise it surfaces when it reaches the head.
-    if (this.#slotIsDeliverable(slot, null)) {
+    // Commit the call (if this is the head) so the close reaction has a rejector;
+    // otherwise it surfaces when it reaches the head.
+    if (this.#isHeadOfQueue(slot)) {
       this.#processQueue();
     }
     const uClose = fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.());
@@ -389,7 +338,7 @@ class FlatMapHelper {
         s.reject(error);
       } else {
         (slot as ErrorState).closeState = 'ready';
-        ASSERT(!this.#slotIsDeliverable(slot, null), 'not deliverable');
+        ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
       }
     };
     uClose.then(onClosed, onClosed);
@@ -530,13 +479,10 @@ class FlatMapHelper {
     const slot: ErrorState = { type: 'error', error, closeState: 'awaiting-return', reject: null };
     this.#markSomeCallsAsNoLongerGettingValues(requested - 1);
     this.#active = slot;
-    this.#closeUnderlyingForError(slot, null);
+    this.#closeUnderlyingForError(slot);
   }
 
-  // `values` is the slot's iterator array (for an error parked in an inner iterator),
-  // or null when `slot` is the active-error slot (a mapper/iterator error while
-  // reading the underlying), so #slotIsDeliverable can decide deliverability in O(1).
-  #closeUnderlyingForError(slot: ErrorState, values: Slot[] | null) {
+  #closeUnderlyingForError(slot: ErrorState) {
     ASSERT(slot.type === 'error', 'slot is error');
     ASSERT(slot.closeState === 'awaiting-return', 'slot awaiting-return');
 
@@ -548,14 +494,12 @@ class FlatMapHelper {
     }
     if (returnPromise === undefined) {
       slot.closeState = 'ready';
-      if (this.#slotIsDeliverable(slot, values)) {
+      if (this.#isHeadOfQueue(slot)) {
         this.#processQueue();
       }
       return;
     }
-    // Commit the error to its call (if deliverable now) so onClosed has a rejector;
-    // otherwise it is committed when it reaches the head.
-    if (this.#slotIsDeliverable(slot, values)) {
+    if (this.#isHeadOfQueue(slot)) {
       this.#processQueue();
     }
     const onClosed = () => {
@@ -565,79 +509,68 @@ class FlatMapHelper {
         slotButWithTypeScript.reject(slot.error);
       } else {
         slot.closeState = 'ready';
-        ASSERT(!this.#slotIsDeliverable(slot, values), 'not deliverable');
+        ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
       }
     };
     // TODO fast path for non-promise?
     Promise.resolve(returnPromise).then(onClosed, onClosed);
   }
 
-  // Deliver a settled slot to its call. Returns true if the call was consumed (so
-  // the caller can null #calls at that position); false for an awaiting/removed slot.
-  #deliverSlot(slot: Slot, call: { resolve: (v: unknown) => void, reject: (v: unknown) => void }): boolean {
-    if (slot.type === 'value') {
-      call.resolve({ value: slot.value, done: false });
-      return true;
+  // returns false if was awaiting
+  #dispatchHeadOfInFlight(values: Slot[]): boolean {
+    const head = values[0];
+    if (head.type === 'awaiting') {
+      return false;
     }
-    if (slot.type === 'done') {
-      // Edge case: a { done: true } delivered "like a value" (see the done handler).
-      call.resolve({ value: undefined, done: true });
-      return true;
-    }
-    if (slot.type === 'error') {
-      if (slot.closeState === 'awaiting-return') {
-        // The triggered .return() has not settled yet: commit this call by leaving a
-        // rejector for the close reaction, and let the slot drop from the queue.
-        (slot as Extract<ErrorState, { closeState: 'awaiting-return' }>).reject = call.reject;
+    values.shift();
+    if (head.type === 'value') {
+      this.#calls.shift()!.resolve({ value: head.value, done: false });
+    } else if (head.type === 'error') {
+      const call = this.#calls.shift()!;
+      if (head.closeState === 'awaiting-return') {
+        // This error triggered `.return()`, and the result has not yet settled.
+        // Since this is the head of the queue, we can commit it to this call by leaving a rejector for
+        // the close reaction to invoke, and can still drop `head` from the inFlight values.
+        head.reject = call.reject;
       } else {
-        ASSERT(slot.closeState === 'ready', 'closeState ready');
-        call.reject(slot.error);
+        ASSERT(head.closeState === 'ready', 'closeState ready');
+        call.reject(head.error);
       }
-      return true;
+    } else {
+      // unreachable
+      console.error('unreachable');
+      throw new Error('unreachable');
     }
-    // 'awaiting' or 'removed'
-    return false;
+    return true;
   }
 
   #processQueue() {
-    // Deliver everything currently deliverable. Within the head-of-queue iterator a
-    // settled slot is delivered out of order — slot i binds to #calls[i] — so a
-    // value/error sitting behind a still-awaiting earlier pull goes to its own call
-    // right away (like .map). A later iterator's values stay buffered until the head
-    // iterator fully drains, because their global positions are not yet fixed.
-    while (true) {
-      const head = this.#headValues();
-      if (head == null) break;
-      for (let i = 0; i < head.length; ++i) {
-        const call = this.#calls[i];
-        if (call == null) continue; // already delivered out of order
-        if (this.#deliverSlot(head[i], call)) this.#calls[i] = null;
+    // assert: we are going to do at least one unit of work
+    while (this.#closedButStillHaveValuesInFlight.length > 0) {
+      const head = this.#closedButStillHaveValuesInFlight[0];
+      while (head.length > 0) {
+        if (!this.#dispatchHeadOfInFlight(head)) {
+          return;
+        }
       }
-      // Compact the leading run of delivered (consumed) slots, in lockstep.
-      let removed = 0;
-      while (removed < head.length && this.#calls[removed] == null) ++removed;
-      if (removed > 0) {
-        head.splice(0, removed);
-        this.#calls.splice(0, removed);
-      }
-      if (head.length > 0) break; // the front slot is still awaiting; cannot advance
-      // The head iterator is fully delivered: drop it and expose the next one.
-      if (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0] === head) {
-        this.#closedButStillHaveValuesInFlight.shift();
-        continue;
-      }
-      break; // head was the (now-empty) active iterator's values
+      this.#closedButStillHaveValuesInFlight.shift();
     }
-    // Once nothing is buffered ahead, surface a pending underlying/mapper error.
-    if (this.#closedButStillHaveValuesInFlight.length === 0 && this.#active.type === 'error') {
-      const call = this.#calls.shift()!;
+    if (this.#active.type === 'error') {
       if (this.#active.closeState === 'ready') {
-        call.reject(this.#active.error);
+        this.#calls.shift()!.reject(this.#active.error);
       } else {
-        this.#active.reject = call.reject;
+        this.#active.reject = this.#calls.shift()!.reject;
       }
       this.#active = { type: 'finished' };
       // TODO maybe errors just go as a length-1 entry on top of closedButStillHaveValuesInFlight?
+      return;
+    }
+    if (this.#active.type === 'iter') {
+      while (this.#active.values.length > 0) {
+        if (!this.#dispatchHeadOfInFlight(this.#active.values)) {
+          return;
+        }
+      }
     }
   }
 

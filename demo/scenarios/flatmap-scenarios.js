@@ -588,6 +588,121 @@ export const flatMapScenarios = [
     ],
   },
   {
+    id: "flatmap-exhaustion-2",
+    helper: "flatMap",
+    label: "Exhaustion 2*",
+    description: "Getting <code>done: true</code> from an inner iterator voids any following Promises from that iterator.<br><br><strong>Open question</strong>: <code>unhandledrejection</code>?",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r2" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", iterator: "A" },
+            { type: "inner-pull", pull: "a0", iterator: "A" },
+            { type: "inner-pull", pull: "a1", iterator: "A" },
+            { type: "inner-pull", pull: "a2", iterator: "A" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a1", done: true },
+          ],
+        },
+        {
+          events: [
+            { type: "void", pull: "a2" },
+            { type: "pull", pull: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a2", value: "a3" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a0", value: "a1" },
+            { type: "result", result: "r0", value: "a1", from: "a0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u1", value: "B" },
+            { type: "fn", call: "p1", arg: "B", from: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p1", iterator: "B" },
+            { type: "inner-pull", pull: "b0", iterator: "B" },
+            { type: "inner-pull", pull: "b1", iterator: "B" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "b0", value: "b1" },
+            { type: "result", result: "r1", value: "b1", from: "b0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "b1", value: "b2" },
+            { type: "result", result: "r2", value: "b2", from: "b1" },
+          ],
+        },
+        {
+          events: [],
+        },
+      ] },
+    ],
+  },
+  {
     id: "flatmap-closing",
     helper: "flatMap",
     label: "Closing",
@@ -1021,6 +1136,114 @@ export const flatMapScenarios = [
     ],
   },
   {
+    id: "flatmap-error-in-underlying",
+    helper: "flatMap",
+    label: "Error in underlying",
+    description: "As always, errors from the underlying stream are considered to close it, and do not trigger <code>underlying.return()</code>.",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", error: "boom" },
+          ],
+        },
+        {
+          events: [
+            { type: "result", result: "r1", done: true },
+            { type: "result", result: "r0", error: "boom" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r2" },
+            { type: "result", result: "r2", done: true },
+          ],
+        },
+        {
+          events: [],
+        },
+      ] },
+    ],
+  },
+  {
+    id: "flatmap-error-in-mapper",
+    helper: "flatMap",
+    label: "Error in mapper",
+    description: "Errors in the mapper function do close the underlying iterator.",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", error: "boom" },
+          ],
+        },
+        {
+          events: [
+            { type: "close", target: "source" },
+            { type: "result", result: "r1", done: true },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "source" },
+            { type: "result", result: "r0", error: "boom" },
+          ],
+        },
+        {
+          events: [],
+        },
+      ] },
+    ],
+  },
+  {
     id: "flatmap-error-in-underlying-during-return",
     helper: "flatMap",
     label: "Error in underlying during return",
@@ -1090,6 +1313,175 @@ export const flatMapScenarios = [
             { type: "settle", pull: "u1", error: "boom" },
             { type: "result", result: "r1", error: "boom" },
             { type: "result", result: "ret", done: true },
+          ],
+        },
+      ] },
+    ],
+  },
+  {
+    id: "flatmap-error-in-underlying-during-return-2",
+    helper: "flatMap",
+    label: "Error in underlying during return 2",
+    description: "As in <a href=\"#flatmap-error-in-underlying-during\">Error in underlying during return</a>, except that the error must be held until an earlier value resolves. The call to <code>result.return()</code> can settle immediately, however, because now we know that neither the underlying nor the inner iterator will need to be closed.",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", iterator: "A" },
+            { type: "inner-pull", pull: "a0", iterator: "A" },
+            { type: "inner-pull", pull: "a1", iterator: "A" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a1", done: true },
+            { type: "pull", pull: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "return", result: "ret" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u1", error: "boom" },
+            { type: "result", result: "ret", done: true },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a0", value: "a1" },
+            { type: "result", result: "r0", value: "a1", from: "a0" },
+            { type: "result", result: "r1", error: "boom" },
+          ],
+        },
+        {
+          events: [],
+        },
+      ] },
+    ],
+  },
+  {
+    id: "flatmap-error-in-mapper-during-return",
+    helper: "flatMap",
+    label: "Error in mapper during return",
+    description: "Like <a href=\"#flatmap-error-in-underlying-during\">Error in underlying during return</a>, but the error happens in the mapper. In this case <code>underlying.return()</code> must be called, and it blocks the Promise for <code>result.return()</code>.",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", iterator: "A" },
+            { type: "inner-pull", pull: "a0", iterator: "A" },
+            { type: "inner-pull", pull: "a1", iterator: "A" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a1", done: true },
+            { type: "pull", pull: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u1", value: "B" },
+            { type: "fn", call: "p1", arg: "B", from: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "return", result: "ret" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p1", error: "boom" },
+            { type: "close", target: "source" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "source" },
+            { type: "result", result: "ret", done: true },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a0", value: "a0" },
+            { type: "result", result: "r0", value: "a0", from: "a0" },
+            { type: "result", result: "r1", error: "boom" },
           ],
         },
       ] },

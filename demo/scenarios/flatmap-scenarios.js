@@ -796,7 +796,7 @@ export const flatMapScenarios = [
     id: "flatmap-closing-during-pull",
     helper: "flatMap",
     label: "Closing during pull",
-    description: "When <code>result.return()</code> is called while we are blocked on pulling from the underlying iterator or on the mapper, we wait for that to settle and close the resulting iterator (to obey the invariant that code that receives an iterator is responsible for closing it). Only once that completes does the <code>result.return()</code> Promise settle.<br><br>We hold open a Promise from <code>result.next()</code> in case the underlying pull or the mapper throws.",
+    description: "When <code>result.return()</code> is called while we are blocked on pulling from the underlying iterator or on the mapper, we wait for that to settle and close the resulting iterator (to obey the invariant that code that receives an iterator is responsible for closing it), and finally close the underlying iterator once that close settles. Only once both closes complete does the <code>result.return()</code> Promise settle.<br><br>We hold open a Promise from <code>result.next()</code> in case the underlying pull or the mapper throws.",
     ticks: [
       { steps: [
         {
@@ -863,16 +863,7 @@ export const flatMapScenarios = [
         },
         {
           events: [
-            { type: "tombstone", target: "underlying" },
             { type: "tombstone", target: "result" },
-            { type: "close", target: "source" },
-          ],
-        },
-      ] },
-      { steps: [
-        {
-          events: [
-            { type: "close-settled", target: "source" },
           ],
         },
       ] },
@@ -900,9 +891,18 @@ export const flatMapScenarios = [
       ] },
       { steps: [
         {
-          caption: "The call to <code>result.return()</code> does not settle until the call of <code>inner.return()</code> has settled.",
+          caption: "Only once <code>inner.return()</code> has settled do we call <code>underlying.return()</code>.",
           events: [
             { type: "close-settled", target: "B" },
+            { type: "tombstone", target: "underlying" },
+            { type: "close", target: "source" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "source" },
             { type: "result", result: "ret", done: true },
           ],
         },
@@ -913,10 +913,10 @@ export const flatMapScenarios = [
     ],
   },
   {
-    id: "flatmap-during-pull-2",
+    id: "flatmap-closing-during-pull-2",
     helper: "flatMap",
-    label: "Closing during pull 2*",
-    description: "Same scenario as <a href=\"#flatmap-closing-during-pull\">Closing during pull</a>, except we have an extra pull. This one can resolve as soon as <code>result.return()</code> is invoked: we only need to delay resolving a single Promise to hold possible errors.<br><br><strong>Open question</strong>: the call to <code>underlying.return()</code> here (and in the previous case) happens before the call to <code>inner.return()</code>, which makes it unlike the <a href=\"#flatmap-closing\">simple case</a>. Should we delay calling <code>underlying.return()</code>?",
+    label: "Closing during pull 2",
+    description: "Same scenario as <a href=\"#flatmap-closing-during-pull\">Closing during pull</a>, except we have an extra pull. This one can resolve as soon as <code>result.return()</code> is invoked: we only need to delay resolving a single Promise to hold possible errors. As in that case, <code>underlying.return()</code> is not called until the <code>inner.return()</code> triggered by the mapper settling has itself settled, matching the <a href=\"#flatmap-closing\">simple case</a>.",
     ticks: [
       { steps: [
         {
@@ -981,15 +981,7 @@ export const flatMapScenarios = [
         {
           events: [
             { type: "return", result: "ret" },
-            { type: "close", target: "source" },
             { type: "result", result: "r2", done: true },
-          ],
-        },
-      ] },
-      { steps: [
-        {
-          events: [
-            { type: "close-settled", target: "source" },
           ],
         },
       ] },
@@ -1014,6 +1006,14 @@ export const flatMapScenarios = [
         {
           events: [
             { type: "close-settled", target: "B" },
+            { type: "close", target: "source" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "close-settled", target: "source" },
             { type: "result", result: "ret", done: true },
           ],
         },
@@ -1081,14 +1081,6 @@ export const flatMapScenarios = [
         {
           events: [
             { type: "return", result: "ret" },
-            { type: "close", target: "source" },
-          ],
-        },
-      ] },
-      { steps: [
-        {
-          events: [
-            { type: "close-settled", target: "source" },
           ],
         },
       ] },

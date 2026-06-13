@@ -1247,6 +1247,7 @@ function coerceToJSON(text) {
     .trim()
     .replace(/^export\s+(default\s+|const\s+\w+\s*=\s*)/, '')   // tolerate a pasted `export …`
     .replace(/;\s*$/, '')
+    .replace(/\/\/.*/g, '')
     .replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":')      // quote bare keys: { id: -> { "id":
     .replace(/,(\s*[}\]])/g, '$1');                              // drop trailing commas before } or ]
 }

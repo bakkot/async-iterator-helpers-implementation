@@ -772,9 +772,9 @@ tests.push(scenarioTest({
 //
 // When return() lands while a pull from the underlying is in flight (no inner
 // iterator yet), we are committed to closing, so we will NOT pull the iterator that
-// pull is about to produce. We close the UNDERLYING eagerly (right at return(),
-// while the pull is still in flight), but we still wait for the pull and the mapper,
-// because they might throw/reject — a stream error that must reach a consumer call.
+// pull is about to produce. NOTHING is closed at return() time: the closes are
+// deferred until the in-flight pull and mapper settle, because they might
+// throw/reject — a stream error that must reach a consumer call.
 //
 //   * The `requested` units of demand bound to that pull can never receive a value
 //     (we won't pull), so the trailing `requested - 1` "surplus" calls are doned
@@ -782,21 +782,27 @@ tests.push(scenarioTest({
 //     position a pull/mapper rejection would be delivered to (queued behind any
 //     parked values, like a normal underlying error).
 //   * When the in-flight pull/mapper settle:
-//       - pull rejects   -> the rejection (the stream's error) goes to the held call.
-//       - mapper rejects -> the mapper error goes to the held call (withheld until
-//                           the eager underlying close settles).
+//       - pull dones     -> the underlying exhausted itself; a clean done does not
+//                           close the source, so nothing is closed and return()
+//                           resolves done.
+//       - pull rejects   -> the underlying faulted itself, so nothing is closed; the
+//                           rejection (the stream's error) goes to the held call and
+//                           return() resolves done.
+//       - mapper rejects -> the underlying is closed NOW; the mapper error goes to
+//                           the held call once that close settles, and return()
+//                           settles from the close's outcome.
 //       - value+iterable -> invoke the iterable and call .return() on it RIGHT AWAY
-//                           (no .next()); the held call dones.
-//   * result.return() waits for BOTH the eager underlying .return() AND (if an inner
-//     iterator gets produced) the inner .return(), which can be outstanding
-//     CONCURRENTLY. (This is intentionally different from the active-iterator return
-//     path, which closes inner-then-underlying sequentially.) It resolves done once
-//     both settle, or rejects with a CLOSE error (inner taking precedence over the
-//     underlying). The stream error from a pull/mapper rejection goes to the held
-//     call, never to return()'s promise.
-// The base success case: a single outstanding call. The underlying is closed eagerly
-// at return(); the produced iterator is closed without being pulled; the held call
-// dones; and return() waits for BOTH closes.
+//                           (no .next()); the held call dones. Only once the inner
+//                           close settles is the underlying closed — the same
+//                           sequential inner-then-underlying order as the
+//                           active-iterator return path — and return() settles with
+//                           the outcome (a close error rejects it, the inner's
+//                           taking precedence).
+//     The stream error from a pull/mapper rejection goes to the held call, never to
+//     return()'s promise.
+// The base success case: a single outstanding call. Nothing closes at return(); the
+// produced iterator is closed without being pulled and the held call dones; the
+// underlying closes after the inner close settles; return() then resolves.
 tests.push(scenarioTest({
   id: "flatmap-test-018",
   helper: "flatMap",
@@ -806,11 +812,10 @@ tests.push(scenarioTest({
       { type: "next", result: "r0" },
       { type: "pull", pull: "u0" },
     ] } ] },
-    // return() while reading underlying. The underlying is closed EAGERLY (the pull is
-    // still in flight); r0 is held in case the pull/mapper rejects.
-    { note: "the underlying is closed eagerly; the call is held", steps: [ { events: [
+    // return() while reading underlying. Nothing closes yet; r0 is held in case the
+    // pull/mapper rejects.
+    { note: "return() defers the closes; the call is held", steps: [ { events: [
       { type: "return", result: "ret" },
-      { type: "close", target: "source" },
     ] } ] },
     // The pull resolves with a value; the mapper is invoked.
     { note: "the in-flight underlying value is mapped", steps: [ { events: [
@@ -824,13 +829,13 @@ tests.push(scenarioTest({
       { type: "close", target: "A" },
       { type: "result", result: "r0", done: true },
     ] } ] },
-    // return() waits for BOTH closes (concurrently). Settling just the inner is not
-    // enough...
-    { note: "settling only the inner close does not resolve return()", steps: [ { events: [
+    // The closes are sequential: the underlying's .return() is invoked only once the
+    // inner close settles.
+    { note: "once the inner close settles, the underlying closes", steps: [ { events: [
       { type: "close-settled", target: "A" },
+      { type: "close", target: "source" },
     ] } ] },
-    // ...return() resolves once the underlying close also settles.
-    { note: "once both closes settle, return() resolves", steps: [ { events: [
+    { note: "once the underlying close settles, return() resolves", steps: [ { events: [
       { type: "close-settled", target: "source" },
       { type: "result", result: "ret", done: true },
     ] } ] },
@@ -850,12 +855,9 @@ tests.push(scenarioTest({
       { type: "pull", pull: "u0" },
     ] } ] },
     // Demand 2; we won't pull, so the trailing call (r1) can never get a value -> done
-    // it eagerly. The head call (r0) is held; the underlying is closed eagerly.
-    // (src.return() is a synchronous call; the surplus done is observed a microtask
-    // later, so the close logs first.)
-    { note: "the surplus dones eagerly; the head is held; the underlying closes eagerly", steps: [ { events: [
+    // it eagerly. The head call (r0) is held; nothing closes yet.
+    { note: "the surplus dones eagerly; the head is held", steps: [ { events: [
       { type: "return", result: "ret" },
-      { type: "close", target: "source" },
       { type: "result", result: "r1", done: true },
     ] } ] },
     { note: "the in-flight underlying value is mapped", steps: [ { events: [
@@ -867,10 +869,11 @@ tests.push(scenarioTest({
       { type: "close", target: "A" },
       { type: "result", result: "r0", done: true },
     ] } ] },
-    { note: "return() still waits for the underlying close", steps: [ { events: [
+    { note: "once the inner close settles, the underlying closes", steps: [ { events: [
       { type: "close-settled", target: "A" },
+      { type: "close", target: "source" },
     ] } ] },
-    { note: "once both closes settle, return() resolves", steps: [ { events: [
+    { note: "once the underlying close settles, return() resolves", steps: [ { events: [
       { type: "close-settled", target: "source" },
       { type: "result", result: "ret", done: true },
     ] } ] },
@@ -878,8 +881,8 @@ tests.push(scenarioTest({
 }, { helper: flatMap, utils }));
 
 // The in-flight pull REJECTS after return(). The rejection is the stream's and goes
-// to the held call. No inner is produced, so return() waits only for the eager
-// underlying close.
+// to the held call. The underlying faulted itself, so nothing is closed at all and
+// return() resolves right away.
 tests.push(scenarioTest({
   id: "flatmap-test-020",
   helper: "flatMap",
@@ -889,23 +892,19 @@ tests.push(scenarioTest({
       { type: "next", result: "r0" },
       { type: "pull", pull: "u0" },
     ] } ] },
-    { note: "the underlying is closed eagerly; the call is held", steps: [ { events: [
+    { note: "return() defers the closes; the call is held", steps: [ { events: [
       { type: "return", result: "ret" },
-      { type: "close", target: "source" },
     ] } ] },
-    { note: "the pull error reaches the held call; return() still awaits the close", steps: [ { events: [
+    { note: "the pull error reaches the held call; return() resolves, closing nothing", steps: [ { events: [
       { type: "settle", pull: "u0", error: "boom" },
       { type: "result", result: "r0", error: "boom" },
-    ] } ] },
-    { note: "once the underlying close settles, return() resolves done", steps: [ { events: [
-      { type: "close-settled", target: "source" },
       { type: "result", result: "ret", done: true },
     ] } ] },
   ],
 }, { helper: flatMap, utils }));
 
-// The MAPPER rejects after return(). The underlying is already closing (eagerly), so
-// we don't close it again; the mapper error is the stream's, withheld until that
+// The MAPPER rejects after return(). The underlying produced a value and is still
+// open, so it is closed NOW; the mapper error is the stream's, withheld until that
 // close settles, then delivered to the held call. No inner is produced.
 tests.push(scenarioTest({
   id: "flatmap-test-021",
@@ -916,16 +915,16 @@ tests.push(scenarioTest({
       { type: "next", result: "r0" },
       { type: "pull", pull: "u0" },
     ] } ] },
-    { note: "the underlying is closed eagerly; the call is held", steps: [ { events: [
+    { note: "return() defers the closes; the call is held", steps: [ { events: [
       { type: "return", result: "ret" },
-      { type: "close", target: "source" },
     ] } ] },
     { note: "the in-flight underlying value is mapped", steps: [ { events: [
       { type: "settle", pull: "u0", value: 1 },
       { type: "fn", call: "p0", arg: 1, from: "u0" },
     ] } ] },
-    { note: "the mapper error is withheld until the eager close settles", steps: [ { events: [
+    { note: "the mapper error closes the underlying; the error is withheld until that settles", steps: [ { events: [
       { type: "fn-settle", call: "p0", error: "boom" },
+      { type: "close", target: "source" },
     ] } ] },
     { note: "once the close settles, the error reaches the held call and return() resolves", steps: [ { events: [
       { type: "close-settled", target: "source" },
@@ -935,9 +934,9 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// CLOSE error on the success path: the produced iterator's .return() rejects. return()
-// waits for both closes; once both settle it rejects with the inner-close error
-// (inner taking precedence over the underlying).
+// CLOSE error on the success path: the produced iterator's .return() rejects. The
+// underlying is still closed afterwards, and return() rejects with the inner-close
+// error (inner taking precedence over the underlying).
 tests.push(scenarioTest({
   id: "flatmap-test-022",
   helper: "flatMap",
@@ -947,9 +946,8 @@ tests.push(scenarioTest({
       { type: "next", result: "r0" },
       { type: "pull", pull: "u0" },
     ] } ] },
-    { note: "the underlying is closed eagerly; the call is held", steps: [ { events: [
+    { note: "return() defers the closes; the call is held", steps: [ { events: [
       { type: "return", result: "ret" },
-      { type: "close", target: "source" },
     ] } ] },
     { note: "the in-flight underlying value is mapped", steps: [ { events: [
       { type: "settle", pull: "u0", value: 1 },
@@ -960,11 +958,12 @@ tests.push(scenarioTest({
       { type: "close", target: "A" },
       { type: "result", result: "r0", done: true },
     ] } ] },
-    // The inner .return() rejects, but return() still awaits the underlying close.
-    { note: "the inner close rejected; return() still awaits the underlying close", steps: [ { events: [
+    // The inner .return() rejects; the underlying is still closed afterwards.
+    { note: "the inner close rejected; the underlying still closes", steps: [ { events: [
       { type: "close-settled", target: "A", error: "inner-close" },
+      { type: "close", target: "source" },
     ] } ] },
-    { note: "once both closes settle, return() rejects with the inner-close error", steps: [ { events: [
+    { note: "once the underlying close settles, return() rejects with the inner-close error", steps: [ { events: [
       { type: "close-settled", target: "source" },
       { type: "result", result: "ret", error: "inner-close" },
     ] } ] },
@@ -2477,8 +2476,8 @@ tests.push(scenarioTest({
 }, { helper: flatMap, utils }));
 
 // CLOSE error on the success path, on the UNDERLYING this time: the inner .return()
-// succeeds but the eager underlying .return() rejects ASYNCHRONOUSLY. return() waits
-// for both closes, then rejects with the underlying-close error.
+// succeeds; the underlying .return() (invoked only after the inner close settles)
+// rejects ASYNCHRONOUSLY, and return() rejects with the underlying-close error.
 tests.push(scenarioTest({
   id: "flatmap-test-053",
   helper: "flatMap",
@@ -2488,9 +2487,8 @@ tests.push(scenarioTest({
       { type: "next", result: "r0" },
       { type: "pull", pull: "u0" },
     ] } ] },
-    { note: "the underlying is closed eagerly; the call is held", steps: [ { events: [
+    { note: "return() defers the closes; the call is held", steps: [ { events: [
       { type: "return", result: "ret" },
-      { type: "close", target: "source" },
     ] } ] },
     { note: "the in-flight underlying value is mapped", steps: [ { events: [
       { type: "settle", pull: "u0", value: 1 },
@@ -2501,9 +2499,10 @@ tests.push(scenarioTest({
       { type: "close", target: "A" },
       { type: "result", result: "r0", done: true },
     ] } ] },
-    // The inner close settles cleanly; return() still awaits the underlying close.
-    { note: "the inner closed cleanly; return() still awaits the underlying close", steps: [ { events: [
+    // The inner close settles cleanly; only now is the underlying closed.
+    { note: "the inner closed cleanly; the underlying closes", steps: [ { events: [
       { type: "close-settled", target: "A" },
+      { type: "close", target: "source" },
     ] } ] },
     // The underlying .return() rejects: return() rejects with the underlying-close error.
     { note: "once the underlying close rejects, return() rejects with it", steps: [ { events: [
@@ -2670,9 +2669,9 @@ tests.push(scenarioTest({
 //
 // Structurally distinct from the tests above: return() lands AFTER the source has
 // yielded and the mapper was invoked (so the mapper promise is pending), rather
-// than while the underlying pull is in flight. The underlying still closes eagerly
-// at return(); when the mapper resolves to an iterable we close it WITHOUT pulling,
-// done the held call, and return() waits for both closes.
+// than while the underlying pull is in flight. The closes are deferred all the
+// same: when the mapper resolves to an iterable we close it WITHOUT pulling and
+// done the held call, then close the underlying once the inner close settles.
 tests.push(scenarioTest({
   id: "flatmap-test-058",
   helper: "flatMap",
@@ -2686,21 +2685,21 @@ tests.push(scenarioTest({
       { type: "settle", pull: "u0", value: 1 },
       { type: "fn", call: "p0", arg: 1, from: "u0" },
     ] } ] },
-    // return() lands while the mapper is still pending. The underlying closes eagerly;
-    // r0 is held.
-    { note: "the underlying is closed eagerly; the call is held", steps: [ { events: [
+    // return() lands while the mapper is still pending. Nothing closes yet; r0 is
+    // held.
+    { note: "return() defers the closes; the call is held", steps: [ { events: [
       { type: "return", result: "ret" },
-      { type: "close", target: "source" },
     ] } ] },
     { note: "the produced iterator is closed without being pulled; the held call dones", steps: [ { events: [
       { type: "fn-settle", call: "p0", iterator: "A" },
       { type: "close", target: "A" },
       { type: "result", result: "r0", done: true },
     ] } ] },
-    { note: "return() still waits for the underlying close", steps: [ { events: [
+    { note: "once the inner close settles, the underlying closes", steps: [ { events: [
       { type: "close-settled", target: "A" },
+      { type: "close", target: "source" },
     ] } ] },
-    { note: "once both closes settle, return() resolves", steps: [ { events: [
+    { note: "once the underlying close settles, return() resolves", steps: [ { events: [
       { type: "close-settled", target: "source" },
       { type: "result", result: "ret", done: true },
     ] } ] },
@@ -2711,9 +2710,9 @@ tests.push(scenarioTest({
 // (A) reported done one short and is parked feeding p1 with an in-flight pull; the
 // freed demand redirected to a fresh underlying pull that is now in flight. On
 // return(): the bound demand's surplus (p3) dones eagerly, the head-most bound call
-// (p2) is held, p1 keeps its parked pull, and the underlying closes eagerly. When the
-// in-flight pull yields, its iterator (B) is closed WITHOUT pulling and p2 dones; the
-// parked value still reaches p1.
+// (p2) is held, p1 keeps its parked pull, and nothing closes yet. When the in-flight
+// pull yields, its iterator (B) is closed WITHOUT pulling and p2 dones — then the
+// underlying closes once B's close settles; the parked value still reaches p1.
 tests.push(scenarioTest({
   id: "flatmap-test-059",
   helper: "flatMap",
@@ -2742,12 +2741,10 @@ tests.push(scenarioTest({
       { type: "pull", pull: "u1" },
     ] } ] },
     // return() while reading underlying. Bound demand is 2 (p2, p3): the trailing one
-    // (p3) dones eagerly; p2 (head-most bound) is held; p1 keeps its parked pull; the
-    // underlying closes eagerly.
-    // (src.return() is synchronous; the surplus done is observed a microtask later.)
-    { note: "the surplus dones eagerly; the underlying closes eagerly", steps: [ { events: [
+    // (p3) dones eagerly; p2 (head-most bound) is held; p1 keeps its parked pull;
+    // nothing closes yet.
+    { note: "the surplus dones eagerly; the calls are held", steps: [ { events: [
       { type: "return", result: "pr" },
-      { type: "close", target: "source" },
       { type: "result", result: "p3", done: true },
     ] } ] },
     // The in-flight pull yields a value; the mapper is invoked again.
@@ -2762,10 +2759,11 @@ tests.push(scenarioTest({
       { type: "close", target: "B" },
       { type: "result", result: "p2", done: true },
     ] } ] },
-    { note: "return() still waits for the underlying close", steps: [ { events: [
+    { note: "once the inner close settles, the underlying closes", steps: [ { events: [
       { type: "close-settled", target: "B" },
+      { type: "close", target: "source" },
     ] } ] },
-    { note: "once both closes settle, return() resolves", steps: [ { events: [
+    { note: "once the underlying close settles, return() resolves", steps: [ { events: [
       { type: "close-settled", target: "source" },
       { type: "result", result: "pr", done: true },
     ] } ] },
@@ -2777,9 +2775,10 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// Same parked setup, but the in-flight pull REJECTS. The error is queued behind p1's
-// still-pending parked value and reaches the held call (p2) only after p1 is
-// delivered. return() waits for the eager underlying close.
+// Same parked setup, but the in-flight pull REJECTS. The underlying faulted itself,
+// so nothing is closed and return() resolves right away; the error is queued behind
+// p1's still-pending parked value and reaches the held call (p2) only after p1 is
+// delivered.
 tests.push(scenarioTest({
   id: "flatmap-test-060",
   helper: "flatMap",
@@ -2804,25 +2803,22 @@ tests.push(scenarioTest({
       { type: "pull", pull: "u1" },
     ] } ] },
     // Bound demand is 1 (p2): nothing to done eagerly (p2 is held); p1 keeps its parked
-    // pull; the underlying closes eagerly.
-    { note: "the underlying closes eagerly; the calls are held", steps: [ { events: [
+    // pull; nothing closes yet.
+    { note: "return() defers the closes; the calls are held", steps: [ { events: [
       { type: "return", result: "pr" },
-      { type: "close", target: "source" },
     ] } ] },
-    // The in-flight pull rejects: the error is queued behind p1's still-pending parked
-    // value. No inner is produced, so return() waits only for the eager underlying close.
-    { note: "the pull error is queued behind the parked value", steps: [ { events: [
+    // The in-flight pull rejects: the underlying faulted itself, so nothing is closed
+    // and return() resolves immediately. The error is queued behind p1's still-pending
+    // parked value.
+    { note: "the pull error is queued behind the parked value; return() resolves", steps: [ { events: [
       { type: "settle", pull: "u1", error: "boom" },
+      { type: "result", result: "pr", done: true },
     ] } ] },
     // p1's parked pull yields: p1 gets its value, then the error surfaces to p2.
     { note: "the parked value is delivered, then the error reaches the held call", steps: [ { events: [
       { type: "settle", pull: "a0", value: "a1" },
       { type: "result", result: "p1", value: "a1", from: "a0" },
       { type: "result", result: "p2", error: "boom" },
-    ] } ] },
-    { note: "once the underlying close settles, return() resolves done", steps: [ { events: [
-      { type: "close-settled", target: "source" },
-      { type: "result", result: "pr", done: true },
     ] } ] },
   ],
 }, { helper: flatMap, utils }));
@@ -2874,10 +2870,9 @@ tests.push(scenarioTest({
       { type: "pull", pull: "u1" },
     ] } ] },
     // return() while reading the underlying: bound demand is 1 (r1, held); nothing to
-    // done eagerly; r0 keeps its parked pull a0; the underlying closes eagerly.
-    { note: "the underlying closes eagerly; the calls are held", steps: [ { events: [
+    // done eagerly; r0 keeps its parked pull a0; nothing closes yet.
+    { note: "return() defers the closes; the calls are held", steps: [ { events: [
       { type: "return", result: "ret" },
-      { type: "close", target: "source" },
     ] } ] },
     // A's parked pull #0 reports done. The freed demand can never be filled (we won't
     // pull anything more), so the trailing call r1 settles done immediately; r0 — the
@@ -2896,6 +2891,73 @@ tests.push(scenarioTest({
       { type: "fn-settle", call: "p1", iterator: "B" },
       { type: "close", target: "B" },
       { type: "result", result: "r0", done: true },
+    ] } ] },
+    { note: "once the inner close settles, the underlying closes", steps: [ { events: [
+      { type: "close-settled", target: "B" },
+      { type: "close", target: "source" },
+    ] } ] },
+    { note: "once the underlying close settles, return() resolves", steps: [ { events: [
+      { type: "close-settled", target: "source" },
+      { type: "result", result: "ret", done: true },
+    ] } ] },
+  ],
+}, { helper: flatMap, utils }));
+
+// A PARKED iterator errors while draining. The error closes nothing (the closes are
+// the draining flow's responsibility) and parks in order, rejecting its call as
+// usual; draining proceeds unaffected — the held call remains the sink for a
+// pull/mapper rejection, the in-flight pull's iterator is still produced and closed
+// without being pulled, and the closes still run sequentially. (In particular the
+// produced iterator is not leaked merely because an unrelated parked error arrived
+// first.)
+tests.push(scenarioTest({
+  id: "flatmap-test-063",
+  helper: "flatMap",
+  label: "flatMap: a parked-iterator error while draining does not disturb the deferred closes",
+  ticks: [
+    { note: "two coalesced calls, one underlying pull", steps: [ { events: [
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "pull", pull: "u0" },
+    ] } ] },
+    { note: "the mapper is invoked", steps: [ { events: [
+      { type: "settle", pull: "u0", value: 1 },
+      { type: "fn", call: "p0", arg: 1, from: "u0" },
+    ] } ] },
+    { note: "demand 2 fans out across A", steps: [ { events: [
+      { type: "fn-settle", call: "p0", iterator: "A" },
+      { type: "inner-pull", pull: "a0", iterator: "A" },
+      { type: "inner-pull", pull: "a1", iterator: "A" },
+    ] } ] },
+    { note: "A parks; the freed demand reads the underlying again", steps: [ { events: [
+      { type: "settle", pull: "a1", done: true },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    { note: "return() defers the closes; the calls are held", steps: [ { events: [
+      { type: "return", result: "ret" },
+    ] } ] },
+    // The parked pull rejects: the error is at the head, so it rejects r0 right away.
+    // Draining is unaffected.
+    { note: "the parked error rejects its call; draining proceeds", steps: [ { events: [
+      { type: "settle", pull: "a0", error: "boom" },
+      { type: "result", result: "r0", error: "boom" },
+    ] } ] },
+    { note: "the in-flight underlying value is mapped", steps: [ { events: [
+      { type: "settle", pull: "u1", value: 2 },
+      { type: "fn", call: "p1", arg: 2, from: "u1" },
+    ] } ] },
+    { note: "the produced iterator is closed without being pulled; the held call dones", steps: [ { events: [
+      { type: "fn-settle", call: "p1", iterator: "B" },
+      { type: "close", target: "B" },
+      { type: "result", result: "r1", done: true },
+    ] } ] },
+    { note: "once the inner close settles, the underlying closes", steps: [ { events: [
+      { type: "close-settled", target: "B" },
+      { type: "close", target: "source" },
+    ] } ] },
+    { note: "once the underlying close settles, return() resolves", steps: [ { events: [
+      { type: "close-settled", target: "source" },
+      { type: "result", result: "ret", done: true },
     ] } ] },
   ],
 }, { helper: flatMap, utils }));

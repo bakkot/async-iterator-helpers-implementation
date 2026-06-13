@@ -467,6 +467,12 @@ async function runSchedule(maxEvents, chooser) {
   // rewrite "open" iterators into "finished" ones.
   rec.finishedNaturally = isFinished();
   rec.underlying.naturalFinished = rec.underlying.finished;
+  // Whether the helper was mid-read (an underlying pull or the mapper in flight)
+  // when the schedule stopped. Closes are deferred until that read settles, so in
+  // this state the underlying's close (or the discovery that it finished itself
+  // and needs no close) legitimately happens during finalization; the leak check
+  // then judges the underlying by its final state instead of this snapshot.
+  rec.underlying.midReadAtEnd = pendingPulls.some((p) => p.kind === 'U') || pendingMapper != null;
   for (const inner of rec.inners) inner.naturalFinished = inner.finished;
 
   // --- finalization: drive to quiescence so cleanup/settle invariants apply --
@@ -617,7 +623,17 @@ function checkInvariants(rec) {
     // on its own -- including a return() before the first pull (map/filter close
     // it unconditionally), so this is NOT exempted for the never-pulled case. An
     // iterator without a .return() method has nothing to close, so it can't leak.
-    if (!rec.underlying.naturalFinished && rec.underlying.returnCalls === 0 && rec.underlying.hasReturn) {
+    //
+    // When the helper terminated while mid-read (underlying pull or mapper in
+    // flight), the close is DEFERRED until that read settles, which happens during
+    // finalization: judge by the final state (returnCalls is cumulative, so a
+    // finalize-time close counts; a pull force-settled done means the underlying
+    // finished itself and correctly needs no close). The cost of this relaxation:
+    // a path that abandons an in-flight pull where it should instead close on its
+    // settlement would be masked here, since finalize's forced done looks like a
+    // natural finish.
+    const underlyingFinishedForLeak = rec.underlying.midReadAtEnd ? rec.underlying.finished : rec.underlying.naturalFinished;
+    if (!underlyingFinishedForLeak && rec.underlying.returnCalls === 0 && rec.underlying.hasReturn) {
       add(`underlying was left open at termination (not finished, not .return()'d): leak`);
     }
     for (const inner of rec.inners) {

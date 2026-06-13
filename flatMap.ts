@@ -27,10 +27,6 @@ type Slot =
 
 type InFlight = { type: 'iter', iter: unknown, readonly values: Slot[] }
 
-// The outcome of a close (.return()) we performed, captured so it never rejects on
-// its own — we compose these to settle result.return()'s promise.
-type CloseOutcome = { ok: true } | { ok: false, error: unknown };
-
 // For errors from the mapper or from result iterators, we invoke .return() on
 // whatever is still open (the underlying, and possibly an active inner iterator).
 // Those calls must settle before the error is surfaced.
@@ -42,22 +38,19 @@ type ReadingUnderlyingState = { type: 'reading underlying', requested: number /*
 
 // return() landed while we were reading the underlying for the next inner iterator.
 // We are committed to closing, so we will NOT pull the iterator that pull produces:
-// the surplus bound demand was doned eagerly and the underlying was closed eagerly
-// (its outcome is captured in `uCloseSettled`). One bound call is held — the position
-// a pull/mapper rejection would land on. When the in-flight pull/mapper settle we
-// close the produced iterator (if any) WITHOUT pulling it and done the held call.
-// result.return() (resolveReturn/rejectReturn) waits for BOTH the underlying close
-// and any inner close, which can be outstanding concurrently. Draining always
-// logically requests exactly one value — the held call, which is the last of
-// #calls; the buffered parked values keep the calls before it. When parked slots
-// truncate (an inner reports done), the freed calls are the LAST ones — the held
-// position shifts earlier, since results deliver in call order and the rejection
-// lands on the first call not bound to a surviving buffered value.
+// the surplus bound demand was doned eagerly. One bound call is held — the position
+// a pull/mapper rejection would land on. Nothing is closed eagerly: when the
+// in-flight pull/mapper settles we close the iterator it produced (if any) and then
+// the underlying, sequentially, and settle result.return() (resolveReturn) with the
+// outcome of those closes. Draining always logically requests exactly one value —
+// the held call, which is the last of #calls; the buffered parked values keep the
+// calls before it. When parked slots truncate (an inner reports done), the freed
+// calls are the LAST ones — the held position shifts earlier, since results deliver
+// in call order and the rejection lands on the first call not bound to a surviving
+// buffered value.
 type DrainingState = {
   type: 'draining',
   resolveReturn: (v: unknown) => void,
-  rejectReturn: (e: unknown) => void,
-  uCloseSettled: Promise<CloseOutcome>,
 };
 
 type ActiveState =
@@ -293,15 +286,11 @@ class FlatMapHelper {
         }
         if (this.#active.type === 'draining') {
           // A parked iterator errored while we were draining the in-flight underlying
-          // pull. The underlying is already closing (eagerly), so we don't close it
-          // again; the pending bound demand can never be filled now the stream is
-          // truncated here, so done it (the in-flight pull's result is discarded once
-          // we're finished). The error itself still reaches the call at this slot's
-          // position, and result.return() waits for the eager underlying close.
-          const d = this.#active;
-          this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
-          this.#finalizeReturnAfterUnderlyingClose(d);
-          this.#active = { type: 'finished' };
+          // pull. Draining proceeds unaffected: the closes happen when that pull and
+          // the mapper settle, and the held call remains the sink for a rejection
+          // from them. This error just parks in order like any other; there is
+          // nothing to close for it, since the closes are the draining flow's
+          // responsibility.
           (slot as ErrorState).closeState = 'ready';
           if (this.#isHeadOfQueue(slot)) {
             this.#processQueue();
@@ -327,29 +316,13 @@ class FlatMapHelper {
     this.#active = { type: 'finished' };
   }
 
-  // The underlying pull rejected while draining: the underlying exhausted itself, so
-  // the error surfaces to the head-most pending call immediately (after any buffered
-  // values); the eager underlying close only gates result.return(). Buffered values
-  // keep their calls and the rest of the pending demand is doned.
-  #drainingErrorFromUnderlying(d: DrainingState, error: unknown) {
-    ASSERT(this.#active === d, 'active is the draining state');
-    this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#bufferedValueCount() - 1);
-    this.#finalizeReturnAfterUnderlyingClose(d);
-    this.#active = { type: 'error', error, closeState: 'ready' };
-    if (this.#closedButStillHaveValuesInFlight.length === 0) {
-      this.#processQueue();
-    }
-  }
-
   // The underlying produced a value while draining but we failed to map it (the
-  // mapper threw or rejected, or obtaining the inner iterator threw). Like any mapper
-  // error, it surfaces only after the underlying close settles — here the eager close
-  // already in flight. The head-most pending call is the error sink; buffered values
-  // keep their calls and the rest of the pending demand is doned. No inner was
-  // produced, so result.return() waits only for the eager underlying close.
+  // mapper threw or rejected, or obtaining the inner iterator threw). Like any
+  // mapper error this closes the underlying — deferred until now — and the error
+  // surfaces to the held call (the first call not bound to a buffered value) only
+  // once that close settles. result.return() then settles from the close's outcome.
   #drainingErrorFromMapper(d: DrainingState, error: unknown) {
     ASSERT(this.#active === d, 'active is the draining state');
-    this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#bufferedValueCount() - 1);
     const slot: ErrorState = { type: 'error', error, closeState: 'awaiting-return', reject: null };
     this.#active = slot;
     // Commit the call (if this is the head) so the close reaction has a rejector;
@@ -357,54 +330,42 @@ class FlatMapHelper {
     if (this.#isHeadOfQueue(slot)) {
       this.#processQueue();
     }
-    d.uCloseSettled.then(() => {
+    const uClose = fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.());
+    const onClosed = () => {
+      // runs on either settlement of underlying.return(), swallowing its error
       const s = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
       if (s.reject) {
         s.reject(error);
-      } else if ((slot as Slot).type !== 'removed') {
+      } else {
         (slot as ErrorState).closeState = 'ready';
+        ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
       }
-    });
-    // Registered after the rejection reaction above so the held call rejects
-    // before result.return() resolves.
-    this.#finalizeReturnAfterUnderlyingClose(d);
+    };
+    uClose.then(onClosed, onClosed);
+    // Registered after the rejection reaction above so the held call rejects before
+    // result.return() settles; a failed close rejects result.return().
+    d.resolveReturn(uClose.then(() => ({ value: undefined, done: true })));
   }
 
-  // Run `thunk` (a .return() call) and capture its outcome as a never-rejecting
-  // promise, so several closes can be composed without unhandled rejections.
-  #captureClose(thunk: () => unknown): Promise<CloseOutcome> {
-    return fastPromiseTry(thunk).then(
-      () => ({ ok: true } as CloseOutcome),
-      (error) => ({ ok: false, error } as CloseOutcome),
+  // Close `inner` and then the underlying, sequentially — the inner's .return() must
+  // settle before the underlying's is invoked. Resolves done unless a close failed,
+  // in which case it rejects with that error, the inner close taking precedence
+  // (though the underlying close still happens).
+  #closeInnerThenUnderlying(inner: unknown) {
+    // todo fast path for missing returns
+    return fastPromiseTry(() => (inner as MaybeReturnable).return?.()).then(
+      () => {
+        // TODO strictly speaking we need to check for object-ness of the return value here
+        // or, change the spec to never do that, because it's dumb
+        return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
+          .then(() => ({ value: undefined, done: true }));
+      },
+      error => {
+        // this error squashes errors from closing underlying
+        return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
+          .finally(() => Promise.reject(error));
+      },
     );
-  }
-
-  // Settle result.return() once the eager underlying close has settled (no inner was
-  // produced). It resolves done unless that close failed, in which case it rejects
-  // with that error.
-  #finalizeReturnAfterUnderlyingClose(d: DrainingState) {
-    d.uCloseSettled.then(outcome => {
-      if (outcome.ok) {
-        d.resolveReturn({ value: undefined, done: true });
-      } else {
-        d.rejectReturn(outcome.error);
-      }
-    });
-  }
-
-  // Settle result.return() once both the inner close and the eager underlying close
-  // have settled. It resolves done unless a close failed, in which case it rejects
-  // with that error — the inner close taking precedence.
-  #finalizeReturnAfterBothCloses(d: DrainingState, iCloseSettled: Promise<CloseOutcome>) {
-    Promise.all([iCloseSettled, d.uCloseSettled]).then(([iOutcome, uOutcome]) => {
-      if (!iOutcome.ok) {
-        d.rejectReturn(iOutcome.error);
-      } else if (!uOutcome.ok) {
-        d.rejectReturn(uOutcome.error);
-      } else {
-        d.resolveReturn({ value: undefined, done: true });
-      }
-    });
   }
 
   #issuePullFromUnderlying(requested: number) {
@@ -417,9 +378,11 @@ class FlatMapHelper {
         if (active.type !== 'reading underlying' && active.type !== 'draining') return;
         if ((r as { done: boolean }).done) {
           if (active.type === 'draining') {
+            // The underlying exhausted itself before we could close it; a clean done
+            // does not close the source, so there is nothing left to wait for.
             this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
-            this.#finalizeReturnAfterUnderlyingClose(active);
             this.#active = { type: 'finished' };
+            active.resolveReturn({ value: undefined, done: true });
           } else {
             this.#markUnderlyingAsFinished();
           }
@@ -448,15 +411,13 @@ class FlatMapHelper {
             }
 
             if (active.type === 'draining') {
-              // Less-eager: we don't pull this iterator. Close it RIGHT AWAY (it was
-              // never pulled, so it cannot have finished on its own — no .return()-
-              // after-done hazard), done the pending bound demand, and have
-              // result.return() wait for BOTH the eager underlying close and this
-              // inner close.
-              const iCloseSettled = this.#captureClose(() => (actualIter as MaybeReturnable).return?.());
+              // We don't pull this iterator. Close it (it was never pulled, so it
+              // cannot have finished on its own — no .return()-after-done hazard),
+              // then the underlying, sequentially — the same as return() with an
+              // active inner — and settle result.return() with that outcome.
               this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
               this.#active = { type: 'finished' };
-              this.#finalizeReturnAfterBothCloses(active, iCloseSettled);
+              active.resolveReturn(this.#closeInnerThenUnderlying(actualIter));
               return;
             }
 
@@ -471,11 +432,11 @@ class FlatMapHelper {
           },
           error => {
             const active = this.#active;
-            if (active.type !== 'reading underlying' && active.type !== 'draining') return;
             if (active.type === 'draining') {
               this.#drainingErrorFromMapper(active, error);
               return;
             }
+            if (active.type !== 'reading underlying') return;
             this.#closeUnderlyingForErrorInMapper(error);
           }
         );
@@ -484,7 +445,14 @@ class FlatMapHelper {
         const active = this.#active;
         if (active.type !== 'reading underlying' && active.type !== 'draining') return;
         if (active.type === 'draining') {
-          this.#drainingErrorFromUnderlying(active, error);
+          // The underlying errored after return(). It exhausted itself, so it is not
+          // closed and result.return() has nothing to wait for; the error surfaces
+          // to the held call immediately (after any buffered values).
+          this.#active = { type: 'error', error, closeState: 'ready' };
+          if (this.#closedButStillHaveValuesInFlight.length === 0) {
+            this.#processQueue();
+          }
+          active.resolveReturn({ value: undefined, done: true });
           return;
         }
 
@@ -642,19 +610,12 @@ class FlatMapHelper {
       // pending). We're committed to closing, so we will NOT pull whatever iterator
       // that pull produces. The bound demand can't receive a value, so done the
       // trailing surplus eagerly and HOLD the head-most bound call (the position a
-      // pull/mapper rejection would land on). Close the underlying EAGERLY now, and
-      // switch to 'draining': when the pull/mapper settle we close the produced
-      // iterator (if any) without pulling it and done the held call. return() waits
-      // for both closes (see #finalizeReturnAfterBothCloses).
+      // pull/mapper rejection would land on). Nothing is closed yet: when the
+      // pull/mapper settle we close the iterator they produced (if any) and then
+      // the underlying, and the promise returned here settles with that outcome.
       this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#bufferedValueCount() - 1);
-      const uCloseSettled = this.#captureClose(() => (this.#underlying as MaybeReturnable).return?.());
-      const { resolve, reject, promise } = Promise.withResolvers();
-      this.#active = {
-        type: 'draining',
-        resolveReturn: resolve,
-        rejectReturn: reject,
-        uCloseSettled,
-      };
+      const { resolve, promise } = Promise.withResolvers();
+      this.#active = { type: 'draining', resolveReturn: resolve };
       return promise;
     }
 
@@ -663,21 +624,6 @@ class FlatMapHelper {
     // TODO order of truncation vs resolving this Promise
     const active = this.#active as InFlight;
     this.#markUnderlyingAsFinished();
-    const activeIter = active.iter;
-
-    // todo fast path for missing returns
-    return fastPromiseTry(() => (activeIter as MaybeReturnable).return?.()).then(
-      () => {
-        // TODO strictly speaking we need to check for object-ness of the return value here
-        // or, change the spec to never do that, because it's dumb
-        return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
-          .then(() => ({ value: undefined, done: true }))
-      },
-      error => {
-        // this error squashes errors from closing underlying
-        return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
-          .finally(() => Promise.reject(error));
-      },
-    );
+    return this.#closeInnerThenUnderlying(active.iter);
   }
 }

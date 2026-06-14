@@ -3099,4 +3099,120 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
+// orphaned error
+tests.push(scenarioTest({
+  id: "flatmap-test-063",
+  helper: "flatMap",
+  label: "error which was blocked on closing is discarded by earlier done",
+  ticks: [
+    { steps: [
+      {
+        events: [],
+      },
+      {
+        events: [
+          { type: "next", result: "r0" },
+          { type: "pull", pull: "u0" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "next", result: "r1" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "settle", pull: "u0", value: "A" },
+          { type: "fn", call: "p0", arg: "A", from: "u0" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "fn-settle", call: "p0", iterator: "A" },
+          { type: "inner-pull", pull: "a0", iterator: "A" },
+          { type: "inner-pull", pull: "a1", iterator: "A" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "next", result: "r2" },
+          { type: "inner-pull", pull: "a2", iterator: "A" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "settle", pull: "a2", done: true },
+          { type: "pull", pull: "u1" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "settle", pull: "u1", value: "B" },
+          { type: "fn", call: "p1", arg: "B", from: "u1" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "fn-settle", call: "p1", iterator: "B" },
+          { type: "inner-pull", pull: "b0", iterator: "B" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "settle", pull: "a1", error: "boom" },
+          { type: "close", target: "B" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "settle", pull: "a0", done: true },
+          { type: "result", result: "r1", done: true },
+          { type: "result", result: "r2", done: true },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "close-settled", target: "B" },
+          { type: "close", target: "source" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "close-settled", target: "source" },
+        ],
+      },
+    ] },
+    { steps: [
+      {
+        events: [
+          { type: "settle", pull: "b0", value: "b0" },
+          { type: "result", result: "r0", value: "b0", from: "b0" },
+        ],
+      },
+    ] },
+  ],
+}, { helper: flatMap, utils }));
+
 await runTests(tests, xfailed);

@@ -23,7 +23,7 @@ type Slot =
   | { type: 'awaiting' }
   | { type: 'value', value: unknown }
   | ErrorState
-  | { type: 'removed' }
+  | { type: 'removed' } // i.e. we already got { done: true } for this iterator at an earlier position
 
 type InFlight = { type: 'iter', iter: unknown, readonly values: Slot[] }
 
@@ -36,18 +36,21 @@ type ErrorState =
 
 type ReadingUnderlyingState = { type: 'reading underlying', requested: number /* integer > 0 */ };
 
-// draining = we must wait for an in-flight underlying pull (and the mapper) to
-// finish handing us the inner iterator so we can close it, then close the
-// underlying, before we are done. Two triggers:
-//   * resolveReturn set: result.return() was called while pulling or mapping;
-//     the held .return() promise settles from the close outcome.
-//   * errorSlot set: an *earlier* inner iterator errored while we were already
-//     reading the underlying for the next one. There is no result.return(); the
-//     held position is the error slot, whose error surfaces once the closes settle.
+/*
+draining = we must wait for an in-flight underlying pull (and the mapper) to finish handing us the inner iterator so we can close it,
+then close the underlying, before we are done.
+
+we enter this state either by calling .return() while pulling underlying or waiting for the mapper,
+or by getting an error from an earlier inner iterator while pulling underlying or waiting for the mapper
+
+in the former case, we will have arranged not to resolve a call to result.next() so we have somewhere to put an error if the pull or mapper throws
+if they finish without throwing, we resolve that call with { done: true }; errors from the calls to .return() can go into the result.return() call
+*/
 type DrainingState =
 | {
     type: 'draining',
     resolveReturn: ((v: unknown) => void),
+    rejectReturn: ((v: unknown) => void),
     errorSlot: null,
   }
 | {
@@ -96,8 +99,7 @@ class FlatMapHelper {
         ASSERT(active.type == 'reading underlying' || active.type == 'draining', 'reading underlying can only transition to draining');
         if ((r as { done: boolean }).done) {
           if (active.type === 'draining') {
-            // if underlying was exhausted while we were waiting for it to close, the things which were waiting for it can just proceed
-            this.#active = { type: 'finished' };
+            // if underlying was exhausted while we were waiting for it to close, the things that were waiting for it can just proceed
             if (active.errorSlot) {
               this.#commitError(active.errorSlot);
             } else {
@@ -107,6 +109,7 @@ class FlatMapHelper {
           } else {
             this.#markUnderlyingAsFinished();
           }
+          this.#active = { type: 'finished' };
           return;
         }
 
@@ -133,7 +136,7 @@ class FlatMapHelper {
                 this.#closeInnerThenUnderlying(actualIter as MaybeReturnable, () => this.#commitError(active.errorSlot));
               } else {
                 this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
-                this.#closeInnerThenUnderlying(actualIter as MaybeReturnable, (gotError, error) => gotError ? active.resolveReturn(Promise.reject(error)) : active.resolveReturn({ done: true, value: undefined })); // TODO just store the rejector
+                this.#closeInnerThenUnderlying(actualIter as MaybeReturnable, (gotError, error) => gotError ? active.rejectReturn(error) : active.resolveReturn({ done: true, value: undefined }));
               }
               return;
             }
@@ -157,6 +160,7 @@ class FlatMapHelper {
         const active = this.#active;
         ASSERT(active.type == 'reading underlying' || active.type == 'draining', 'reading underlying can only transition to draining');
         if (active.type === 'draining' && active.errorSlot) {
+          // TODO should this be AggregateError?
           this.#active = { type: 'finished' };
           this.#commitError(active.errorSlot);
           return;
@@ -177,22 +181,19 @@ class FlatMapHelper {
         if (active.type === 'draining') {
           active.resolveReturn({ value: undefined, done: true });
         }
-        return;
       }
     );
   }
 
   #issuePullFromCurrentActive() {
-    ASSERT(this.#active.type === 'iter', 'active is iter');
+    ASSERT(this.#active.type === 'iter', 'we have an active iterator');
 
     const slot = { type: 'awaiting' } as Slot;
     const inFlight = this.#active as InFlight;
     const thisIterValues = inFlight.values;
     thisIterValues.push(slot);
 
-    const actualIter = inFlight.iter as Nextable;
-
-    fastPromiseTry(() => actualIter.next()).then(
+    fastPromiseTry(() => (inFlight.iter as Nextable).next()).then(
       iterResult => {
         // got iterator result from inner iterator
 
@@ -200,6 +201,8 @@ class FlatMapHelper {
         ASSERT(slot.type === 'awaiting', 'slot awaiting');
 
         if ((iterResult as { done: boolean }).done) {
+          ASSERT(this.#closedButStillHaveValuesInFlight.includes(thisIterValues) || this.#active === inFlight, 'inFlight is still tracked');
+
           // I am assuming this can be done cheaply, possibly with a slightly different data structure
           // though also in practice N is small enough for it not to matter
           const currentIndex = thisIterValues.indexOf(slot);
@@ -208,12 +211,8 @@ class FlatMapHelper {
           const removedCount = thisIterValues.length - currentIndex;
           ASSERT(removedCount > 0, 'have not already truncated this value');
 
-          const exposedNewHead = currentIndex === 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight.values;
-
-          ASSERT(this.#closedButStillHaveValuesInFlight.includes(thisIterValues) || this.#active === inFlight, 'inFlight is still tracked');
-
           // remove anything after this slot
-          // TODO errors if any are settled-but-not-done
+          // TODO probably we should error if anything here is settled-but-not-done
           for (let i = currentIndex; i < thisIterValues.length; ++i) {
             const slot = thisIterValues[i];
             if (slot.type === 'value') {
@@ -226,8 +225,11 @@ class FlatMapHelper {
             slot.type = 'removed';
           }
           thisIterValues.length = currentIndex;
+
+          let exposedNewHead = false;
           if (currentIndex === 0) {
             if (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight.values) {
+              exposedNewHead = true;
               do {
                 this.#closedButStillHaveValuesInFlight.shift();
               } while (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0].length === 0);
@@ -236,12 +238,16 @@ class FlatMapHelper {
 
           if (this.#active.type === 'iter') {
             if (this.#active === inFlight) {
-              if (thisIterValues.length > 0) {
+              if (currentIndex > 0) {
                 this.#closedButStillHaveValuesInFlight.push(this.#active.values);
               }
               this.#issuePullFromUnderlying(removedCount);
             } else {
-              // strictly speaking, if thisIterValues is now empty we could remove it
+              // i.e., we got a { done: true } from an inner iterator we already considered to be done
+              // we just discared any subsequent Promises from said iterator
+              // so we need to re-issue those pulls on the currently active one
+
+              // strictly speaking, if thisIterValues is now empty we could remove it from closedButStillHaveValuesInFlight
               // but, no real reason to; we'll pop when it gets to the head of the queue
 
               for (let i = 0; i < removedCount; ++i) {
@@ -251,7 +257,7 @@ class FlatMapHelper {
           } else if (this.#active.type === 'reading underlying') {
             this.#active.requested += removedCount;
           } else {
-            ASSERT(this.#active.type === 'error' || this.#active.type === 'draining' || this.#active.type === 'finished', 'no longer issuing pulls');
+            ASSERT(this.#closed(), 'no longer issuing pulls');
 
             this.#markSomeCallsAsNoLongerGettingValues(removedCount);
           }
@@ -284,46 +290,33 @@ class FlatMapHelper {
           const active = this.#active;
           this.#closedButStillHaveValuesInFlight.push(active.values);
           this.#active = { type: 'finished' };
+          if (this.#isHeadOfQueue(slot)) {
+            this.#processQueue();
+          }
 
           if (active === inFlight) {
             // just gotta close underlying
-            // this will also call processQueue if necessary
             this.#closeUnderlyingForError(slotButWithTypeScript as ErrorState);
           } else {
             // gotta close both underlying and active
             const activeIter = active.iter;
-            if (this.#isHeadOfQueue(slot)) {
-              this.#processQueue();
-            }
 
-            const onClosed = () => {
-              if (slotButWithTypeScript.reject) {
-                ASSERT((slot as Slot).type !== 'removed', 'slot not removed');
-                slotButWithTypeScript.reject(error);
-              } else {
-                if ((slot as Slot).type === 'removed') return; // TODO make sure this is really what we want
-                (slot as ErrorState).closeState = 'ready';
-                ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
-              }
-            };
-            this.#closeInnerThenUnderlying(activeIter as MaybeReturnable, onClosed);
+            this.#closeInnerThenUnderlying(activeIter as MaybeReturnable, () => this.#commitError(slotButWithTypeScript));
           }
-          return;
-        }
-        if (this.#active.type === 'reading underlying') {
+        } else if (this.#active.type === 'reading underlying') {
           slotButWithTypeScript.closeState = 'awaiting-return';
           this.#markSomeCallsAsNoLongerGettingValues(this.#active.requested);
           this.#active = { type: 'draining', resolveReturn: null, errorSlot: slotButWithTypeScript };
           if (this.#isHeadOfQueue(slot)) {
             this.#processQueue();
           }
-          return;
-        }
-        ASSERT(this.#active.type === 'error' || this.#active.type === 'draining' || this.#active.type === 'finished', 'no longer issuing pulls');
-        // nothing to close in this case
-        (slot as ErrorState).closeState = 'ready';
-        if (this.#isHeadOfQueue(slot)) {
-          this.#processQueue();
+        } else {
+          ASSERT(this.#closed(), 'no longer issuing pulls');
+          // nothing to close in this case
+          (slot as ErrorState).closeState = 'ready';
+          if (this.#isHeadOfQueue(slot)) {
+            this.#processQueue();
+          }
         }
       },
     );
@@ -333,15 +326,14 @@ class FlatMapHelper {
 
   // we were holding this error until some event finished, and it now has
   #commitError(slot: ErrorState) {
+    if ((slot as Slot).type === 'removed') return;
     ASSERT(slot.closeState === 'awaiting-return', 'error was pending');
-    const s = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
-    if (s.reject) {
-      s.reject(slot.error);
+    const slotButWithTypescript = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
+    if (slotButWithTypescript.reject) {
+      slotButWithTypescript.reject(slot.error);
     } else {
       (slot as ErrorState).closeState = 'ready';
-      if (this.#isHeadOfQueue(slot)) {
-        this.#processQueue();
-      }
+      ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
     }
   }
 
@@ -351,9 +343,8 @@ class FlatMapHelper {
     if (active.type === 'draining') {
       if (active.errorSlot) {
         this.#active = { type: 'finished' };
-        this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => {
-          this.#commitError(active.errorSlot)
-        });
+          // TODO should this be AggregateError w/ the mapper error? ditto elsewhere
+        this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => this.#commitError(active.errorSlot));
       } else {
         const slot: ErrorState = { type: 'error', error, closeState: 'awaiting-return', reject: null };
         this.#active = slot;
@@ -361,19 +352,13 @@ class FlatMapHelper {
           this.#processQueue();
         }
         this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, closeError) => {
-          const s = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
-          if (s.reject) {
-            s.reject(error);
-          } else {
-            (slot as ErrorState).closeState = 'ready';
-            ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
-          }
+          this.#commitError(slot);
 
           // TODO ordering for this vs above rejection
           if (gotError) {
-            active.resolveReturn!(Promise.reject(closeError));
+            active.rejectReturn(closeError);
           } else {
-            active.resolveReturn!({ value: undefined, done: true }); // TODO just hold the rejector
+            active.resolveReturn({ value: undefined, done: true });
           }
         });
       }
@@ -383,6 +368,9 @@ class FlatMapHelper {
     const slot: ErrorState = { type: 'error', error, closeState: 'awaiting-return', reject: null };
     this.#markSomeCallsAsNoLongerGettingValues(requested - 1);
     this.#active = slot;
+    if (this.#closedButStillHaveValuesInFlight.length === 0) {
+      this.#processQueue();
+    }
     this.#closeUnderlyingForError(slot);
   }
 
@@ -390,21 +378,7 @@ class FlatMapHelper {
     ASSERT(slot.type === 'error', 'slot is error');
     ASSERT(slot.closeState === 'awaiting-return', 'slot awaiting-return');
 
-    if (this.#isHeadOfQueue(slot)) {
-      this.#processQueue();
-    }
-
-    this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => {
-      // we don't actually care if calling return threw
-      ASSERT(slot.closeState === 'awaiting-return', 'slot awaiting-return');
-      const slotButWithTypeScript = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
-      if (slotButWithTypeScript.reject) {
-        slotButWithTypeScript.reject(slot.error);
-      } else {
-        slot.closeState = 'ready';
-        ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
-      }
-    });
+    this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => this.#commitError(slot));
   }
 
   // ------------------ Iterator closing stuff ------------------
@@ -432,7 +406,6 @@ class FlatMapHelper {
       this.#closedButStillHaveValuesInFlight.push(this.#active.values);
     }
     this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#valuesWeCouldDeliverFromClosedInnerIterators());
-    this.#active = { type: 'finished' };
   }
 
   #closeInnerThenUnderlying(inner: MaybeReturnable, next: (gotError: boolean, error?: unknown) => void) {
@@ -459,6 +432,10 @@ class FlatMapHelper {
   }
 
   // ------------------ Utilities ------------------
+
+  #closed() {
+    return this.#active.type === 'error' || this.#active.type === 'draining' || this.#active.type === 'finished';
+  }
 
   #valuesWeCouldDeliverFromClosedInnerIterators() {
     return this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.length, 0);
@@ -528,7 +505,7 @@ class FlatMapHelper {
   // ------------------ Public API ------------------
 
   next() {
-    if (this.#active.type === 'error' || this.#active.type === 'draining' || this.#active.type === 'finished') {
+    if (this.#closed()) {
       return Promise.resolve({ value: undefined, done: true });
     }
     const { resolve, reject, promise } = Promise.withResolvers();
@@ -551,20 +528,21 @@ class FlatMapHelper {
         this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => gotError ? rej(error) : res({ value: undefined, done: true }));
       });
     }
-    if (this.#active.type === 'error' || this.#active.type === 'draining' || this.#active.type === 'finished') {
+    if (this.#closed()) {
       return Promise.resolve({ value: undefined, done: true });
     }
 
     if (this.#active.type === 'reading underlying') {
       this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#valuesWeCouldDeliverFromClosedInnerIterators() - 1); // -1 for the slot we hold open in case of errors from the pull/mapper
-      const { resolve, promise } = Promise.withResolvers();
-      this.#active = { type: 'draining', resolveReturn: resolve, errorSlot: null };
+      const { resolve, reject, promise } = Promise.withResolvers();
+      this.#active = { type: 'draining', resolveReturn: resolve, rejectReturn: reject, errorSlot: null };
       return promise;
     }
 
     // TODO order of truncation vs resolving this Promise
     const active = this.#active as InFlight;
     this.#markUnderlyingAsFinished();
+    this.#active = { type: 'finished' };
     return new Promise((res, rej) => {
       this.#closeInnerThenUnderlying(active.iter as MaybeReturnable, (gotError, error) => gotError ? rej(error) : res({ value: undefined, done: true }));
     });

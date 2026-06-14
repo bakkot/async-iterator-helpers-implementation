@@ -496,6 +496,65 @@ export const flatMapScenarios = [
     ],
   },
   {
+    id: "flatmap-delayed-delivery",
+    helper: "flatMap",
+    label: "Delayed delivery*",
+    description: "In the current implementation we do not deliver later values from the head-of-queue inner iterator, although we could, and doing so would be more like <code>map</code>.<br><br><strong>Open question</strong>: Should we? It's a bunch of extra bookkeeping for probably not much benefit, but it is currently inconsistent.",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", iterator: "A" },
+            { type: "inner-pull", pull: "a0", iterator: "A" },
+            { type: "inner-pull", pull: "a1", iterator: "A" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a1", value: "a1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a0", value: "a0" },
+            { type: "result", result: "r0", value: "a0", from: "a0" },
+            { type: "result", result: "r1", value: "a1", from: "a1" },
+          ],
+        },
+      ] },
+    ],
+  },
+  {
     id: "flatmap-exhaustion",
     helper: "flatMap",
     label: "Exhaustion",

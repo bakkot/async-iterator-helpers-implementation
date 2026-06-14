@@ -36,18 +36,8 @@ type ErrorState =
 
 type ReadingUnderlyingState = { type: 'reading underlying', requested: number /* integer > 0 */ };
 
-// return() landed while we were reading the underlying for the next inner iterator.
-// We are committed to closing, so we will NOT pull the iterator that pull produces:
-// the surplus bound demand was doned eagerly. One bound call is held — the position
-// a pull/mapper rejection would land on. Nothing is closed eagerly: when the
-// in-flight pull/mapper settles we close the iterator it produced (if any) and then
-// the underlying, sequentially, and settle result.return() (resolveReturn) with the
-// outcome of those closes. Draining always logically requests exactly one value —
-// the held call, which is the last of #calls; the buffered parked values keep the
-// calls before it. When parked slots truncate (an inner reports done), the freed
-// calls are the LAST ones — the held position shifts earlier, since results deliver
-// in call order and the rejection lands on the first call not bound to a surviving
-// buffered value.
+// draining = called result.return() while pulling or mapping
+// we need to wait for it to finish giving us the inner iterator so we can close it
 type DrainingState = {
   type: 'draining',
   resolveReturn: (v: unknown) => void,
@@ -143,26 +133,18 @@ class FlatMapHelper {
 
     fastPromiseTry(() => actualIter.next()).then(
       iterResult => {
-        // got iterator result from non-underlying iterator
+        // got iterator result from inner iterator
 
         if (slot.type === 'removed') return;
         ASSERT(slot.type === 'awaiting', 'slot awaiting');
 
         if ((iterResult as { done: boolean }).done) {
-          // Find the current index: earlier slots of this iterator may have been
-          // delivered (and shifted off) since this pull was issued, so an index
-          // captured at issue time would be stale.
+          // I am assuming this can be done cheaply, possibly with a slightly different data structure
+          // though also in practice N is small enough for it not to matter
           const currentIndex = thisIterValues.indexOf(slot);
           const removedCount = thisIterValues.length - currentIndex;
           ASSERT(removedCount > 0, 'have not already truncated this value');
 
-          // Does removing these slots change the head of the queue (revealing
-          // something that was buffered behind this iterator)? Only if this pull was
-          // the head of its own iterator (currentIndex === 0) AND that iterator is
-          // the front of the closed queue — then truncation pops it and the next
-          // entry becomes the head. (While `inFlight` is still the active iterator it
-          // isn't in the closed queue, so this is false; and nothing is buffered
-          // behind the active iterator anyway.) Capture before truncating pops it.
           const exposedNewHead = currentIndex === 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight.values;
 
           ASSERT(this.#closedButStillHaveValuesInFlight.includes(inFlight.values) || this.#active === inFlight, 'inFlight is still tracked');
@@ -184,24 +166,13 @@ class FlatMapHelper {
               }
             }
           } else if (this.#active.type === 'reading underlying') {
-            // The freed demand is absorbed by the iterator the in-flight underlying
-            // pull will produce.
             this.#active.requested += removedCount;
-          } else if (this.#active.type === 'draining') {
-            // We will NOT pull anything more, so these parked slots can never receive
-            // a value: done their calls now. Results deliver in call order, so the
-            // call held for the in-flight pull/mapper (the position a rejection would
-            // land on) is the first one not bound to a surviving buffered value — the
-            // freed calls are the LAST `removedCount`, shifting the held position
-            // earlier. (Draining always logically requests exactly one held value.)
-            this.#markSomeCallsAsNoLongerGettingValues(removedCount);
           } else {
-            ASSERT(this.#active.type === 'error' || this.#active.type === 'finished', 'active is error or finished');
+            ASSERT(this.#active.type === 'error' || this.#active.type === 'draining' || this.#active.type === 'finished', 'no longer issuing pulls');
 
             this.#markSomeCallsAsNoLongerGettingValues(removedCount);
           }
 
-          // If we popped the front of the queue, deliver from whatever it revealed.
           if (exposedNewHead) {
             this.#processQueue();
           }
@@ -217,7 +188,7 @@ class FlatMapHelper {
         }
       },
       error => {
-        // got error from non-underlying iterator
+        // got error from inner iterator
 
         if (slot.type === 'removed') return;
         ASSERT(slot.type === 'awaiting', 'slot awaiting');
@@ -233,26 +204,16 @@ class FlatMapHelper {
 
           if (active === inFlight) {
             // just gotta close underlying
+            // this will also call processQueue if necessary
             this.#closeUnderlyingForError(slotButWithTypeScript as ErrorState);
           } else {
-            // The errored slot lives in an iterator that already reported done (it's
-            // parked in the closed queue); a *different* iterator (`active`) is still
-            // live. Two things are open: `active` and the underlying. Close them
-            // sequentially — the active inner iterator first, then the underlying,
-            // matching the order return() uses — and surface the error only once both
-            // closes have settled. Errors from either .return() are swallowed.
-            //
-            // `active`'s already-requested pulls are NOT discarded: an error stops new
-            // pulls, but values already in flight still deliver to their calls, so
-            // `active` stays parked above (as an explicit return() would leave them).
+            // gotta close both underlying and active
             const activeIter = active.iter;
-            // Commit the call (if any) waiting on this slot before the closes settle,
-            // so onClosed has a rejector to invoke; otherwise we mark it ready.
             if (this.#isHeadOfQueue(slot)) {
               this.#processQueue();
             }
+
             const onClosed = () => {
-              // runs on either settlement of underlying.return(), swallowing its error
               if (slotButWithTypeScript.reject) {
                 ASSERT((slot as Slot).type !== 'removed', 'slot not removed');
                 slotButWithTypeScript.reject(error);
@@ -262,42 +223,18 @@ class FlatMapHelper {
                 ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
               }
             };
-            const closeUnderlying = () => {
-              // runs on either settlement of activeIter.return(), swallowing its error
-              fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.()).then(onClosed, onClosed);
-            };
-            fastPromiseTry(() => (activeIter as MaybeReturnable).return?.()).then(closeUnderlying, closeUnderlying);
+            this.#closeInnerThenUnderlying(activeIter).then(onClosed, onClosed);
           }
           return;
         }
         if (this.#active.type === 'reading underlying') {
-          // TODO if we have already invoked #fn, the result might be an iterator, which we would need to close... which also means waiting for it...
-          // also means distinguish 'reading underlying' vs 'waiting for mapper'
-          // maybe we can make _the subsequent { done: true }_ wait??? it must exist b/c it was waiting for this value. need to think more / about other cases / effects on filter etc.
-
-          // The errored slot belongs to a parked iterator; we were reading the
-          // underlying for the NEXT iterator. That pending demand sits after the
-          // error and was never bound to a pull, so it can never be filled: done it.
+          // TODO this needs to transition to draining, not finished, and do that whole dance
           this.#markSomeCallsAsNoLongerGettingValues(this.#active.requested);
           this.#active = { type: 'finished' };
           this.#closeUnderlyingForError(slotButWithTypeScript as ErrorState);
           return;
-          // TODO do exceptions from the fn call at this point go into unhandled promise rejection
         }
-        if (this.#active.type === 'draining') {
-          // A parked iterator errored while we were draining the in-flight underlying
-          // pull. Draining proceeds unaffected: the closes happen when that pull and
-          // the mapper settle, and the held call remains the sink for a rejection
-          // from them. This error just parks in order like any other; there is
-          // nothing to close for it, since the closes are the draining flow's
-          // responsibility.
-          (slot as ErrorState).closeState = 'ready';
-          if (this.#isHeadOfQueue(slot)) {
-            this.#processQueue();
-          }
-          return;
-        }
-        ASSERT(this.#active.type === 'error' || this.#active.type === 'finished', 'active is error or finished');
+        ASSERT(this.#active.type === 'error' || this.#active.type === 'draining' || this.#active.type === 'finished', 'no longer issuing pulls');
         // nothing to close in this case
         (slot as ErrorState).closeState = 'ready';
         if (this.#isHeadOfQueue(slot)) {
@@ -351,7 +288,7 @@ class FlatMapHelper {
   // settle before the underlying's is invoked. Resolves done unless a close failed,
   // in which case it rejects with that error, the inner close taking precedence
   // (though the underlying close still happens).
-  #closeInnerThenUnderlying(inner: unknown) {
+  #closeInnerThenUnderlying(inner: unknown): Promise<unknown> {
     // todo fast path for missing returns
     return fastPromiseTry(() => (inner as MaybeReturnable).return?.()).then(
       () => {

@@ -231,7 +231,7 @@ class FlatMapHelper {
                 ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
               }
             };
-            this.#closeInnerThenUnderlying(activeIter).then(onClosed, onClosed);
+            this.#closeInnerThenUnderlying(activeIter as MaybeReturnable, onClosed);
           }
           return;
         }
@@ -309,18 +309,16 @@ class FlatMapHelper {
     }
   }
 
-  #closeInnerThenUnderlying(inner: unknown): Promise<unknown> {
-    return new Promise((res, rej) => {
-      this.#closeIterThen(inner as MaybeReturnable, (gotError, error) => {
-        this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError2, error2) => {
-          if (gotError) {
-            rej(error);
-          } else if (gotError2) {
-            rej(error2);
-          } else {
-            res({ done: true, value: undefined }); // TODO
-          }
-        });
+  #closeInnerThenUnderlying(inner: MaybeReturnable, next: (gotError: boolean, error?: unknown) => void) {
+    this.#closeIterThen(inner, (gotError, error) => {
+      this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError2, error2) => {
+        if (gotError) {
+          next(true, error);
+        } else if (gotError2) {
+          next(true, error2);
+        } else {
+          next(false);
+        }
       });
     });
   }
@@ -369,12 +367,11 @@ class FlatMapHelper {
             if (active.type === 'draining') {
               // we just close, not pull
               this.#active = { type: 'finished' };
-              const close = this.#closeInnerThenUnderlying(actualIter);
               if (active.errorSlot) {
-                close.then(() => this.#commitError(active.errorSlot), () => this.#commitError(active.errorSlot));
+                this.#closeInnerThenUnderlying(actualIter as MaybeReturnable, () => this.#commitError(active.errorSlot));
               } else {
                 this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
-                active.resolveReturn(close);
+                this.#closeInnerThenUnderlying(actualIter as MaybeReturnable, (gotError, error) => gotError ? active.resolveReturn(Promise.reject(error)) : active.resolveReturn({ done: true, value: undefined })); // TODO just store the rejector
               }
               return;
             }
@@ -429,7 +426,7 @@ class FlatMapHelper {
     if (active.type === 'draining') {
       if (active.errorSlot) {
         this.#active = { type: 'finished' };
-        this.#closeUnderlyingThen((gotError, error) => {
+        this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => {
           this.#commitError(active.errorSlot)
         });
       } else {
@@ -452,7 +449,7 @@ class FlatMapHelper {
       this.#processQueue();
     }
 
-    this.#closeUnderlyingThen((gotError, error) => {
+    this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => {
       // we don't actually care if calling return threw
       ASSERT(slot.closeState === 'awaiting-return', 'slot awaiting-return');
       const slotButWithTypeScript = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
@@ -480,11 +477,6 @@ class FlatMapHelper {
     } else {
       Promise.resolve(returnPromise).then(() => next(false), e => next(true, e));
     }
-
-  }
-
-  #closeUnderlyingThen(next: (gotError: boolean, error?: unknown) => void): void {
-    this.#closeIterThen(this.#underlying as MaybeReturnable, next);
   }
 
   // returns false if was awaiting
@@ -590,6 +582,8 @@ class FlatMapHelper {
     // TODO order of truncation vs resolving this Promise
     const active = this.#active as InFlight;
     this.#markUnderlyingAsFinished();
-    return this.#closeInnerThenUnderlying(active.iter);
+    return new Promise((res, rej) => {
+      this.#closeInnerThenUnderlying(active.iter as MaybeReturnable, (gotError, error) => gotError ? rej(error) : res({ done: true, value: undefined }));
+    })
   }
 }

@@ -309,25 +309,20 @@ class FlatMapHelper {
     }
   }
 
-  // Close `inner` and then the underlying, sequentially — the inner's .return() must
-  // settle before the underlying's is invoked. Resolves done unless a close failed,
-  // in which case it rejects with that error, the inner close taking precedence
-  // (though the underlying close still happens).
   #closeInnerThenUnderlying(inner: unknown): Promise<unknown> {
-    // todo fast path for missing returns
-    return fastPromiseTry(() => (inner as MaybeReturnable).return?.()).then(
-      () => {
-        // TODO strictly speaking we need to check for object-ness of the return value here
-        // or, change the spec to never do that, because it's dumb
-        return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
-          .then(() => ({ value: undefined, done: true }));
-      },
-      error => {
-        // this error squashes errors from closing underlying
-        return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
-          .finally(() => Promise.reject(error));
-      },
-    );
+    return new Promise((res, rej) => {
+      this.#closeIterThen(inner as MaybeReturnable, (gotError, error) => {
+        this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError2, error2) => {
+          if (gotError) {
+            rej(error);
+          } else if (gotError2) {
+            rej(error2);
+          } else {
+            res({ done: true, value: undefined }); // TODO
+          }
+        });
+      });
+    });
   }
 
   #issuePullFromUnderlying(requested: number) {
@@ -434,8 +429,9 @@ class FlatMapHelper {
     if (active.type === 'draining') {
       if (active.errorSlot) {
         this.#active = { type: 'finished' };
-        fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
-          .then(() => this.#commitError(active.errorSlot), () => this.#commitError(active.errorSlot));
+        this.#closeUnderlyingThen((gotError, error) => {
+          this.#commitError(active.errorSlot)
+        });
       } else {
         this.#drainingErrorFromMapper(active, error);
       }
@@ -470,10 +466,10 @@ class FlatMapHelper {
   }
 
   // this is very zalgo but whatever
-  #closeUnderlyingThen(next: (gotError: boolean, error?: unknown) => void): void {
+  #closeIterThen(iter: MaybeReturnable, next: (gotError: boolean, error?: unknown) => void): void {
     let returnPromise;
     try {
-      returnPromise = (this.#underlying as MaybeReturnable).return?.();
+      returnPromise = iter.return?.();
     } catch (error) {
       next(true, error);
       return;
@@ -484,6 +480,11 @@ class FlatMapHelper {
     } else {
       Promise.resolve(returnPromise).then(() => next(false), e => next(true, e));
     }
+
+  }
+
+  #closeUnderlyingThen(next: (gotError: boolean, error?: unknown) => void): void {
+    this.#closeIterThen(this.#underlying as MaybeReturnable, next);
   }
 
   // returns false if was awaiting

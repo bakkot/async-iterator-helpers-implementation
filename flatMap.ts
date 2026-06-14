@@ -278,9 +278,7 @@ class FlatMapHelper {
     if (this.#isHeadOfQueue(slot)) {
       this.#processQueue();
     }
-    const uClose = fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.());
-    const onClosed = () => {
-      // runs on either settlement of underlying.return(), swallowing its error
+    this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, closeError) => {
       const s = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
       if (s.reject) {
         s.reject(error);
@@ -288,11 +286,14 @@ class FlatMapHelper {
         (slot as ErrorState).closeState = 'ready';
         ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
       }
-    };
-    uClose.then(onClosed, onClosed);
-    // Registered after the rejection reaction above so the held call rejects before
-    // result.return() settles; a failed close rejects result.return().
-    d.resolveReturn!(uClose.then(() => ({ value: undefined, done: true })));
+
+      // TODO ordering for this vs above rejection
+      if (gotError) {
+        d.resolveReturn!(Promise.reject(closeError));
+      } else {
+        d.resolveReturn!({ value: undefined, done: true }); // TODO just hold the rejector
+      }
+    });
   }
 
   // we were holding this error until some event finished, and it now has
@@ -556,8 +557,9 @@ class FlatMapHelper {
       // closes the underlying. (No outstanding calls exist: the first next() would
       // have moved us out of 'unstarted'.)
       this.#active = { type: 'finished' };
-      return fastPromiseTry(() => (this.#underlying as MaybeReturnable).return?.())
-        .then(() => ({ value: undefined, done: true }));
+      return new Promise((res, rej) => {
+        this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => gotError ? rej(error) : res({ value: undefined, done: true }));
+      });
     }
     if (this.#active.type === 'error' || this.#active.type === 'draining' || this.#active.type === 'finished') {
       return Promise.resolve({ value: undefined, done: true });
@@ -583,7 +585,7 @@ class FlatMapHelper {
     const active = this.#active as InFlight;
     this.#markUnderlyingAsFinished();
     return new Promise((res, rej) => {
-      this.#closeInnerThenUnderlying(active.iter as MaybeReturnable, (gotError, error) => gotError ? rej(error) : res({ done: true, value: undefined }));
-    })
+      this.#closeInnerThenUnderlying(active.iter as MaybeReturnable, (gotError, error) => gotError ? rej(error) : res({ value: undefined, done: true }));
+    });
   }
 }

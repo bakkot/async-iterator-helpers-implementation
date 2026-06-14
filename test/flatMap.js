@@ -733,6 +733,79 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
+// An inner iterator errors *while we are already reading the underlying for the
+// next iterator*. That earlier inner error closes the stream, but unlike a
+// straightforward inner error (test 014/016) there is an in-flight underlying
+// pull — and the iterator IT is about to produce — that must still be closed
+// before the error is surfaced. This is the error-driven twin of the "return()
+// while reading the underlying" dance (test 018): no result.return() is in
+// flight, so the held position is the error slot itself. Concretely, A keeps
+// pull #0 in flight and reports done at #1, redirecting demand 2 to a fresh
+// underlying pull (u1); then A's #0 rejects. We must wait for u1 (and the inner
+// iterator B it produces) and close BOTH B and the underlying, in order, before
+// the error reaches r0.
+tests.push(scenarioTest({
+  id: "flatmap-test-064",
+  helper: "flatMap",
+  label: "flatMap: an earlier inner error while reading the underlying still closes the produced iterator and the underlying",
+  ticks: [
+    { note: "three concurrent calls, one underlying pull", steps: [ { events: [
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "next", result: "r2" },
+      { type: "pull", pull: "u0" },
+    ] } ] },
+    { note: "the mapper is invoked once", steps: [ { events: [
+      { type: "settle", pull: "u0", value: 1 },
+      { type: "fn", call: "p0", arg: 1, from: "u0" },
+    ] } ] },
+    { note: "demand 3 fans out across A", steps: [ { events: [
+      { type: "fn-settle", call: "p0", iterator: "A" },
+      { type: "inner-pull", pull: "a0", iterator: "A" },
+      { type: "inner-pull", pull: "a1", iterator: "A" },
+      { type: "inner-pull", pull: "a2", iterator: "A" },
+    ] } ] },
+    // A keeps #0 in flight and reports done at #1: A's #0 is queued ahead; the
+    // freed demand (2) is redirected to a fresh underlying pull. We are now
+    // reading the underlying for the next iterator.
+    { note: "inner done redirects the freed demand to another underlying pull", steps: [ { events: [
+      { type: "settle", pull: "a1", done: true },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    // A's still-in-flight #0 now ERRORS. This closes the stream, but the
+    // underlying pull (u1) is in flight: nothing is closed yet. The two
+    // redirected trailing calls (r1, r2) can never get a value -> done eagerly.
+    // r0 (tied to A's #0) is held for the error.
+    { note: "the earlier inner error dones the trailing calls but defers the closes", steps: [ { events: [
+      { type: "settle", pull: "a0", error: "boom" },
+      { type: "result", result: "r1", done: true },
+      { type: "result", result: "r2", done: true },
+    ] } ] },
+    // The in-flight underlying value is still mapped — we must close whatever it
+    // produces.
+    { note: "the in-flight underlying value is mapped", steps: [ { events: [
+      { type: "settle", pull: "u1", value: 2 },
+      { type: "fn", call: "p1", arg: 2, from: "u1" },
+    ] } ] },
+    // The produced iterator B is closed without being pulled (it was never
+    // pulled, so there is no .return()-after-done hazard).
+    { note: "the produced iterator is closed without being pulled", steps: [ { events: [
+      { type: "fn-settle", call: "p1", iterator: "B" },
+      { type: "close", target: "B" },
+    ] } ] },
+    // Closes are sequential: the underlying is closed only once B's close settles.
+    { note: "once the inner close settles, the underlying closes", steps: [ { events: [
+      { type: "close-settled", target: "B" },
+      { type: "close", target: "source" },
+    ] } ] },
+    // Only once the underlying close settles does the error reach the held call.
+    { note: "once the underlying close settles, the error reaches the held call", steps: [ { events: [
+      { type: "close-settled", target: "source" },
+      { type: "result", result: "r0", error: "boom" },
+    ] } ] },
+  ],
+}, { helper: flatMap, utils }));
+
 // --- return() ---------------------------------------------------------------
 //
 // return() means "no more demand". It closes whatever is still open — the active
@@ -1612,13 +1685,17 @@ tests.push(scenarioTest({
 
 // A pull of an ALREADY-PARKED iterator rejects while the helper is between inner
 // iterators (reading the underlying for the next one). The error belongs to the
-// parked iterator's position, so it closes the underlying and reaches that call;
+// parked iterator's position and will close the underlying and reach that call;
 // the demand that was coalesced for the NEXT iterator sits after the error and can
-// never be filled, so those calls settle done.
+// never be filled, so those calls settle done. But the in-flight underlying pull
+// might still produce an iterator that has to be closed, so — like return() while
+// reading the underlying — nothing closes until that pull settles. Here it settles
+// DONE: the underlying exhausted itself, so nothing is closed at all (see test 047
+// for the mapper-reject completion and test 064 for the value/iterator one).
 tests.push(scenarioTest({
   id: "flatmap-test-036",
   helper: "flatMap",
-  label: "flatMap: a parked-iterator pull error while reading underlying dones the pending demand",
+  label: "flatMap: a parked-iterator pull error while reading underlying defers the close and dones the pending demand",
   ticks: [
     { note: "two coalesced calls, one underlying pull", steps: [ { events: [
       { type: "next", result: "r0" },
@@ -1640,15 +1717,19 @@ tests.push(scenarioTest({
       { type: "settle", pull: "a1", done: true },
       { type: "pull", pull: "u1" },
     ] } ] },
-    // A's parked pull #0 now rejects. It closes the underlying and its error reaches
-    // r0; the pending demand for the next iterator (r1) can never be filled -> done.
-    { note: "the underlying closes, the pending demand is doned, then the error surfaces", steps: [ { events: [
+    // A's parked pull #0 now rejects while the underlying pull (u1) is in flight.
+    // We are committed to closing, but nothing is closed yet — that pull might
+    // produce an iterator to close. The pending demand for the next iterator (r1)
+    // can never be filled -> done eagerly; r0 (tied to A's #0) is held.
+    { note: "the parked-iterator error dones the pending demand but defers the close", steps: [ { events: [
       { type: "settle", pull: "a0", error: "boom" },
-      { type: "close", target: "source" },
       { type: "result", result: "r1", done: true },
     ] } ] },
-    { steps: [ { events: [
-      { type: "close-settled", target: "source" },
+    // The in-flight underlying pull reports done: a clean done does not close the
+    // source, and there is no iterator to close, so nothing is closed at all and
+    // A's error surfaces to r0.
+    { note: "the underlying exhausts itself: nothing to close, the error surfaces", steps: [ { events: [
+      { type: "settle", pull: "u1", done: true },
       { type: "result", result: "r0", error: "boom" },
     ] } ] },
   ],
@@ -2166,13 +2247,16 @@ tests.push(scenarioTest({
 
 // One error from an inner iterator, one from the mapper. A is parked with pull #0
 // in flight (feeding r0); the freed demand is mid-mapper for the NEXT iterator
-// (feeding r1). The parked inner rejects FIRST: while "reading underlying" that
-// closes the underlying, dones the pending demand (r1), and A's error reaches r0.
-// The still-pending mapper then rejecting is harmlessly ignored (already finished).
+// (feeding r1). The parked inner rejects FIRST: A owns the stream and the pending
+// demand (r1) is doned, but the close is DEFERRED until the in-flight mapper
+// settles (it might produce an iterator to close). The mapper then rejects: that
+// faults the underlying, so it is closed — A's error, not the mapper's, surfaces
+// to r0 once the close settles. (The mapper-completion twin of test 036's
+// underlying-done and test 064's value/iterator completions.)
 tests.push(scenarioTest({
   id: "flatmap-test-047",
   helper: "flatMap",
-  label: "flatMap: an inner error then a mapper error (inner first) ignores the late mapper error",
+  label: "flatMap: an inner error then a mapper error (inner first) closes via the mapper rejection and surfaces the inner error",
   ticks: [
     { note: "two coalesced calls, one underlying pull", steps: [ { events: [
       { type: "next", result: "r0" },
@@ -2196,21 +2280,24 @@ tests.push(scenarioTest({
       { type: "settle", pull: "u1", value: 2 },
       { type: "fn", call: "p1", arg: 2, from: "u1" },
     ] } ] },
-    // A's parked pull rejects while the mapper is pending: close the underlying,
-    // done the pending demand (r1), and surface A's error to r0.
-    { note: "the underlying closes, the pending demand is doned, then A errors to r0", steps: [ { events: [
+    // A's parked pull rejects while the mapper is pending. A owns the stream; the
+    // pending demand (r1) is doned, but nothing closes yet — we must let the mapper
+    // settle first. r0 (tied to A's #0) is held.
+    { note: "the parked-iterator error dones the pending demand but defers the close", steps: [ { events: [
       { type: "settle", pull: "a0", error: "boomA" },
-      { type: "close", target: "source" },
       { type: "result", result: "r1", done: true },
     ] } ] },
+    // The mapper now rejects. It produced no iterator, but a mapper fault closes the
+    // underlying; the mapper's own error (boomM) is swallowed since A already owns
+    // the stream.
+    { note: "the mapper rejection closes the underlying; its own error is swallowed", steps: [ { events: [
+      { type: "fn-settle", call: "p1", error: "boomM" },
+      { type: "close", target: "source" },
+    ] } ] },
+    // Only once the underlying close settles does A's error reach r0.
     { steps: [ { events: [
       { type: "close-settled", target: "source" },
       { type: "result", result: "r0", error: "boomA" },
-    ] } ] },
-    // The still-pending mapper now rejects: the helper is already finished, so it is
-    // ignored (no extra close, no surfaced error).
-    { note: "the late mapper rejection is ignored", steps: [ { events: [
-      { type: "fn-settle", call: "p1", error: "boomM" },
     ] } ] },
   ],
 }, { helper: flatMap, utils }));

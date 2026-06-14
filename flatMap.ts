@@ -60,7 +60,7 @@ type ActiveState =
   | { type: 'unstarted' }
   | ReadingUnderlyingState
   | DrainingState
-  | ErrorState // specifically this means an error when reading from underlying or invoking the mapper
+  | ErrorState // specifically in this position this means an error when reading from underlying or invoking the mapper
   | InFlight
   | { type: 'finished' } // but still might be outstanding earlier calls, to be settled by closedButStillHaveValuesInFlight
 
@@ -73,7 +73,6 @@ class FlatMapHelper {
   #fn: unknown;
 
   // holds the .values arrays of closed iterators (not the InFlight objects, so the iterators themselves can be GC'd)
-  // invariant: index [0] is non-empty
   readonly #closedButStillHaveValuesInFlight: Slot[][] = [];
 
   #active: ActiveState = { type: 'unstarted' };
@@ -132,7 +131,7 @@ class FlatMapHelper {
   #issuePullFromCurrentActive() {
     ASSERT(this.#active.type === 'iter', 'active is iter');
 
-    const slot: Slot = { type: 'awaiting' } as Slot; // the cast is not a no-op
+    const slot = { type: 'awaiting' } as Slot;
     const inFlight = this.#active as InFlight;
     const thisIterValues = inFlight.values;
     thisIterValues.push(slot);
@@ -261,39 +260,6 @@ class FlatMapHelper {
     }
     this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#valuesWeCouldDeliverFromClosedInnerIterators());
     this.#active = { type: 'finished' };
-  }
-
-  // The underlying produced a value while draining but we failed to map it (the
-  // mapper threw or rejected, or obtaining the inner iterator threw). Like any
-  // mapper error this closes the underlying — deferred until now — and the error
-  // surfaces to the held call (the first call not bound to a buffered value) only
-  // once that close settles. result.return() then settles from the close's outcome.
-  #drainingErrorFromMapper(d: DrainingState, error: unknown) {
-    ASSERT(this.#active === d, 'active is the draining state');
-    ASSERT(d.resolveReturn != null, 'draining-from-return, not draining-from-error');
-    const slot: ErrorState = { type: 'error', error, closeState: 'awaiting-return', reject: null };
-    this.#active = slot;
-    // Commit the call (if this is the head) so the close reaction has a rejector;
-    // otherwise it surfaces when it reaches the head.
-    if (this.#isHeadOfQueue(slot)) {
-      this.#processQueue();
-    }
-    this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, closeError) => {
-      const s = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
-      if (s.reject) {
-        s.reject(error);
-      } else {
-        (slot as ErrorState).closeState = 'ready';
-        ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
-      }
-
-      // TODO ordering for this vs above rejection
-      if (gotError) {
-        d.resolveReturn!(Promise.reject(closeError));
-      } else {
-        d.resolveReturn!({ value: undefined, done: true }); // TODO just hold the rejector
-      }
-    });
   }
 
   // we were holding this error until some event finished, and it now has
@@ -431,7 +397,27 @@ class FlatMapHelper {
           this.#commitError(active.errorSlot)
         });
       } else {
-        this.#drainingErrorFromMapper(active, error);
+        const slot: ErrorState = { type: 'error', error, closeState: 'awaiting-return', reject: null };
+        this.#active = slot;
+        if (this.#isHeadOfQueue(slot)) {
+          this.#processQueue();
+        }
+        this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, closeError) => {
+          const s = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
+          if (s.reject) {
+            s.reject(error);
+          } else {
+            (slot as ErrorState).closeState = 'ready';
+            ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
+          }
+
+          // TODO ordering for this vs above rejection
+          if (gotError) {
+            active.resolveReturn!(Promise.reject(closeError));
+          } else {
+            active.resolveReturn!({ value: undefined, done: true }); // TODO just hold the rejector
+          }
+        });
       }
       return;
     }
@@ -486,6 +472,7 @@ class FlatMapHelper {
     if (head.type === 'awaiting') {
       return false;
     }
+    ASSERT(head.type === 'value' || head.type === 'error', 'can only dispatch value or error');
     values.shift();
     if (head.type === 'value') {
       this.#calls.shift()!.resolve({ value: head.value, done: false });
@@ -497,9 +484,6 @@ class FlatMapHelper {
         ASSERT(head.closeState === 'ready', 'closeState ready');
         call.reject(head.error);
       }
-    } else {
-      console.error('unreachable');
-      throw new Error('unreachable');
     }
     return true;
   }
@@ -553,9 +537,6 @@ class FlatMapHelper {
 
   return() {
     if (this.#active.type === 'unstarted') {
-      // Nothing has been pulled yet, but — as in map and filter — return() still
-      // closes the underlying. (No outstanding calls exist: the first next() would
-      // have moved us out of 'unstarted'.)
       this.#active = { type: 'finished' };
       return new Promise((res, rej) => {
         this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => gotError ? rej(error) : res({ value: undefined, done: true }));
@@ -566,21 +547,12 @@ class FlatMapHelper {
     }
 
     if (this.#active.type === 'reading underlying') {
-      // A pull from the underlying is in flight (possibly with the mapper also
-      // pending). We're committed to closing, so we will NOT pull whatever iterator
-      // that pull produces. The bound demand can't receive a value, so done the
-      // trailing surplus eagerly and HOLD the head-most bound call (the position a
-      // pull/mapper rejection would land on). Nothing is closed yet: when the
-      // pull/mapper settle we close the iterator they produced (if any) and then
-      // the underlying, and the promise returned here settles with that outcome.
-      this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#valuesWeCouldDeliverFromClosedInnerIterators() - 1);
+      this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#valuesWeCouldDeliverFromClosedInnerIterators() - 1); // -1 for the slot we hold open in case of errors from the pull/mapper
       const { resolve, promise } = Promise.withResolvers();
       this.#active = { type: 'draining', resolveReturn: resolve, errorSlot: null };
       return promise;
     }
 
-    // active is an inner iterator. Park it (its in-flight pulls keep delivering),
-    // then close it and the underlying in sequence — active iterator first.
     // TODO order of truncation vs resolving this Promise
     const active = this.#active as InFlight;
     this.#markUnderlyingAsFinished();

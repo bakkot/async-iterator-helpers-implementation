@@ -25,7 +25,7 @@ type Slot =
   | ErrorState
   | { type: 'removed' } // i.e. we already got { done: true } for this iterator at an earlier position
 
-type InFlight = { type: 'iter', iter: unknown, readonly values: Slot[] }
+type ActiveInnerIterState = { type: 'iter', iter: unknown, readonly values: Slot[] } // invariant: values.length > 0
 
 // For errors from the mapper or from result iterators, we invoke .return() on
 // whatever is still open (the underlying, and possibly an active inner iterator).
@@ -64,7 +64,7 @@ type ActiveState =
   | ReadingUnderlyingState
   | DrainingState
   | ErrorState // specifically in this position this means an error when reading from underlying or invoking the mapper
-  | InFlight
+  | ActiveInnerIterState // invariant: while active,
   | { type: 'finished' } // but still might be outstanding earlier calls, to be settled by closedButStillHaveValuesInFlight
 
 
@@ -88,9 +88,8 @@ class FlatMapHelper {
     this.#fn = fn;
   }
 
-  #issuePullFromUnderlying(requested: number) {
-    ASSERT(this.#active.type === 'unstarted' || this.#active.type === 'iter', 'active is unstarted or iter'); // latter case is when we just got { done: true } from previous active
-    this.#active = { type: 'reading underlying', requested };
+  #issuePullFromUnderlying() {
+    ASSERT(this.#active.type === 'reading underlying', 'pull from underlying only after setting state appropriately');
 
     fastPromiseTry(() => (this.#underlying as Nextable).next()).then(
       r => {
@@ -189,7 +188,7 @@ class FlatMapHelper {
     ASSERT(this.#active.type === 'iter', 'we have an active iterator');
 
     const slot = { type: 'awaiting' } as Slot;
-    const inFlight = this.#active as InFlight;
+    const inFlight = this.#active as ActiveInnerIterState;
     const thisIterValues = inFlight.values;
     thisIterValues.push(slot);
 
@@ -241,7 +240,8 @@ class FlatMapHelper {
               if (currentIndex > 0) {
                 this.#closedButStillHaveValuesInFlight.push(this.#active.values);
               }
-              this.#issuePullFromUnderlying(removedCount);
+              this.#active = { type: 'reading underlying', requested: removedCount };
+              this.#issuePullFromUnderlying();
             } else {
               // i.e., we got a { done: true } from an inner iterator we already considered to be done
               // we just discared any subsequent Promises from said iterator
@@ -288,11 +288,9 @@ class FlatMapHelper {
         if (this.#active.type === 'iter') {
           slotButWithTypeScript.closeState = 'awaiting-return';
           const active = this.#active;
+          ASSERT(active.values.length > 0, 'active has at least one outstanding');
           this.#closedButStillHaveValuesInFlight.push(active.values);
           this.#active = { type: 'finished' };
-          if (this.#isHeadOfQueue(slot)) {
-            this.#processQueue();
-          }
 
           if (active === inFlight) {
             // just gotta close underlying
@@ -307,16 +305,13 @@ class FlatMapHelper {
           slotButWithTypeScript.closeState = 'awaiting-return';
           this.#markSomeCallsAsNoLongerGettingValues(this.#active.requested);
           this.#active = { type: 'draining', resolveReturn: null, errorSlot: slotButWithTypeScript };
-          if (this.#isHeadOfQueue(slot)) {
-            this.#processQueue();
-          }
         } else {
           ASSERT(this.#closed(), 'no longer issuing pulls');
           // nothing to close in this case
           (slot as ErrorState).closeState = 'ready';
-          if (this.#isHeadOfQueue(slot)) {
-            this.#processQueue();
-          }
+        }
+        if (this.#isHeadOfQueue(slot)) {
+          this.#processQueue();
         }
       },
     );
@@ -333,7 +328,8 @@ class FlatMapHelper {
       slotButWithTypescript.reject(slot.error);
     } else {
       (slot as ErrorState).closeState = 'ready';
-      ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
+      // if this is head of queue, caller is responsible for dealing with that
+      // this is generally only possible if the above-mentioned events we were waiting for took zero ticks
     }
   }
 
@@ -511,7 +507,8 @@ class FlatMapHelper {
     const { resolve, reject, promise } = Promise.withResolvers();
     this.#calls.push({ resolve, reject });
     if (this.#active.type === 'unstarted') {
-      this.#issuePullFromUnderlying(1);
+      this.#active = { type: 'reading underlying', requested: 1 };
+      this.#issuePullFromUnderlying();
     } else if (this.#active.type === 'reading underlying') {
       ++this.#active.requested;
     } else {
@@ -540,7 +537,7 @@ class FlatMapHelper {
     }
 
     // TODO order of truncation vs resolving this Promise
-    const active = this.#active as InFlight;
+    const active = this.#active as ActiveInnerIterState;
     this.#markUnderlyingAsFinished();
     this.#active = { type: 'finished' };
     return new Promise((res, rej) => {

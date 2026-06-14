@@ -452,23 +452,12 @@ class FlatMapHelper {
     ASSERT(slot.type === 'error', 'slot is error');
     ASSERT(slot.closeState === 'awaiting-return', 'slot awaiting-return');
 
-    let returnPromise;
-    try {
-      returnPromise = (this.#underlying as MaybeReturnable).return?.();
-    } catch {
-      // synchronous throw from it.return() gets swallowed
-    }
-    if (returnPromise === undefined) {
-      slot.closeState = 'ready';
-      if (this.#isHeadOfQueue(slot)) {
-        this.#processQueue();
-      }
-      return;
-    }
     if (this.#isHeadOfQueue(slot)) {
       this.#processQueue();
     }
-    const onClosed = () => {
+
+    this.#closeUnderlyingThen((gotError, error) => {
+      // we don't actually care if calling return threw
       ASSERT(slot.closeState === 'awaiting-return', 'slot awaiting-return');
       const slotButWithTypeScript = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
       if (slotButWithTypeScript.reject) {
@@ -477,9 +466,24 @@ class FlatMapHelper {
         slot.closeState = 'ready';
         ASSERT(!this.#isHeadOfQueue(slot), 'not head of queue');
       }
-    };
-    // TODO fast path for non-promise?
-    Promise.resolve(returnPromise).then(onClosed, onClosed);
+    });
+  }
+
+  // this is very zalgo but whatever
+  #closeUnderlyingThen(next: (gotError: boolean, error?: unknown) => void): void {
+    let returnPromise;
+    try {
+      returnPromise = (this.#underlying as MaybeReturnable).return?.();
+    } catch (error) {
+      next(true, error);
+      return;
+    }
+    // TODO fast path for non-promise in general?
+    if (!returnPromise) {
+      next(false);
+    } else {
+      Promise.resolve(returnPromise).then(() => next(false), e => next(true, e));
+    }
   }
 
   // returns false if was awaiting

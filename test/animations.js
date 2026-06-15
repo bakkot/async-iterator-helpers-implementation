@@ -1,7 +1,7 @@
 // A failure here means the story an animation tells differs from what the implementation actually does.
 
 import { map } from '../map.js';
-import { filter } from '../filter.js';
+import { filter } from '../filter.ts';
 import { flatMap } from '../flatMap.ts';
 import * as utils from './utils.js';
 import { scenarioTest } from './scenario-to-test.js';

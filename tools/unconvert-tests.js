@@ -30,7 +30,7 @@ const scenariosDir = join(root, '..', 'async-iterator-animations', 'scenarios');
 
 const CONFIGS = [
   { helper: 'map', helperFile: 'map.js', itVar: 'mapped', src: 'map-test-scenarios.js', out: 'test/roundtrip-map.js' },
-  { helper: 'filter', helperFile: 'filter.js', itVar: 'f', src: 'filter-test-scenarios.js', out: 'test/roundtrip-filter.js' },
+  { helper: 'filter', helperFile: 'filter.ts', itVar: 'f', src: 'filter-test-scenarios.js', out: 'test/roundtrip-filter.js' },
   { helper: 'flatMap', helperFile: 'flatMap.ts', itVar: 'fm', src: 'flatmap-test-scenarios.js', out: 'test/roundtrip-flatMap.js' },
 ];
 

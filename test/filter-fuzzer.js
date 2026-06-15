@@ -17,7 +17,7 @@
 // re-runs that exact schedule deterministically.
 
 import { parseArgs } from 'node:util';
-import { filter } from '../filter.js';
+import { filter } from '../filter.ts';
 
 // Adaptive microtask drain. A single action can trigger a synchronous cascade
 // of sync-false replacement pulls (each ~2 hops) before the final settlement,

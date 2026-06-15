@@ -4,7 +4,7 @@
 // compatible with `runTests` from the implementation repo's test/utils.js:
 //
 //   import * as utils from './utils.js';
-//   import { filter } from '../filter.js';
+//   import { filter } from '../filter.ts';
 //   tests.push(scenarioTest(myScenario, { helper: filter, utils }));
 //
 // `helper` is the combinator under test; `utils` must provide

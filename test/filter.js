@@ -10,7 +10,7 @@
 // express were copied verbatim from the original file, each marked with a
 // [copied verbatim] comment giving the reason.
 
-import { filter } from '../filter.js';
+import { filter } from '../filter.ts';
 import {
   runTests,
   track,

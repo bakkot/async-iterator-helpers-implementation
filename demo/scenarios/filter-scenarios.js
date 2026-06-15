@@ -987,8 +987,8 @@ export const filterScenarios = [
           arrows: [["I0","R0"]],
           events: [
             { type: "compact", pull: "u0" },
-            { type: "result", result: "r0", error: "boom" },
             { type: "result", result: "r1", done: true },
+            { type: "result", result: "r0", error: "boom" },
           ],
         },
         {

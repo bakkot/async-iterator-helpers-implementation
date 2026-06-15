@@ -938,8 +938,8 @@ tests.push(scenarioTest({
     ] } ] },
     { note: "the value behind the error is delivered and the surplus call is done", steps: [ { events: [
       { type: "fn-settle", call: "p2", verdict: false },
-      { type: "result", result: "r1", value: 30, from: "p0" },
       { type: "result", result: "r2", done: true },
+      { type: "result", result: "r1", value: 30, from: "p0" },
     ] } ] },
     // Only when it.return() settles does the error finally surface to r0.
     { note: "the held error surfaces once the close settles", steps: [ { events: [
@@ -1478,8 +1478,8 @@ tests.push(scenarioTest({
     // source terminal and no replacement pull possible, r1 resolves done.
     { note: "error shifts forward and the trailing call drains", steps: [ { events: [
       { type: "fn-settle", call: "p0", verdict: false },
-      { type: "result", result: "r0", error: "boom" },
       { type: "result", result: "r1", done: true },
+      { type: "result", result: "r0", error: "boom" },
     ] } ] },
   ],
 }, { helper: filter, utils }));
@@ -1629,8 +1629,8 @@ tests.push(scenarioTest({
     // with no new pulls coming) retires done; r1 stays pending.
     { note: "error compacts forward to r0; the latest call retires done", steps: [ { events: [
       { type: "fn-settle", call: "p0", verdict: false },
-      { type: "result", result: "r0", error: "source reject 1" },
       { type: "result", result: "r2", done: true },
+      { type: "result", result: "r0", error: "source reject 1" },
     ] } ] },
     { note: "the middle call stays pending behind its in-flight slot", steps: [ { events: [
     ] } ] },
@@ -1738,8 +1738,8 @@ tests.push(scenarioTest({
     // surviving outcome: it rejects r0, and r1 drains done after it.
     { note: "compacted error rejects r0 before the tail done", steps: [ { events: [
       { type: "fn-settle", call: "p1", verdict: false },
-      { type: "result", result: "r0", error: "source throw 2" },
       { type: "result", result: "r1", done: true },
+      { type: "result", result: "r0", error: "source throw 2" },
     ] } ] },
   ],
 }, { helper: filter, utils }));

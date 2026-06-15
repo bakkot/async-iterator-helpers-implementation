@@ -6,8 +6,7 @@ class FilterHelper {
   #it;
   #pred;
 
-  // TODO rename to InFlight or slots or something
-  // Positions is an ordered queue of results or placeholders for results,
+  // Slots is an ordered queue of results or placeholders for results,
   // held in a Set: insertion order is pull order, so the head is the
   // first-inserted entry (`#head()`). Membership means "still live": a position
   // is in the Set from when its pull is issued until it is delivered, dropped, or
@@ -28,7 +27,7 @@ class FilterHelper {
   //     | 'ready'      // no wait: no close, or the close has already settled
   //     | 'awaiting-return'   // close pending, error not yet at the head of the queue
   //     | ((e: Error) => void) // close pending, error committed to its call — invoke to reject it
-  #positions = new Set();
+  #slots = new Set();
 
   // Outstanding consumer next() calls in call order; each entry is
   // { resolve, reject }.
@@ -48,7 +47,7 @@ class FilterHelper {
       error: undefined,
       closeState: 'ready',
     };
-    this.#positions.add(pos);
+    this.#slots.add(pos);
     let result;
     try {
       result = this.#it.next();
@@ -60,7 +59,10 @@ class FilterHelper {
       pos.closeState = 'ready'
       this.#finished = true;
       // source faulted so we do not call it.return().
-      // don't need to call #processQueue because callers are about to anyway.
+      if (this.#calls.length === 1) {
+        // i.e. this is the only thing in the queue
+        this.#processQueue();
+      }
       return;
     }
 
@@ -69,22 +71,19 @@ class FilterHelper {
         if (this.#isIgnored(pos)) return;
         // TODO handle errors from reading `done`/`value` properties
         if (r.done) {
-          // A done is the terminal wall: discard its position and every later one
-          // (overriding any later value, later error, or later done).
-          //
           // This is theoretically quadratic in the degree of concurrency: if we issue
           // N pulls and they all settle with { done: true } back-to-front, then
           // we will do N steps in this loop the first time, N-1 the second, etc.
           // In practice this is unlikely to matter.
           // A native implementation could probably avoid that cost.
           let discarding = false;
-          for (const n of this.#positions) {
+          for (const n of this.#slots) {
             if (n === pos) discarding = true;
-            if (discarding) this.#positions.delete(n);
+            if (discarding) this.#slots.delete(n);
           }
           this.#finished = true; // a clean done does not close the source.
           this.#processQueue();
-          const drained = this.#calls.splice(this.#positions.size);
+          const drained = this.#calls.splice(this.#slots.size);
           for (const call of drained) {
             call.resolve({ value: undefined, done: true });
           }
@@ -106,12 +105,6 @@ class FilterHelper {
 
   #invokePred(pos, value) {
     pos.value = value;
-    // The predicate is *called* synchronously (so the call is observed in pull
-    // order), but its outcome is always handled one microtask hop later. A
-    // synchronous throw is funneled through a rejected promise so it takes the
-    // exact same deferred path as an asynchronous rejection — the source close
-    // it triggers then lands after any delivery this same step unblocked.
-    //
     // TODO reconsider: maybe we shouldn't have to pay a microtask tick if the
     // predicate synchronously returns true or false.
     let res;
@@ -127,19 +120,17 @@ class FilterHelper {
           pos.status = 'value';
           this.#processQueue();
         } else {
-          this.#positions.delete(pos);
+          const isHead = this.#head() === pos;
+          this.#slots.delete(pos);
           if (!this.#finished) {
-            // Source still open: replace the lost value with a fresh pull, so the
-            // queue stays balanced and no call can become surplus.
             this.#issuePull();
-            this.#processQueue();
+            // this.#processQueue();
           } else {
-            // Source already closed: no replacement pull. In a quiescent state
-            // #calls and #positions are equal in length, and we just removed one
-            // position without removing a call, so there is now exactly one
-            // surplus call, which we can settle.
-            this.#processQueue();
+            // this.#processQueue();
             this.#calls.pop().resolve({ value: undefined, done: true });
+          }
+          if (isHead) {
+            this.#processQueue();
           }
         }
       },
@@ -150,14 +141,6 @@ class FilterHelper {
         const wasLive = !this.#finished;
         this.#finished = true;
         if (wasLive) {
-          // This error is the terminal event, so it closes the source. Its rejection
-          // must wait for the it.return() to settle, so while that close is pending the
-          // position is 'awaiting-return'. #processQueue commits the error to its call by leaving a
-          // rejector in closeState (without blocking the values behind it); the single
-          // reaction below then either invokes that rejector or, if the error has not
-          // reached the head yet, flips closeState to 'ready' so it rejects in order
-          // once it does. A missing it.return(), a synchronous throw, or a non-thenable
-          // result is already settled — closeState stays 'ready' and there is no delay.
           let r;
           try {
             r = this.#it.return?.();
@@ -181,15 +164,14 @@ class FilterHelper {
     );
   }
 
-  // Deliver no-longer-awaiting values/errors from the head, in order.
   #processQueue() {
-    while (this.#calls.length > 0 && this.#positions.size > 0) {
+    while (this.#calls.length > 0 && this.#slots.size > 0) {
       const pos = this.#head();
       if (pos.status === 'value') {
-        this.#positions.delete(pos);
+        this.#slots.delete(pos);
         this.#calls.shift().resolve({ value: pos.value, done: false });
       } else if (pos.status === 'error') {
-        this.#positions.delete(pos);
+        this.#slots.delete(pos);
         const call = this.#calls.shift();
         if (pos.closeState === 'awaiting-return') {
           // This error triggered `#it.return()`, and the result has not yet settled.
@@ -207,15 +189,14 @@ class FilterHelper {
     }
   }
 
-  // The head of the queue: the first-inserted (oldest) live position.
   #head() {
-    return this.#positions.values().next().value;
+    return this.#slots.values().next().value;
   }
 
   // A settlement is stale if its position is no longer in the queue, which can
   // only mean a terminal `done` wall discarded it.
   #isIgnored(pos) {
-    return !this.#positions.has(pos);
+    return !this.#slots.has(pos);
   }
 
   // ---- consumer-facing iterator ----------------------------------------
@@ -228,15 +209,10 @@ class FilterHelper {
     this.#calls.push({ resolve, reject });
     this.#issuePull();
 
-    // TODO reconsider whether this is the appropriate place for this
-    // as opposed to triggering when the head of queue changes state
-    this.#processQueue();
     return promise;
   }
 
   return() {
-    // Terminal values are ignored: the argument is dropped and the underlying's
-    // .return() value is discarded, matching map/flatMap.
     if (this.#finished) {
       return Promise.resolve({ value: undefined, done: true });
     }
@@ -246,11 +222,8 @@ class FilterHelper {
     try {
       r = this.#it.return?.();
     } catch (e) {
-      this.#processQueue(); // TODO why are we calling this here...
       return Promise.reject(e);
     }
-
-    this.#processQueue();
 
     return Promise.resolve(r).then(() => ({ value: undefined, done: true }));
   }

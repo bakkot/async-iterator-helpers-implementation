@@ -11,6 +11,7 @@ function ASSERT(condition: boolean, message: string) {
   }
 }
 
+// https://github.com/tc39/ecma262/pull/3883
 function fastPromiseTry<T>(cb: () => T): Promise<Awaited<T>> {
   try {
     return Promise.resolve(cb());

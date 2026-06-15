@@ -124,9 +124,7 @@ class FilterHelper {
           this.#slots.delete(pos);
           if (!this.#finished) {
             this.#issuePull();
-            // this.#processQueue();
           } else {
-            // this.#processQueue();
             this.#calls.pop().resolve({ value: undefined, done: true });
           }
           if (isHead) {

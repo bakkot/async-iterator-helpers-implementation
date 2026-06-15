@@ -339,10 +339,14 @@ function runModel(maxEvents, chooser) {
         pendingDelivery = true;
         issuePull();
         firePendingDelivery();
-      } else if (nodes.length > 0 && consumers.length > 0) {
-        pump();
+      } else {
+        // Source already closed: no replacement pull. Dropping this slot leaves
+        // one surplus consumer. The implementation settles that surplus done
+        // *first* (it pops the trailing call) and only then delivers the new
+        // head (processQueue). Mirror that order: surplus done, then head.
+        if (consumers.length > valueLimit) settleDoneFrom(valueLimit);
+        if (nodes.length > 0 && consumers.length > 0) pump();
       }
-      if (done && consumers.length > valueLimit) settleDoneFrom(valueLimit);
     } else {
       // A predicate error is the terminal event while the source is still live,
       // so it closes the source. The rejection must not be surfaced until that

@@ -81,8 +81,10 @@ class FilterHelper {
             if (n === pos) discarding = true;
             if (discarding) this.#slots.delete(n);
           }
-          this.#finished = true; // a clean done does not close the source.
-          this.#processQueue();
+          this.#finished = true;
+          if (this.#head() === pos) {
+            this.#processQueue();
+          }
           const drained = this.#calls.splice(this.#slots.size);
           for (const call of drained) {
             call.resolve({ value: undefined, done: true });
@@ -97,8 +99,9 @@ class FilterHelper {
         pos.error = e;
         pos.closeState = 'ready';
         this.#finished = true;
-        // source faulted so we do not call it.return().
-        this.#processQueue();
+        if (this.#head() === pos) {
+          this.#processQueue();
+        }
       }
     );
   }
@@ -116,20 +119,19 @@ class FilterHelper {
     Promise.resolve(res).then(
       (keep) => {
         if (this.#isIgnored(pos)) return;
+        const isHead = this.#head() === pos;
         if (keep) {
           pos.status = 'value';
-          this.#processQueue();
         } else {
-          const isHead = this.#head() === pos;
           this.#slots.delete(pos);
           if (!this.#finished) {
             this.#issuePull();
           } else {
             this.#calls.pop().resolve({ value: undefined, done: true });
           }
-          if (isHead) {
-            this.#processQueue();
-          }
+        }
+        if (isHead) {
+          this.#processQueue();
         }
       },
       (err) => {
@@ -157,7 +159,9 @@ class FilterHelper {
             pos.closeState = 'ready';
           }
         }
-        this.#processQueue();
+        if (this.#head() === pos) {
+          this.#processQueue();
+        }
       }
     );
   }

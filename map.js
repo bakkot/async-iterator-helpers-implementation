@@ -23,17 +23,10 @@ class MapHelper {
       return (new Promise(res => res(this.#fn(value)))).then(mapped => {
         return { value: mapped, done: false,  };
       }, (err) => {
-        // An error from the predicate closes the underlying iterator, but only
-        // if the machinery is still live. If we're already done — a concurrent
-        // call closed it, return() ran, or the underlying itself errored or
-        // finished — leave the underlying alone (in particular, never call
-        // .return() after observing an error from the underlying).
         if (this.#done) {
           return Promise.reject(err);
         }
         this.#done = true;
-        // errors from calling .return() are swallowed, as in IteratorClose,
-        // whether .return() throws synchronously or returns a rejected promise
         try {
           return Promise.resolve(this.#it.return?.()).finally(() => Promise.reject(err));
         } catch {

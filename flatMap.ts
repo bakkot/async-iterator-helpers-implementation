@@ -25,16 +25,16 @@ type Slot =
   | ErrorState
   | { type: 'removed' } // i.e. we already got { done: true } for this iterator at an earlier position
 
+type ReadingUnderlyingState = { type: 'reading underlying', requested: number /* integer > 0 */ };
+
 type ActiveInnerIterState = { type: 'iter', iter: unknown, readonly values: Slot[] } // invariant: values.length > 0
 
-// For errors from the mapper or from result iterators, we invoke .return() on
-// whatever is still open (the underlying, and possibly an active inner iterator).
+// For errors from the mapper or from inner iterators, we invoke .return() on whatever is still open (the underlying, and possibly an active inner iterator).
 // Those calls must settle before the error is surfaced.
 type ErrorState =
   | { type: 'error', error: unknown, closeState: 'ready', reject?: null }
   | { type: 'error', error: unknown, closeState: 'awaiting-return', reject: null | ((e: unknown) => void) }
 
-type ReadingUnderlyingState = { type: 'reading underlying', requested: number /* integer > 0 */ };
 
 /*
 draining = we must wait for an in-flight underlying pull (and the mapper) to finish handing us the inner iterator so we can close it,
@@ -62,9 +62,9 @@ type DrainingState =
 type ActiveState =
   | { type: 'unstarted' }
   | ReadingUnderlyingState
+  | ActiveInnerIterState // invariant: while active,
   | DrainingState
   | ErrorState // specifically in this position this means an error when reading from underlying or invoking the mapper
-  | ActiveInnerIterState // invariant: while active,
   | { type: 'finished' } // but still might be outstanding earlier calls, to be settled by closedButStillHaveValuesInFlight
 
 
@@ -244,7 +244,7 @@ class FlatMapHelper {
               this.#issuePullFromUnderlying();
             } else {
               // i.e., we got a { done: true } from an inner iterator we already considered to be done
-              // we just discared any subsequent Promises from said iterator
+              // we just discarded any subsequent Promises from said iterator
               // so we need to re-issue those pulls on the currently active one
 
               // strictly speaking, if thisIterValues is now empty we could remove it from closedButStillHaveValuesInFlight
@@ -294,7 +294,7 @@ class FlatMapHelper {
 
           if (active === inFlight) {
             // just gotta close underlying
-            this.#closeUnderlyingForError(slotButWithTypeScript as ErrorState);
+            this.#closeIterThen(this.#underlying as MaybeReturnable, () => this.#commitError(slotButWithTypeScript));
           } else {
             // gotta close both underlying and active
             const activeIter = active.iter;
@@ -350,7 +350,7 @@ class FlatMapHelper {
         this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, closeError) => {
           this.#commitError(slot);
 
-          // TODO ordering for this vs above rejection
+          // TODO ordering for this vs above
           if (gotError) {
             active.rejectReturn(closeError);
           } else {
@@ -362,18 +362,11 @@ class FlatMapHelper {
     }
     const { requested } = this.#active as ReadingUnderlyingState;
     const slot: ErrorState = { type: 'error', error, closeState: 'awaiting-return', reject: null };
-    this.#markSomeCallsAsNoLongerGettingValues(requested - 1);
+    this.#markSomeCallsAsNoLongerGettingValues(requested - 1); // -1 for this error
     this.#active = slot;
     if (this.#closedButStillHaveValuesInFlight.length === 0) {
       this.#processQueue();
     }
-    this.#closeUnderlyingForError(slot);
-  }
-
-  #closeUnderlyingForError(slot: ErrorState) {
-    ASSERT(slot.type === 'error', 'slot is error');
-    ASSERT(slot.closeState === 'awaiting-return', 'slot awaiting-return');
-
     this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => this.#commitError(slot));
   }
 

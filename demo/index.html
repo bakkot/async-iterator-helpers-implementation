@@ -41,6 +41,20 @@
     background: #f7f7f9;
   }
 
+  .gh-link {
+    position: fixed;
+    left: 12px;
+    bottom: 10px;
+    /* font-size: 12px; */
+    color: var(--muted);
+    text-decoration: none;
+    opacity: 0.7;
+  }
+  .gh-link:hover {
+    opacity: 1;
+    text-decoration: underline;
+  }
+
   h1 {
     margin: 0;
     font-size: 20px;
@@ -697,6 +711,8 @@
     <button id="next">Next ▶</button>
   </div>
   <div class="hint">← / → (or space) to step · Home / End to jump</div>
+
+  <a class="gh-link" href="https://github.com/bakkot/async-iterator-helpers-implementation">discuss on GitHub</a>
 
   <script type="module" src="index-built.js"></script>
 </body>

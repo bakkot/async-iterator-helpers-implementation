@@ -499,7 +499,7 @@ export const flatMapScenarios = [
     id: "flatmap-delayed-delivery",
     helper: "flatMap",
     label: "Delayed delivery*",
-    description: "In the current implementation we do not deliver later values from the head-of-queue inner iterator, although we could, and doing so would be more like <code>map</code>.<br><br><strong>Open question</strong>: Should we? It's a bunch of extra bookkeeping for probably not much benefit, but it is currently inconsistent.",
+    description: "In the current implementation we do not deliver later values from the head-of-queue inner iterator until all previous values from that iterator have settled, although we could, and doing so would be more like <code>map</code>.<br><br><strong>Open question</strong>: Should we? It's a bunch of extra bookkeeping for probably not much benefit, but it is currently inconsistent.",
     ticks: [
       { steps: [
         {

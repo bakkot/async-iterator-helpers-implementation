@@ -120,7 +120,7 @@ export const filterScenarios = [
     id: "filter-concurrent",
     helper: "filter",
     label: "Simple concurrent",
-    description: "As with <code>map</code>, multiple pulls can be in flight. Unlike <code>map</code>, later values cannot generally settle until earlier ones have resolved, because resolution of earlier predicates affects where later values will end up.",
+    description: "As with <code>map</code>, multiple pulls can be in flight. Unlike <code>map</code>, later values cannot generally settle until earlier ones have resolved, because resolution of earlier predicates affects where later values will end up. <a href=\"https://github.com/tc39/proposal-unordered-async-iterator-helpers\">Unordered helpers</a> would not need to have this delay.",
     ticks: [
       { steps: [
         {

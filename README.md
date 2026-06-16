@@ -4,7 +4,7 @@ This repo is for me to mess around with possible behaviors for [async iterator h
 
 The implementations ([map.js](./map.js), [filter.ts](./filter.ts), [flatmap.ts](./flatMap.ts)) are written by me and are intended as the actual source of truth for how I think these should behave prior to writing spec text. I've made an effort to make them readable, and more-or-less succeeded for `map` and `filter`, but `flatMap` is still way more complicated than I'd like.
 
-There is a [dem](http://bakkot.github.io/async-iterator-helpers-implementation) which has a bunch of hand-written scenarios which demonstrate various behaviors, and also lets you play around with it yourself by clicking boxes which represent various Promises. This is hooked up to the actual implementation. Visualizer was mostly written by Claude.
+There is a [demo](http://bakkot.github.io/async-iterator-helpers-implementation) which has a bunch of hand-written scenarios which demonstrate various behaviors, and also lets you play around with it yourself by clicking boxes which represent various Promises. This is hooked up to the actual implementation. Visualizer was mostly written by Claude.
 
 There are also tests but these are almost 100% written by Claude and I haven't looked at them much. They're just to make it easier for me to see when something changes (and how) when I change the implementation. I do not recommend reading them.
 

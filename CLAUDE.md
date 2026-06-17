@@ -2,7 +2,7 @@ This project explores async iterator helpers for JavaScript, with support for co
 
 Implementations are in `./map.js`, `./filter.js`, and `.flatMap.ts` (yes, it's intentional that `flatMap` is `.ts`; my version of node can handle it fine with no extra flags).
 
-Unit tests are in `test/{map,filter,flatMap}.js`, run with `npm run test-implementations`. There's also fuzzers you can run with `npm run test-fuzzing`.
+Unit tests are in `test/{map,filter,flatMap}.js`, run with `npm run test-implementations`. There's also fuzzers you can run with `npm run test-fuzzing`. Do not run the `filter` or `flatMap` fuzzers without the `--fuzz` flag; `--fuzz 100000` is a reasonable amount.
 
 There is also a demo allow you to step through various scenarios aka animations, under `demo`. This uses the same format as (most of) the unit tests, described in `demo/scenarios/FORMAT.md`.
 

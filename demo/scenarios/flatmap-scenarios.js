@@ -555,6 +555,95 @@ export const flatMapScenarios = [
     ],
   },
   {
+    id: "flatmap-delayed-delivery-2",
+    helper: "flatMap",
+    label: "Delayed delivery 2",
+    description: "We could even deliver items from iterators past the head of the queue, since in some cases we know the lengths of earlier iterators. In this scenario, in the end state we could have delivered both <code>a1</code> and <code>b0</code>. The current implementation does not.",
+    ticks: [
+      { steps: [
+        {
+          events: [],
+        },
+        {
+          events: [
+            { type: "next", result: "r0" },
+            { type: "pull", pull: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "next", result: "r2" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u0", value: "A" },
+            { type: "fn", call: "p0", arg: "A", from: "u0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p0", iterator: "A" },
+            { type: "inner-pull", pull: "a0", iterator: "A" },
+            { type: "inner-pull", pull: "a1", iterator: "A" },
+            { type: "inner-pull", pull: "a2", iterator: "A" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a2", done: true },
+            { type: "pull", pull: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "u1", value: "B" },
+            { type: "fn", call: "p1", arg: "B", from: "u1" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "fn-settle", call: "p1", iterator: "B" },
+            { type: "inner-pull", pull: "b0", iterator: "B" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "b0", value: "b0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a1", value: "a1" },
+          ],
+        },
+      ] },
+    ],
+  },
+  {
     id: "flatmap-exhaustion",
     helper: "flatMap",
     label: "Exhaustion",

@@ -1219,7 +1219,9 @@ function buildExportBar() {
   exportBtns = [];
   const bar = document.createElement('div');
   bar.className = 'export-bar';
-  const mk = (label, title, handler) => {
+  // `gateable` buttons (copy/download) need committed actions, so they ride the
+  // exportBtns disable list; load is always available (it starts a fresh run).
+  const mk = (label, title, handler, gateable = true) => {
     const b = document.createElement('button');
     b.className = 'export-btn';
     b.textContent = label;
@@ -1227,11 +1229,12 @@ function buildExportBar() {
     b.title = title;
     b.addEventListener('click', () => handler(b));
     bar.appendChild(b);
-    exportBtns.push(b);
+    if (gateable) exportBtns.push(b);
     return b;
   };
   mk('copy', 'Copy the steps so far as a scenario (FORMAT.md) to the clipboard', exportCopy);
   mk('download', 'Download the steps so far as a scenario file (FORMAT.md)', exportDownload);
+  mk('load', 'Paste a scenario (FORMAT.md) to load it', showLoadModal, false);
   caption.appendChild(bar);
 }
 
@@ -1246,7 +1249,7 @@ function coerceToJSON(text) {
   return text
     .trim()
     .replace(/^export\s+(default\s+|const\s+\w+\s*=\s*)/, '')   // tolerate a pasted `export …`
-    .replace(/;\s*$/, '')
+    .replace(/[;,]\s*$/, '')
     .replace(/\/\/.*/g, '')
     .replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":')      // quote bare keys: { id: -> { "id":
     .replace(/,(\s*[}\]])/g, '$1');                              // drop trailing commas before } or ]
@@ -1300,8 +1303,8 @@ function loadScenarioText(text) {
   try {
     scenario = parseScenario(text);
   } catch (err) {
-    showErrorModal('Could not parse the dropped file.', err.message);
-    return;
+    showErrorModal('Could not parse the scenario.', err.message);
+    return false;
   }
   let actions;
   try {
@@ -1312,8 +1315,8 @@ function loadScenarioText(text) {
     if (index.syncFn) throw new Error('fn-sync scenarios have no interactive equivalent');
     actions = scenarioToActions(scenario, index);
   } catch (err) {
-    showErrorModal('That file is not a usable scenario.', err.message);
-    return;
+    showErrorModal('That is not a usable scenario.', err.message);
+    return false;
   }
   const helper = scenario.helper;
   selectSet(helper);
@@ -1327,6 +1330,7 @@ function loadScenarioText(text) {
   updateButtons();
   announceInteractive();   // "Initial state" now reflecting the loaded step count
   showToast('loaded!');
+  return true;
 }
 
 // A brief confirmation toast, bottom-center.
@@ -1356,6 +1360,21 @@ function showErrorModal(title, detail) {
   overlay.querySelector('.modal-title').textContent = title;
   overlay.querySelector('.modal-msg').textContent = detail;
   overlay.classList.add('show');
+}
+
+// The paste-a-scenario modal (a static <dialog> in index.html) — the typed
+// counterpart to drag & drop. Cancel/Escape/backdrop close it natively; Load
+// validates first and only closes on success. On a parse error loadScenarioText
+// pops the error modal and we keep this open so the pasted text can be fixed.
+const loadDialog = document.getElementById('load-modal');
+const loadText = loadDialog.querySelector('.load-text');
+loadDialog.querySelector('.modal-load').addEventListener('click', () => {
+  if (loadScenarioText(loadText.value)) loadDialog.close();
+});
+function showLoadModal() {
+  loadText.value = '';
+  loadDialog.showModal();
+  loadText.focus();
 }
 
 // Drag & drop: only react to file drags, and show a hint while one is over the

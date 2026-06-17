@@ -436,16 +436,15 @@
     opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 60;
   }
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-  /* the load-error modal */
+  /* the load-error modal — a native <dialog> */
   #error-modal {
-    position: fixed; inset: 0; z-index: 70;
-    display: none; align-items: center; justify-content: center;
-    background: rgba(17, 24, 39, 0.45);
+    border: none; border-radius: 12px; padding: 0;
+    width: min(560px, calc(100% - 48px));
+    box-shadow: 0 12px 40px rgba(0,0,0,0.3);
   }
-  #error-modal.show { display: flex; }
+  #error-modal::backdrop { background: rgba(17, 24, 39, 0.45); }
   #error-modal .modal-box {
     background: #fff; border-radius: 12px; padding: 22px 24px;
-    width: min(560px, calc(100% - 48px)); box-shadow: 0 12px 40px rgba(0,0,0,0.3);
   }
   #error-modal .modal-title { margin: 0 0 10px; font-size: 17px; color: #b91c1c; }
   #error-modal .modal-msg {
@@ -745,6 +744,16 @@
   <div class="hint">← / → (or space) to step · Home / End to jump</div>
 
   <a class="gh-link" href="https://github.com/bakkot/async-iterator-helpers-implementation">discuss on GitHub</a>
+
+  <dialog id="error-modal">
+    <form method="dialog" class="modal-box">
+      <h3 class="modal-title"></h3>
+      <pre class="modal-msg"></pre>
+      <div class="modal-actions">
+        <button type="submit" class="modal-close">Close</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="load-modal">
     <form method="dialog" class="modal-box">

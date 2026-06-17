@@ -1343,23 +1343,14 @@ function showToast(msg) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
 }
-// A dismissible modal for load failures.
+// A dismissible modal for load failures (a static <dialog> in index.html).
+// Opened with showModal() so it joins the top layer — above the load dialog
+// when a paste fails to parse. Close/Escape/backdrop dismiss it natively.
+const errorDialog = document.getElementById('error-modal');
 function showErrorModal(title, detail) {
-  let overlay = document.getElementById('error-modal');
-  if (!overlay) {
-    overlay = document.createElement('div');
-    overlay.id = 'error-modal';
-    overlay.innerHTML =
-      '<div class="modal-box"><h3 class="modal-title"></h3><pre class="modal-msg"></pre>' +
-      '<div class="modal-actions"><button class="modal-close">Close</button></div></div>';
-    const close = () => overlay.classList.remove('show');
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-    overlay.querySelector('.modal-close').addEventListener('click', close);
-    document.body.appendChild(overlay);
-  }
-  overlay.querySelector('.modal-title').textContent = title;
-  overlay.querySelector('.modal-msg').textContent = detail;
-  overlay.classList.add('show');
+  errorDialog.querySelector('.modal-title').textContent = title;
+  errorDialog.querySelector('.modal-msg').textContent = detail;
+  errorDialog.showModal();
 }
 
 // The paste-a-scenario modal (a static <dialog> in index.html) — the typed

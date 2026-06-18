@@ -385,6 +385,20 @@
   button:disabled { opacity: 0.4; cursor: default; }
   .counter { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 14px; min-width: 64px; text-align: center; }
 
+  /* Touch devices: treat every interactive control as a single-tap target.
+     `touch-action: manipulation` keeps panning and pinch-zoom but turns off
+     double-tap-to-zoom, so quick repeated taps (e.g. mashing .next()) register
+     as clicks instead of being swallowed as a zoom gesture. user-select: none
+     stops a fast double tap from selecting the control's label text instead.
+     Covers: nav buttons, modal/export buttons, the tab + title links, and the
+     SVG .next()/return() buttons and clickable (settleable) boxes/dots. */
+  button, .tab, h1 code a.setlink,
+  #viz .ibtn, #viz .box.stimulus, #viz .stim-dot {
+    touch-action: manipulation;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
   .caption {
     width: min(960px, 100%);
     min-height: 48px;

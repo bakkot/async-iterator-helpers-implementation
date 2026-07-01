@@ -69,7 +69,7 @@ const underlyingReturnError = 'EretU';
 const innerReturnError = (k) => `EretI${k}`;
 // flatMap surfaces a synthetic TypeError with this message for ill-behaved inner
 // iterators (see innerIllBehaved below); no stub ever produces it.
-const illBehavedError = 'ill-behaved inner iterator';
+const illBehavedError = 'inner iterator reported done at a position which already yielded a value';
 
 // An outcome is OBSERVED by flatMap unless a done from the SAME inner at a LOWER
 // pull index settled EARLIER: that done truncates the later in-flight pulls, so

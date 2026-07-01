@@ -3096,7 +3096,7 @@ tests.push(scenarioTest({
     // position takes a TypeError, which needs no (further) close of its own.
     { note: "the earlier done is ill-behaved and rejects its own call", steps: [ { events: [
       { type: "settle", pull: "a0", done: true },
-      { type: "result", result: "r0", error: "ill-behaved inner iterator" },
+      { type: "result", result: "r0", error: "inner iterator reported done at a position which already yielded a value" },
     ] } ] },
     { note: "the held error still reaches its call once the close settles", steps: [ { events: [
       { type: "close-settled", target: "source" },
@@ -3200,7 +3200,7 @@ tests.push(scenarioTest({
       {
         events: [
           { type: "settle", pull: "a0", done: true },
-          { type: "result", result: "r0", error: "ill-behaved inner iterator" },
+          { type: "result", result: "r0", error: "inner iterator reported done at a position which already yielded a value" },
         ],
       },
     ] },
@@ -3328,7 +3328,7 @@ tests.push(scenarioTest({
     ] } ] },
     { note: "the TypeError reaches the done's position once the close settles", steps: [ { events: [
       { type: "close-settled", target: "source" },
-      { type: "result", result: "r0", error: "ill-behaved inner iterator" },
+      { type: "result", result: "r0", error: "inner iterator reported done at a position which already yielded a value" },
     ] } ] },
     { note: "the helper is finished", steps: [ { events: [
       { type: "next", result: "r2" },
@@ -3390,7 +3390,7 @@ tests.push(scenarioTest({
     ] } ] },
     { note: "the TypeError surfaces after both closes settle", steps: [ { events: [
       { type: "close-settled", target: "source" },
-      { type: "result", result: "r0", error: "ill-behaved inner iterator" },
+      { type: "result", result: "r0", error: "inner iterator reported done at a position which already yielded a value" },
     ] } ] },
     { note: "the already-issued pull on B still delivers", steps: [ { events: [
       { type: "settle", pull: "b0", value: "b0" },

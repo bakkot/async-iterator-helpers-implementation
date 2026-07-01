@@ -130,6 +130,9 @@ class FlatMapHelper {
             this.#markUnderlyingAsFinished();
           }
           this.#active = { type: 'finished' };
+          // no need to process the queue: a clean underlying done changes no inner
+          // iterator's known length, so it can't have unblocked any deliveries —
+          // still-buffered values will be dispatched by their own settlements
           return;
         }
 
@@ -232,7 +235,7 @@ class FlatMapHelper {
             // We have already seen (and possibly delivered) a value or error at a LATER
             // position, which this { done: true } would retroactively drop: the iterator
             // is ill-behaved. Surface an error at this position instead.
-            this.#gotErrorFromInner(slot, entry, inFlight, new TypeError('ill-behaved inner iterator'));
+            this.#gotErrorFromInner(slot, entry, inFlight, new TypeError('inner iterator reported done at a position which already yielded a value'));
             return;
           }
 

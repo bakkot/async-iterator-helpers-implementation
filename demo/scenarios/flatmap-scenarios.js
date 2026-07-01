@@ -498,8 +498,8 @@ export const flatMapScenarios = [
   {
     id: "flatmap-delayed-delivery",
     helper: "flatMap",
-    label: "Delayed delivery*",
-    description: "In the current implementation we do not deliver later values from the head-of-queue inner iterator until all previous values from that iterator have settled, although we could, and doing so would be more like <code>map</code>.<br><br><strong>Open question</strong>: Should we? It's a bunch of extra bookkeeping for probably not much benefit, but it is currently inconsistent.",
+    label: "Eager delivery",
+    description: "Later values from the head-of-queue inner iterator are delivered eagerly, before earlier values from that iterator have settled. We can do this because values from an inner iterator cannot be dropped (unlike <code>filter</code>), so the second outstanding pull of that iterator is guaranteed to feed the second outstanding <code>result.next()</code> Promise. This matches <code>map</code>.",
     ticks: [
       { steps: [
         {
@@ -540,6 +540,7 @@ export const flatMapScenarios = [
         {
           events: [
             { type: "settle", pull: "a1", value: "a1" },
+            { type: "result", result: "r1", value: "a1", from: "a1" },
           ],
         },
       ] },
@@ -548,7 +549,6 @@ export const flatMapScenarios = [
           events: [
             { type: "settle", pull: "a0", value: "a0" },
             { type: "result", result: "r0", value: "a0", from: "a0" },
-            { type: "result", result: "r1", value: "a1", from: "a1" },
           ],
         },
       ] },
@@ -557,8 +557,8 @@ export const flatMapScenarios = [
   {
     id: "flatmap-delayed-delivery-2",
     helper: "flatMap",
-    label: "Delayed delivery 2",
-    description: "We could even deliver items from iterators past the head of the queue, since in some cases we know the lengths of earlier iterators. In this scenario, in the end state we could have delivered both <code>a1</code> and <code>b0</code>. The current implementation does not.",
+    label: "Eager delivery 2",
+    description: "We even deliver items from iterators past the head of the queue, when we know the exact lengths of all earlier iterators. Here, once <code>a1</code> settles we know the first inner iterator has exactly two values (its <code>done: true</code> came immediately after <code>a1</code>), so the destination of the second iterator's waiting <code>b0</code> is known too, and both deliver — even though <code>a0</code> is still outstanding.",
     ticks: [
       { steps: [
         {
@@ -638,6 +638,16 @@ export const flatMapScenarios = [
         {
           events: [
             { type: "settle", pull: "a1", value: "a1" },
+            { type: "result", result: "r1", value: "a1", from: "a1" },
+            { type: "result", result: "r2", value: "b0", from: "b0" },
+          ],
+        },
+      ] },
+      { steps: [
+        {
+          events: [
+            { type: "settle", pull: "a0", value: "a0" },
+            { type: "result", result: "r0", value: "a0", from: "a0" },
           ],
         },
       ] },

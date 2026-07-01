@@ -24,11 +24,28 @@ type Slot =
   | { type: 'awaiting' }
   | { type: 'value', value: unknown }
   | ErrorState
+  | { type: 'delivered' } // its value (or error) has already been handed to its call; kept in place so positions of later slots are stable
   | { type: 'removed' } // i.e. we already got { done: true } for this iterator at an earlier position
 
 type ReadingUnderlyingState = { type: 'reading underlying', requested: number /* integer > 0 */ };
 
-type ActiveInnerIterState = { type: 'iter', iter: unknown, readonly values: Slot[] } // invariant: values.length > 0
+// Per-inner-iterator bookkeeping, shared between the active state and the queue of
+// closed-but-not-yet-drained iterators.
+//
+// minLength/maxLength bound how many values the iterator still contributes,
+// relative to slots[0] (both are decremented when slots are shifted off the head):
+// seeing a value (or error) at index i tells us positions 0..i all exist, so
+// minLength >= i+1; seeing { done: true } at index i tells us position i and later
+// don't exist, so maxLength = i (it is Infinity until then — including for
+// iterators that stop being active without reporting done, e.g. because the
+// consumer called return(), whose remaining length we never learn).
+//
+// When minLength === maxLength we know EXACTLY how many values the iterator has
+// left, so the positions of everything queued after it are known and values from
+// later iterators can be delivered without waiting for this one to drain.
+type InnerIterEntry = { minLength: number, maxLength: number, slots: Slot[] };
+
+type ActiveInnerIterState = { type: 'iter', iter: unknown, entry: InnerIterEntry }
 
 // For errors from the mapper or from inner iterators, we invoke .return() on whatever is still open (the underlying, and possibly an active inner iterator).
 // Those calls must settle before the error is surfaced.
@@ -76,12 +93,15 @@ class FlatMapHelper {
   #underlying: unknown;
   #fn: unknown;
 
-  // holds the .values arrays of closed iterators (not the InFlight objects, so the iterators themselves can be GC'd)
-  readonly #closedButStillHaveValuesInFlight: Slot[][] = [];
+  // holds the entries of closed iterators (not the ActiveInnerIterState objects, so the iterators themselves can be GC'd)
+  readonly #closedButStillHaveValuesInFlight: InnerIterEntry[] = [];
 
   #active: ActiveState = { type: 'unstarted' };
 
-  // invariant: calls.length == [sum of lengths of closedButStillHaveValuesInFlight] + [active.requested | active.values.length | (1 when draining)]
+  // invariant: calls.length == [sum of undelivered slot counts of closedButStillHaveValuesInFlight]
+  //   + [active.requested | undelivered slot count of active.entry | (1 when draining or when active is an undelivered error)]
+  // the i-th call corresponds to the i-th undelivered slot, in queue order; delivering a slot
+  // splices its call out, so the correspondence is maintained
   #calls: { resolve: (v: unknown) => void, reject: (v: unknown) => void }[] = [];
 
   constructor(underlying: unknown, fn: unknown) {
@@ -142,7 +162,7 @@ class FlatMapHelper {
             }
 
             const { requested } = active as Extract<ActiveState, { type: 'reading underlying '}>;
-            this.#active = { type: 'iter', iter: actualIter, values: [] };
+            this.#active = { type: 'iter', iter: actualIter, entry: { minLength: 0, maxLength: Infinity, slots: [] } };
 
             // ok, time to actually pull
             for (let i = 0; i < requested; ++i) {
@@ -170,11 +190,11 @@ class FlatMapHelper {
           this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#valuesWeCouldDeliverFromClosedInnerIterators() - 1); // -1 for the slot we hold open in case of errors from the pull/mapper
         }
 
-        if (this.#closedButStillHaveValuesInFlight.length === 0) {
-          this.#calls.shift()!.reject(error);
-          this.#active = { type: 'finished' };
-        } else {
-          this.#active = { type: 'error', error, closeState: 'ready' };
+        // an error from the underlying counts as it closing itself, so no .return() is needed and the error is ready to deliver
+        this.#active = { type: 'error', error, closeState: 'ready' };
+        if (this.#allClosedExact()) {
+          // we know exactly where the error goes (right after the last value of the last closed iterator), so deliver it now
+          this.#processQueue();
         }
 
         // TODO maybe move this above; it's just here for tick ordering reasons we probably don't care about
@@ -190,8 +210,8 @@ class FlatMapHelper {
 
     const slot = { type: 'awaiting' } as Slot;
     const inFlight = this.#active as ActiveInnerIterState;
-    const thisIterValues = inFlight.values;
-    thisIterValues.push(slot);
+    const entry = inFlight.entry;
+    entry.slots.push(slot);
 
     fastPromiseTry(() => (inFlight.iter as Nextable).next()).then(
       iterResult => {
@@ -201,59 +221,55 @@ class FlatMapHelper {
         ASSERT(slot.type === 'awaiting', 'slot awaiting');
 
         if ((iterResult as { done: boolean }).done) {
-          ASSERT(this.#closedButStillHaveValuesInFlight.includes(thisIterValues) || this.#active === inFlight, 'inFlight is still tracked');
+          ASSERT(this.#closedButStillHaveValuesInFlight.includes(entry) || this.#active === inFlight, 'entry is still tracked');
 
           // I am assuming this can be done cheaply, possibly with a slightly different data structure
           // though also in practice N is small enough for it not to matter
-          const currentIndex = thisIterValues.indexOf(slot);
+          const currentIndex = entry.slots.indexOf(slot);
           ASSERT(currentIndex >= 0, 'slot is still present');
 
-          const removedCount = thisIterValues.length - currentIndex;
+          if (currentIndex < entry.minLength) {
+            // We have already seen (and possibly delivered) a value or error at a LATER
+            // position, which this { done: true } would retroactively drop: the iterator
+            // is ill-behaved. Surface an error at this position instead.
+            this.#gotErrorFromInner(slot, entry, inFlight, new TypeError('ill-behaved inner iterator'));
+            return;
+          }
+
+          const removedCount = entry.slots.length - currentIndex;
           ASSERT(removedCount > 0, 'have not already truncated this value');
 
-          // remove anything after this slot
-          // TODO probably we should error if anything here is settled-but-not-done
-          for (let i = currentIndex; i < thisIterValues.length; ++i) {
-            const slot = thisIterValues[i];
-            if (slot.type === 'value') {
-              slot.value = null; // for memory reasons
-            } else if (slot.type === 'error') {
-              slot.error = null; // for memory reasons
-            } else {
-              ASSERT(slot.type === 'awaiting', 'slot awaiting');
-            }
-            slot.type = 'removed';
+          // remove this slot and anything after it
+          // (anything settled at those positions would have raised minLength past
+          // currentIndex, so everything removed here is still awaiting)
+          for (let i = currentIndex; i < entry.slots.length; ++i) {
+            const s = entry.slots[i];
+            ASSERT(s.type === 'awaiting', 'truncated slots are awaiting');
+            s.type = 'removed';
           }
-          thisIterValues.length = currentIndex;
-
-          let exposedNewHead = false;
-          if (currentIndex === 0) {
-            if (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0] === inFlight.values) {
-              exposedNewHead = true;
-              do {
-                this.#closedButStillHaveValuesInFlight.shift();
-              } while (this.#closedButStillHaveValuesInFlight.length > 0 && this.#closedButStillHaveValuesInFlight[0].length === 0);
-            }
-          }
+          entry.slots.length = currentIndex;
+          entry.maxLength = currentIndex;
+          ASSERT(entry.minLength <= entry.maxLength, 'minLength <= maxLength');
 
           if (this.#active.type === 'iter') {
             if (this.#active === inFlight) {
               if (currentIndex > 0) {
-                this.#closedButStillHaveValuesInFlight.push(this.#active.values);
+                this.#closedButStillHaveValuesInFlight.push(entry);
               }
               this.#active = { type: 'reading underlying', requested: removedCount };
               this.#issuePullFromUnderlying();
-            } else {
-              // i.e., we got a { done: true } from an inner iterator we already considered to be done
-              // we just discarded any subsequent Promises from said iterator
-              // so we need to re-issue those pulls on the currently active one
+              // nothing is queued after this iterator, so learning its length can't unblock anything
+              return;
+            }
+            // i.e., we got a { done: true } from an inner iterator we already considered to be done
+            // we just discarded any subsequent Promises from said iterator
+            // so we need to re-issue those pulls on the currently active one
 
-              // strictly speaking, if thisIterValues is now empty we could remove it from closedButStillHaveValuesInFlight
-              // but, no real reason to; we'll pop when it gets to the head of the queue
+            // strictly speaking, if entry.slots is now empty we could remove it from closedButStillHaveValuesInFlight
+            // but, no real reason to; we'll pop when it gets to the head of the queue
 
-              for (let i = 0; i < removedCount; ++i) {
-                this.#issuePullFromCurrentActive();
-              }
+            for (let i = 0; i < removedCount; ++i) {
+              this.#issuePullFromCurrentActive();
             }
           } else if (this.#active.type === 'reading underlying') {
             this.#active.requested += removedCount;
@@ -263,7 +279,9 @@ class FlatMapHelper {
             this.#markSomeCallsAsNoLongerGettingValues(removedCount);
           }
 
-          if (exposedNewHead) {
+          // if this done pinned the iterator's exact length (or drained it entirely),
+          // values queued after it may now be deliverable
+          if (entry.minLength === entry.maxLength && this.#allExactBefore(entry)) {
             this.#processQueue();
           }
         } else {
@@ -272,7 +290,16 @@ class FlatMapHelper {
           slot.type = 'value';
           (slot as Extract<Slot, { type: 'value' }>).value = value;
 
-          if (this.#isHeadOfQueue(slot)) {
+          const currentIndex = entry.slots.indexOf(slot);
+          ASSERT(currentIndex >= 0, 'slot is still present');
+          if (currentIndex + 1 > entry.minLength) {
+            entry.minLength = currentIndex + 1;
+          }
+
+          // the k-th undelivered slot of this iterator feeds the k-th outstanding call
+          // aimed at it, so this value's destination is known — unless some earlier
+          // iterator's length is unknown, in which case it buffers until then
+          if (this.#allExactBefore(entry)) {
             this.#processQueue();
           }
         }
@@ -281,55 +308,71 @@ class FlatMapHelper {
         // got error from inner iterator
 
         if (slot.type === 'removed') return;
-        ASSERT(slot.type === 'awaiting', 'slot awaiting');
-        slot.type = 'error';
-        const slotButWithTypeScript = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
-        slotButWithTypeScript.error = error;
-
-        if (this.#active.type === 'iter') {
-          slotButWithTypeScript.closeState = 'awaiting-return';
-          const active = this.#active;
-          ASSERT(active.values.length > 0, 'active has at least one outstanding');
-          this.#closedButStillHaveValuesInFlight.push(active.values);
-          this.#active = { type: 'finished' };
-
-          if (active === inFlight) {
-            // just gotta close underlying
-            this.#closeIterThen(this.#underlying as MaybeReturnable, () => this.#commitError(slotButWithTypeScript));
-          } else {
-            // gotta close both underlying and active
-            const activeIter = active.iter;
-
-            this.#closeInnerThenUnderlying(activeIter as MaybeReturnable, () => this.#commitError(slotButWithTypeScript));
-          }
-        } else if (this.#active.type === 'reading underlying') {
-          slotButWithTypeScript.closeState = 'awaiting-return';
-          this.#markSomeCallsAsNoLongerGettingValues(this.#active.requested);
-          this.#active = { type: 'draining', resolveReturn: null, errorSlot: slotButWithTypeScript };
-        } else {
-          ASSERT(this.#closed(), 'no longer issuing pulls');
-          // nothing to close in this case
-          (slot as ErrorState).closeState = 'ready';
-        }
-        if (this.#isHeadOfQueue(slot)) {
-          this.#processQueue();
-        }
+        this.#gotErrorFromInner(slot, entry, inFlight, error);
       },
     );
   }
 
   // ------------------ Error handling stuff ------------------
 
+  // an error at `slot` (which belongs to `entry`, the bookkeeping for `inFlight`'s iterator):
+  // either the pull rejected, or the iterator was ill-behaved (see above), which we treat the
+  // same way — in particular the erroring iterator itself is never closed (a rejected next()
+  // exhausts it; an ill-behaved one claimed to be done)
+  #gotErrorFromInner(slot: Slot, entry: InnerIterEntry, inFlight: ActiveInnerIterState, error: unknown) {
+    ASSERT(slot.type === 'awaiting', 'slot awaiting');
+    slot.type = 'error';
+    const slotButWithTypeScript = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
+    slotButWithTypeScript.error = error;
+
+    const currentIndex = entry.slots.indexOf(slot);
+    ASSERT(currentIndex >= 0, 'slot is still present');
+    if (currentIndex + 1 > entry.minLength) {
+      entry.minLength = currentIndex + 1;
+    }
+
+    if (this.#active.type === 'iter') {
+      slotButWithTypeScript.closeState = 'awaiting-return';
+      const active = this.#active;
+      ASSERT(active.entry.slots.length > 0, 'active has at least one outstanding');
+      this.#closedButStillHaveValuesInFlight.push(active.entry);
+      this.#active = { type: 'finished' };
+
+      if (active === inFlight) {
+        // just gotta close underlying
+        this.#closeIterThen(this.#underlying as MaybeReturnable, () => this.#commitError(slotButWithTypeScript));
+      } else {
+        // gotta close both underlying and active
+        const activeIter = active.iter;
+
+        this.#closeInnerThenUnderlying(activeIter as MaybeReturnable, () => this.#commitError(slotButWithTypeScript));
+      }
+    } else if (this.#active.type === 'reading underlying') {
+      slotButWithTypeScript.closeState = 'awaiting-return';
+      this.#markSomeCallsAsNoLongerGettingValues(this.#active.requested);
+      this.#active = { type: 'draining', resolveReturn: null, errorSlot: slotButWithTypeScript };
+    } else {
+      ASSERT(this.#closed(), 'no longer issuing pulls');
+      // nothing to close in this case
+      (slot as ErrorState).closeState = 'ready';
+    }
+    // an error occupies its position just like a value, so it can be committed to its
+    // call as soon as its destination is known (though if a close is in flight the
+    // rejection itself waits for that close to settle)
+    if (this.#allExactBefore(entry)) {
+      this.#processQueue();
+    }
+  }
+
   // we were holding this error until some event finished, and it now has
   #commitError(slot: ErrorState) {
-    if ((slot as Slot).type === 'removed') return;
     ASSERT(slot.closeState === 'awaiting-return', 'error was pending');
     const slotButWithTypescript = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
     if (slotButWithTypescript.reject) {
       slotButWithTypescript.reject(slot.error);
     } else {
       (slot as ErrorState).closeState = 'ready';
-      // if this is head of queue, caller is responsible for dealing with that
+      // if this error is already deliverable, caller is responsible for dealing with that
       // this is generally only possible if the above-mentioned events we were waiting for took zero ticks
     }
   }
@@ -345,7 +388,7 @@ class FlatMapHelper {
       } else {
         const slot: ErrorState = { type: 'error', error, closeState: 'awaiting-return', reject: null };
         this.#active = slot;
-        if (this.#isHeadOfQueue(slot)) {
+        if (this.#allClosedExact()) {
           this.#processQueue();
         }
         this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, closeError) => {
@@ -365,7 +408,7 @@ class FlatMapHelper {
     const slot: ErrorState = { type: 'error', error, closeState: 'awaiting-return', reject: null };
     this.#markSomeCallsAsNoLongerGettingValues(requested - 1); // -1 for this error
     this.#active = slot;
-    if (this.#closedButStillHaveValuesInFlight.length === 0) {
+    if (this.#allClosedExact()) {
       this.#processQueue();
     }
     this.#closeIterThen(this.#underlying as MaybeReturnable, (gotError, error) => this.#commitError(slot));
@@ -392,8 +435,10 @@ class FlatMapHelper {
 
   #markUnderlyingAsFinished() {
     ASSERT(this.#active.type === 'reading underlying' || this.#active.type === 'iter', 'active is reading underlying or iter'); // latter only via return()
-    if (this.#active.type === 'iter' && this.#active.values.length > 0) {
-      this.#closedButStillHaveValuesInFlight.push(this.#active.values);
+    if (this.#active.type === 'iter' && this.#active.entry.slots.length > 0) {
+      // NB: its maxLength stays Infinity — we never learn how long it would have been —
+      // but nothing will ever be queued after it, so that can't hold anything up
+      this.#closedButStillHaveValuesInFlight.push(this.#active.entry);
     }
     this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#valuesWeCouldDeliverFromClosedInnerIterators());
   }
@@ -427,69 +472,132 @@ class FlatMapHelper {
     return this.#active.type === 'error' || this.#active.type === 'draining' || this.#active.type === 'finished';
   }
 
-  #valuesWeCouldDeliverFromClosedInnerIterators() {
-    return this.#closedButStillHaveValuesInFlight.reduce((acc, x) => acc + x.length, 0);
+  #undeliveredCount(entry: InnerIterEntry) {
+    let count = 0;
+    for (const slot of entry.slots) {
+      if (slot.type !== 'delivered') ++count;
+    }
+    return count;
   }
 
-  #isHeadOfQueue(slot: Slot) {
-    return this.#closedButStillHaveValuesInFlight.length === 0
-      ? this.#active.type === 'iter' && this.#active.values[0] === slot
-        || this.#active.type === 'error' && this.#active === slot
-      : this.#closedButStillHaveValuesInFlight[0][0] === slot; // assert: this.#closedButStillHaveValuesInFlight[0].length > 0
+  #valuesWeCouldDeliverFromClosedInnerIterators() {
+    return this.#closedButStillHaveValuesInFlight.reduce((acc, entry) => acc + this.#undeliveredCount(entry), 0);
+  }
+
+  // whether every queued iterator before `entry` has a known exact length, i.e.
+  // whether the destinations of `entry`'s slots are known
+  #allExactBefore(entry: InnerIterEntry) {
+    for (const e of this.#closedButStillHaveValuesInFlight) {
+      if (e === entry) return true;
+      if (e.minLength !== e.maxLength) return false;
+    }
+    return true; // `entry` is the active iterator's, which comes after all the closed ones
+  }
+
+  // ditto, for things which come after every queued iterator (a terminal error)
+  #allClosedExact() {
+    return this.#closedButStillHaveValuesInFlight.every(e => e.minLength === e.maxLength);
   }
 
   // ------------------ Queue processing ------------------
 
-  // returns false if was awaiting
-  #dispatchHeadOfInFlight(values: Slot[]): boolean {
-    const head = values[0];
-    if (head.type === 'awaiting') {
-      return false;
-    }
-    ASSERT(head.type === 'value' || head.type === 'error', 'can only dispatch value or error');
-    values.shift();
-    if (head.type === 'value') {
-      this.#calls.shift()!.resolve({ value: head.value, done: false });
-    } else if (head.type === 'error') {
-      const call = this.#calls.shift()!;
-      if (head.closeState === 'awaiting-return') {
-        head.reject = call.reject;
-      } else {
-        ASSERT(head.closeState === 'ready', 'closeState ready');
-        call.reject(head.error);
-      }
-    }
-    return true;
-  }
-
+  // Deliver every settled slot whose destination is known: walk the queue from the
+  // head, delivering settled slots to their calls, until an iterator whose exact
+  // length is unknown blocks everything after it. Also drops delivered slots from
+  // the head of the queue (and drained iterators with them) as they can no longer
+  // affect anything.
+  //
+  // Callers gate invocations on the relevant prefix of the queue being exact, so a
+  // call to this always delivers something... except when it is merely dropping a
+  // drained head entry, or when the only deliverable slots were already delivered
+  // eagerly. It's cheap in those cases.
   #processQueue() {
-    // assert: we are going to do at least one unit of work
-    while (this.#closedButStillHaveValuesInFlight.length > 0) {
-      const head = this.#closedButStillHaveValuesInFlight[0];
-      while (head.length > 0) {
-        if (!this.#dispatchHeadOfInFlight(head)) {
-          return;
-        }
+    const closed = this.#closedButStillHaveValuesInFlight;
+    // drop delivered slots at the head of the queue, and drained iterators with them
+    while (closed.length > 0) {
+      const head = closed[0];
+      while (head.slots.length > 0 && head.slots[0].type === 'delivered') {
+        head.slots.shift();
+        ASSERT(head.minLength > 0, 'delivered slots count towards minLength');
+        --head.minLength;
+        --head.maxLength;
       }
-      this.#closedButStillHaveValuesInFlight.shift();
+      if (head.slots.length > 0) break;
+      closed.shift();
     }
-    if (this.#active.type === 'error') {
-      if (this.#active.closeState === 'ready') {
-        this.#calls.shift()!.reject(this.#active.error);
-      } else {
-        this.#active.reject = this.#calls.shift()!.reject;
+
+    let offset = 0; // total undelivered slots in the entries walked so far == index of the next call fed by anything after them
+    for (const entry of closed) {
+      offset += this.#deliverSettledSlots(entry, offset);
+      if (entry.minLength !== entry.maxLength) {
+        // this iterator's length is unknown, so the destinations of everything after it are too
+        return;
       }
+    }
+
+    if (this.#active.type === 'error') {
+      // a terminal error from the underlying or the mapper; it goes to the last outstanding call
+      ASSERT(offset === this.#calls.length - 1, 'the terminal error is the last outstanding call');
+      const active = this.#active;
+      const call = this.#calls.pop()!;
       this.#active = { type: 'finished' };
-      // TODO maybe errors just go as a length-1 entry on top of closedButStillHaveValuesInFlight?
+      if (active.closeState === 'awaiting-return') {
+        active.reject = call.reject;
+      } else {
+        ASSERT(active.closeState === 'ready', 'closeState ready');
+        call.reject(active.error);
+      }
       return;
     }
     if (this.#active.type === 'iter') {
-      while (this.#active.values.length > 0) {
-        if (!this.#dispatchHeadOfInFlight(this.#active.values)) {
-          return;
+      const entry = this.#active.entry;
+      this.#deliverSettledSlots(entry, offset);
+      if (closed.length === 0) {
+        // the active iterator is at the head of the queue, so its delivered slots can be dropped too
+        while (entry.slots.length > 0 && entry.slots[0].type === 'delivered') {
+          entry.slots.shift();
+          ASSERT(entry.minLength > 0, 'delivered slots count towards minLength');
+          --entry.minLength;
         }
       }
     }
+  }
+
+  // deliver every settled slot of `entry` to its call; `offset` is the index into
+  // #calls of the first call fed by this entry. Returns the number of undelivered
+  // slots remaining (all awaiting).
+  #deliverSettledSlots(entry: InnerIterEntry, offset: number): number {
+    let undelivered = 0;
+    for (const slot of entry.slots) {
+      if (slot.type === 'delivered') continue;
+      if (slot.type === 'awaiting') {
+        ++undelivered;
+        continue;
+      }
+      const call = this.#calls.splice(offset + undelivered, 1)[0];
+      ASSERT(call != null, 'every undelivered slot has a call');
+      if (slot.type === 'value') {
+        const { value } = slot;
+        (slot as Slot).type = 'delivered';
+        (slot as unknown as { value: unknown }).value = null; // for memory reasons
+        call.resolve({ value, done: false });
+      } else {
+        ASSERT(slot.type === 'error', 'slot is settled');
+        const errorSlot = slot as ErrorState;
+        if (errorSlot.closeState === 'awaiting-return') {
+          // the rejection is gated on a close; hand it the call's reject for when that settles
+          (errorSlot as Extract<ErrorState, { closeState: 'awaiting-return' }>).reject = call.reject;
+          (slot as Slot).type = 'delivered';
+        } else {
+          ASSERT(errorSlot.closeState === 'ready', 'closeState ready');
+          const { error } = errorSlot;
+          (slot as Slot).type = 'delivered';
+          (slot as unknown as { error: unknown }).error = null; // for memory reasons
+          call.reject(error);
+        }
+      }
+    }
+    return undelivered;
   }
 
   // ------------------ Public API ------------------

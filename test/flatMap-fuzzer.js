@@ -67,6 +67,30 @@ const innerError = (k, j) => `Ei${k}.${j}`;
 // from stream errors above: a close failure must never surface as a stream error.
 const underlyingReturnError = 'EretU';
 const innerReturnError = (k) => `EretI${k}`;
+// flatMap surfaces a synthetic TypeError with this message for ill-behaved inner
+// iterators (see innerIllBehaved below); no stub ever produces it.
+const illBehavedError = 'inner iterator reported done at a position which already yielded a value';
+
+// An outcome is OBSERVED by flatMap unless a done from the SAME inner at a LOWER
+// pull index settled EARLIER: that done truncates the later in-flight pulls, so
+// their outcomes are post-end noise that flatMap discards. Both orders matter (a
+// done at a HIGHER index does not truncate earlier pulls, and a done settling
+// AFTER an outcome arrives too late to hide it), so we compare pull index and
+// settlement order (`seq`, a global counter recording when each outcome became
+// known).
+const outcomeObserved = (inner, p) =>
+  !inner.pulls.some((q) => q.status === 'done' && q.idx < p.idx && q.seq < p.seq);
+
+// An inner iterator is ILL-BEHAVED if flatMap observed a { done: true } at some
+// index after having already observed a value or error at a HIGHER index of the
+// same iterator: a well-behaved iterator can never do that (done marks the end,
+// so those later outcomes would be retroactively dropped — possibly after having
+// been delivered). flatMap responds by surfacing the synthetic `illBehavedError`
+// TypeError at the done's position instead of treating the done as an early end;
+// like any other inner error, it is terminal for the stream.
+const innerIllBehaved = (inner) =>
+  inner.pulls.some((d) => d.status === 'done' && outcomeObserved(inner, d) &&
+    inner.pulls.some((v) => (v.status === 'value' || v.status === 'error') && v.idx > d.idx && v.seq < d.seq && outcomeObserved(inner, v)));
 
 function fmtSettle(s) {
   if (s.type === 'value') return `{value:${s.value},done:false}`;
@@ -151,17 +175,13 @@ async function runSchedule(maxEvents, chooser) {
   // still never ends the stream, so it is deliberately not included here.)
   //
   // BUT an inner-pull error only terminates the helper if flatMap actually
-  // OBSERVES it: a done from the SAME inner at a LOWER pull index that settled
-  // EARLIER truncates the later in-flight pulls, so their outcomes are post-end
-  // noise that flatMap discards -- the helper lives on. Both orders matter (a
-  // done at a HIGHER index does not truncate earlier pulls, and a done settling
-  // AFTER the error arrives too late), so we compare pull index and settlement
-  // order (`seq`, a global counter recording when each outcome became known).
-  const innerErrorObserved = (inner, p) =>
-    !inner.pulls.some((q) => q.status === 'done' && q.idx < p.idx && q.seq < p.seq);
+  // OBSERVES it (see outcomeObserved above) -- an unobserved error is post-end
+  // noise that flatMap discards, and the helper lives on. An observed ill-behaved
+  // done (see innerIllBehaved) is a stream error of its own.
   const streamErrored = () =>
-    rec.inners.some((inner) => inner.pulls.some((p) => p.status === 'error' && innerErrorObserved(inner, p))) ||
-    rec.mappers.some((m) => m.outcome === 'error');
+    rec.inners.some((inner) => inner.pulls.some((p) => p.status === 'error' && outcomeObserved(inner, p))) ||
+    rec.mappers.some((m) => m.outcome === 'error') ||
+    rec.inners.some(innerIllBehaved);
   const isFinished = () => consumerReturned || rec.underlying.finished != null || rec.underlying.returnCalls > 0 || streamErrored();
 
   let eventSeq = 0;
@@ -226,15 +246,11 @@ async function runSchedule(maxEvents, chooser) {
   // only after that close settles, so a pending close with every consumer call
   // settled means flatMap fired a close nothing can ever observe.
   //
-  // DELIBERATE WEAKENING: there is one legitimate "orphaned close" -- an error
-  // triggers a close, and before that close settles an inner done at a lower
-  // pull index truncates the still-undelivered error; the calls then resolve
-  // done immediately and the close's outcome is swallowed (pinned by unit test
-  // flatmap-test-062). We exempt any run containing such a discarded
-  // (produced-but-never-delivered) error, which also exempts any OTHER pending
-  // close in that run -- a real loss of strength, accepted for now. If the
-  // implementation ever gates those dones on the close instead, remove the
-  // exemption (and flip the unit test).
+  // (This used to be weakened for one legitimate "orphaned close": an inner done
+  // at a lower pull index could truncate a still-undelivered error whose close
+  // was in flight. Such a done is now surfaced as an ill-behaved-iterator error
+  // instead of truncating -- see flatmap-test-062 -- so an observed error can no
+  // longer be discarded and the strict check holds.)
   const reportedSettlementViolations = new Set();
   const reportSettlementViolation = (msg) => {
     if (reportedSettlementViolations.has(msg)) return;
@@ -247,13 +263,7 @@ async function runSchedule(maxEvents, chooser) {
       for (const c of unsettled) reportSettlementViolation(`liveness: ${c.kind}#${c.id} is unsettled at quiescence with nothing pending`);
     }
     if (pendingReturns.length > 0 && unsettled.length === 0) {
-      // Every call has settled, so any error that has not been delivered by now
-      // never will be: it was discarded, and may have orphaned a close.
-      const delivered = new Set(rec.calls.filter((c) => c.settle.type === 'reject').map((c) => c.settle.error));
-      const discardedErrorExists = [...realErrors(rec)].some((e) => !delivered.has(e));
-      if (!discardedErrorExists) {
-        reportSettlementViolation(`close-gating: ${pendingReturns.map((r) => r.id).join(', ')} pending but every consumer call has settled`);
-      }
+      reportSettlementViolation(`close-gating: ${pendingReturns.map((r) => r.id).join(', ')} pending but every consumer call has settled`);
     }
   };
 
@@ -548,10 +558,14 @@ function checkInvariants(rec) {
   // (I4) every surfaced rejection carries an error that was actually produced.
   // Multiple rejections ARE allowed: concurrently-issued pulls each deliver their
   // own result -- value or error -- in order, so e.g. two inner pulls that both
-  // reject surface two errors.
+  // reject surface two errors. The one error no stub produces is the synthetic
+  // ill-behaved-iterator TypeError, allowed exactly when some inner really was
+  // ill-behaved (we don't pin its position here).
   const errs = realErrors(rec);
+  const anyIllBehaved = rec.inners.some(innerIllBehaved);
   for (const c of nextCalls) {
     if (c.settle && c.settle.type === 'reject' && !errs.has(c.settle.error)) {
+      if (anyIllBehaved && c.settle.error === illBehavedError) continue;
       add(`next#${c.id} rejected with ${c.settle.error}, which was never produced`);
     }
   }
@@ -600,11 +614,14 @@ function checkInvariants(rec) {
     deliveredByIter.get(k).push(j);
   }
 
-  // (I1, contiguity) Within one inner iterator, delivered item indices must be a
-  // gap-free prefix 0,1,2,...: an inner's pulls are delivered in order and none is
-  // skipped. (Strict increase alone would miss a dropped middle item like
-  // delivering 0:0 then 0:2.)
+  // (I1, contiguity) Within one WELL-BEHAVED inner iterator, delivered item
+  // indices must be a gap-free prefix 0,1,2,...: an inner's pulls are delivered
+  // in order and none is skipped. (Strict increase alone would miss a dropped
+  // middle item like delivering 0:0 then 0:2.) An ill-behaved inner is exempt:
+  // the position of its lying done takes the synthetic TypeError instead of a
+  // value, so its delivered indices legitimately have gaps.
   for (const [k, js] of deliveredByIter) {
+    if (innerIllBehaved(rec.inners[k])) continue;
     for (let t = 0; t < js.length; t++) {
       if (js[t] !== t) { add(`inner I${k} delivered non-contiguous item indices [${js.join(',')}] (expected 0..${js.length - 1})`); break; }
     }

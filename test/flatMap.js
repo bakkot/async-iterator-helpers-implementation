@@ -41,11 +41,20 @@ import { scenarioTest } from './scenario-to-test.js';
 //     count), which produces the next inner iterator. Only the UNDERLYING running
 //     out (`done`) ends the stream.
 //
-//   * Because the concatenation order is fixed, a later value can never be
-//     delivered before an earlier position's fate is known — exactly like filter.
-//     When an inner iterator reports `done` while some of its own earlier pulls
-//     are still in flight, those pulls stay queued ahead of the next iterator's
-//     values so delivery order is preserved.
+//   * Because the concatenation order is fixed, a value can only be delivered
+//     once we know WHICH call it belongs to. Within a single inner iterator that
+//     is always known: values cannot be dropped (a well-behaved iterator never
+//     reports done below a position it has already produced), so the k-th
+//     outstanding pull of an iterator feeds the k-th outstanding position for
+//     that iterator, and its values/errors are delivered EAGERLY, out of
+//     settlement order if need be. Across iterators it is known only once every
+//     EARLIER queued iterator's exact remaining length is known — an iterator
+//     pins its length by settling { done: true } immediately above a settled
+//     value (minLength meets maxLength), or by draining entirely. Values whose
+//     earlier iterators have unknown lengths buffer until then. A { done: true }
+//     below an already-settled value or error is ill-behaved (it would
+//     retroactively drop them, some possibly already delivered) and is surfaced
+//     as a TypeError at that position instead.
 //
 // Throughout, the mapper is driven by a controlledFn whose call we settle with an
 // inner controlledSource's `.iterator`; that lets us control both *when* the
@@ -192,14 +201,15 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// Out-of-order settlement within a single inner iterator is reordered before
-// delivery. Two concurrent inner pulls are in flight; the LATER one settles
-// first, but it cannot be delivered ahead of the earlier (still-pending) one —
-// each consumer call receives its own in-call-order value.
+// Out-of-order settlement within a single inner iterator is delivered EAGERLY.
+// Two concurrent inner pulls are in flight; the LATER one settles first. Its
+// destination is already known — values cannot be dropped, so the k-th
+// outstanding pull of the head-of-queue iterator feeds the k-th outstanding
+// call — so it is delivered immediately, before the earlier pull settles.
 tests.push(scenarioTest({
   id: "flatmap-test-004",
   helper: "flatMap",
-  label: "flatMap: out-of-order inner settlement is delivered in order",
+  label: "flatMap: a later value of the head-of-queue iterator is delivered eagerly to its own call",
   ticks: [
     { note: "two concurrent calls, one underlying pull", steps: [ { events: [
       { type: "next", result: "r0" },
@@ -215,14 +225,15 @@ tests.push(scenarioTest({
       { type: "inner-pull", pull: "a0", iterator: "A" },
       { type: "inner-pull", pull: "a1", iterator: "A" },
     ] } ] },
-    // The second inner pull settles first; it must wait for the first.
-    { note: "a later inner value cannot settle ahead of an earlier one", steps: [ { events: [
+    // The second inner pull settles first and is delivered eagerly to the
+    // second call.
+    { note: "the later inner value is delivered eagerly to its own call", steps: [ { events: [
       { type: "settle", pull: "a1", value: "a1" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
-    { note: "once the earlier value arrives, both settle in call order", steps: [ { events: [
+    { note: "the earlier value is delivered when it arrives", steps: [ { events: [
       { type: "settle", pull: "a0", value: "a0" },
       { type: "result", result: "r0", value: "a0", from: "a0" },
-      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
   ],
 }, { helper: flatMap, utils }));
@@ -1185,12 +1196,12 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// The in-order delivery guarantee survives return(): an already-requested value
-// that settles out of order still waits for the earlier one.
+// Eager delivery survives return(): an already-requested value that settles out
+// of order is still delivered immediately to its own call.
 tests.push(scenarioTest({
   id: "flatmap-test-027",
   helper: "flatMap",
-  label: "flatMap: after return(), already-requested values are still delivered in order",
+  label: "flatMap: after return(), an out-of-order already-requested value is delivered eagerly",
   ticks: [
     { note: "two concurrent calls, one underlying pull", steps: [ { events: [
       { type: "next", result: "r0" },
@@ -1218,14 +1229,14 @@ tests.push(scenarioTest({
       { type: "close-settled", target: "source" },
       { type: "result", result: "ret", done: true },
     ] } ] },
-    // The second pull settles first; it must still wait for the first.
-    { note: "a later value cannot settle ahead of the earlier one", steps: [ { events: [
+    // The second pull settles first; its destination is known, so it delivers.
+    { note: "the later value is delivered eagerly to its own call", steps: [ { events: [
       { type: "settle", pull: "a1", value: "a1" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
-    { note: "both already-requested values settle in call order", steps: [ { events: [
+    { note: "the earlier value is delivered when it arrives", steps: [ { events: [
       { type: "settle", pull: "a0", value: "a0" },
       { type: "result", result: "r0", value: "a0", from: "a0" },
-      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
   ],
 }, { helper: flatMap, utils }));
@@ -2706,16 +2717,15 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// A head inner-iterator error closes the underlying via it.return(); while that
-// close is still PENDING, a value already buffered behind the error (from a later
-// pull of the same iterator) is delivered immediately to its call — the committed
-// head error's recipient is fixed, so following values needn't wait for the close.
-// Only the errored call waits for it.return() to settle. (The flatMap analogue of
-// filter's "head predicate-error close delivers the value behind it immediately".)
+// A head inner-iterator error closes the underlying via it.return(); a value from
+// a LATER pull of the same iterator that had already been delivered (eagerly, at
+// its own settlement) is unaffected, and only the errored call waits for
+// it.return() to settle. (The flatMap analogue of filter's "head predicate-error
+// close delivers the value behind it immediately".)
 tests.push(scenarioTest({
   id: "flatmap-test-057",
   helper: "flatMap",
-  label: "flatMap: a held inner-error close delivers a value buffered behind it without waiting",
+  label: "flatMap: a held inner-error close only delays the errored call itself",
   ticks: [
     { note: "two coalesced calls, one underlying pull", steps: [ { events: [
       { type: "next", result: "r0" },
@@ -2731,18 +2741,16 @@ tests.push(scenarioTest({
       { type: "inner-pull", pull: "a0", iterator: "A" },
       { type: "inner-pull", pull: "a1", iterator: "A" },
     ] } ] },
-    // The later pull (#1) yields first: a1 is buffered behind the still-pending head
-    // pull (#0).
-    { note: "the later value is buffered behind the pending head", steps: [ { events: [
+    // The later pull (#1) yields first and is delivered eagerly to r1.
+    { note: "the later value is delivered eagerly, ahead of the pending head", steps: [ { events: [
       { type: "settle", pull: "a1", value: "a1" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
     // The head pull (#0) errors with the underlying close held pending. The error is
-    // committed to r0 (withheld), and the buffered a1 is delivered to r1 immediately
-    // — without waiting for it.return() to settle.
-    { note: "the close is pending; the buffered value delivers while the error waits", steps: [ { events: [
+    // committed to r0 but withheld until the close settles.
+    { note: "the head error closes the source; the error is withheld", steps: [ { events: [
       { type: "settle", pull: "a0", error: "boom" },
       { type: "close", target: "source" },
-      { type: "result", result: "r1", value: "a1", from: "a1" },
     ] } ] },
     // Only once it.return() settles does the errored call reject.
     { note: "the errored call rejects once the close settles", steps: [ { events: [
@@ -3049,22 +3057,22 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// --- an orphaned close ------------------------------------------------------
+// --- ill-behaved inner iterators ---------------------------------------------
 //
-// An inner done can discard a buffered inner error whose source close is still
-// in flight: A's pull #1 rejects while pull #0 is still pending, so flatMap
-// terminates and closes the source; pull #0 then reports done, truncating the
-// never-delivered error. Both calls resolve done immediately, NOT gated on the
-// still-pending source close, and the close's eventual outcome is observed by
-// nothing (deliberately swallowed: the error that triggered it was discarded).
-// This pins the "orphaned close" semantics; the fuzzer's close-gating invariant
-// (I11) is weakened to exempt exactly this corner (see test/flatMap-fuzzer.js).
-// If we ever decide the dones should instead wait for the close, flip this test
-// and strengthen the fuzzer.
+// A { done: true } at a position BELOW an already-settled value or error is
+// ill-behaved: it retroactively claims positions we have already seen (and
+// possibly already delivered) don't exist. Rather than truncating them, the done
+// is surfaced as a TypeError at its own position. Here A's pull #1 rejects while
+// pull #0 is still pending (so flatMap terminates and closes the source, holding
+// the error for r1); pull #0 then reports done — which contradicts the error we
+// already saw at #1 — so r0 rejects with the ill-behaved TypeError immediately,
+// and r1 still receives the original error once the close settles. (Previously
+// the done discarded the held error and orphaned the close; the fuzzer's
+// close-gating invariant I11 is strict again now that this cannot happen.)
 tests.push(scenarioTest({
   id: "flatmap-test-062",
   helper: "flatMap",
-  label: "flatMap: an inner done orphans the close of a discarded inner error",
+  label: "flatMap: a done below an already-erroring later pull is surfaced as ill-behaved",
   ticks: [
     { note: "two calls, one underlying pull", steps: [ { events: [
       { type: "next", result: "r0" },
@@ -3084,13 +3092,15 @@ tests.push(scenarioTest({
       { type: "settle", pull: "a1", error: "boom" },
       { type: "close", target: "source" },
     ] } ] },
-    { note: "the earlier done discards the held error; the dones do not wait for the close", steps: [ { events: [
+    // The done at #0 contradicts the already-seen error at #1: ill-behaved. Its
+    // position takes a TypeError, which needs no (further) close of its own.
+    { note: "the earlier done is ill-behaved and rejects its own call", steps: [ { events: [
       { type: "settle", pull: "a0", done: true },
-      { type: "result", result: "r0", done: true },
-      { type: "result", result: "r1", done: true },
+      { type: "result", result: "r0", error: "inner iterator reported done at a position which already yielded a value" },
     ] } ] },
-    { note: "the orphaned close settles; nothing observes it", steps: [ { events: [
+    { note: "the held error still reaches its call once the close settles", steps: [ { events: [
       { type: "close-settled", target: "source" },
+      { type: "result", result: "r1", error: "boom" },
     ] } ] },
     { note: "the helper is finished", steps: [ { events: [
       { type: "next", result: "r2" },
@@ -3099,11 +3109,17 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-// orphaned error
+// The ill-behaved-done case with a live LATER iterator: A (parked, feeding r0/r1)
+// errors at pull #1 while the freed demand is already being served by B; the
+// error closes B then the source, holding boom for r1. A's pull #0 then reports
+// done — ill-behaved, since we already saw the error at #1 — so r0 rejects with
+// the TypeError; boom still reaches r1 after the closes; and B's in-flight value
+// still reaches r2. (Previously the done discarded the held error and settled
+// r1/r2 done.)
 tests.push(scenarioTest({
-  id: "flatmap-test-063",
+  id: "flatmap-test-065",
   helper: "flatMap",
-  label: "error which was blocked on closing is discarded by earlier done",
+  label: "flatMap: an ill-behaved done below a held error does not discard it",
   ticks: [
     { steps: [
       {
@@ -3184,8 +3200,7 @@ tests.push(scenarioTest({
       {
         events: [
           { type: "settle", pull: "a0", done: true },
-          { type: "result", result: "r1", done: true },
-          { type: "result", result: "r2", done: true },
+          { type: "result", result: "r0", error: "inner iterator reported done at a position which already yielded a value" },
         ],
       },
     ] },
@@ -3201,6 +3216,7 @@ tests.push(scenarioTest({
       {
         events: [
           { type: "close-settled", target: "source" },
+          { type: "result", result: "r1", error: "boom" },
         ],
       },
     ] },
@@ -3208,10 +3224,279 @@ tests.push(scenarioTest({
       {
         events: [
           { type: "settle", pull: "b0", value: "b0" },
-          { type: "result", result: "r0", value: "b0", from: "b0" },
+          { type: "result", result: "r2", value: "b0", from: "b0" },
         ],
       },
     ] },
+  ],
+}, { helper: flatMap, utils }));
+
+// ============================================================================
+// Eager delivery (values delivered as soon as their destination is known)
+// ============================================================================
+// An iterator whose { done: true } lands immediately above a settled value has
+// pinned its exact length (minLength meets maxLength), so values from LATER
+// iterators no longer need to wait for its still-pending earlier pulls: their
+// destinations are already known. Here A settles its second pull (a1 -> r1,
+// eagerly) and then reports done at #2, fixing A's length at exactly 2 with
+// pull #0 still in flight; B's first value can then flow straight to r2, and
+// a0 to r0 whenever it arrives.
+tests.push(scenarioTest({
+  id: "flatmap-test-066",
+  helper: "flatMap",
+  label: "flatMap: a parked iterator with a known exact length lets later values through eagerly",
+  ticks: [
+    { note: "three concurrent calls, one underlying pull", steps: [ { events: [
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "next", result: "r2" },
+      { type: "pull", pull: "u0" },
+    ] } ] },
+    { note: "the mapper is invoked once", steps: [ { events: [
+      { type: "settle", pull: "u0", value: 1 },
+      { type: "fn", call: "p0", arg: 1, from: "u0" },
+    ] } ] },
+    { note: "demand 3 fans out across A", steps: [ { events: [
+      { type: "fn-settle", call: "p0", iterator: "A" },
+      { type: "inner-pull", pull: "a0", iterator: "A" },
+      { type: "inner-pull", pull: "a1", iterator: "A" },
+      { type: "inner-pull", pull: "a2", iterator: "A" },
+    ] } ] },
+    // A's middle pull settles first and is delivered eagerly.
+    { note: "the mid-iterator value is delivered eagerly", steps: [ { events: [
+      { type: "settle", pull: "a1", value: "a1" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
+    ] } ] },
+    // The done right above the settled value pins A's length at exactly 2.
+    { note: "the done pins A's exact length; the freed demand reads the underlying", steps: [ { events: [
+      { type: "settle", pull: "a2", done: true },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    { note: "the mapper is invoked again", steps: [ { events: [
+      { type: "settle", pull: "u1", value: 2 },
+      { type: "fn", call: "p1", arg: 2, from: "u1" },
+    ] } ] },
+    { note: "the redirected demand pulls B once", steps: [ { events: [
+      { type: "fn-settle", call: "p1", iterator: "B" },
+      { type: "inner-pull", pull: "b0", iterator: "B" },
+    ] } ] },
+    // B's value is NOT blocked on A's still-pending pull #0: A's length is known.
+    { note: "the later iterator's value is delivered past the parked pull", steps: [ { events: [
+      { type: "settle", pull: "b0", value: "b0" },
+      { type: "result", result: "r2", value: "b0", from: "b0" },
+    ] } ] },
+    { note: "the parked value still reaches its own call", steps: [ { events: [
+      { type: "settle", pull: "a0", value: "a0" },
+      { type: "result", result: "r0", value: "a0", from: "a0" },
+    ] } ] },
+  ],
+}, { helper: flatMap, utils }));
+
+// The simplest ill-behaved case: the head-of-queue iterator settles a later pull
+// with a value (delivered eagerly), then settles an EARLIER pull done. The done
+// would retroactively drop the already-delivered value, so it is surfaced as a
+// TypeError at its own position; like any inner error it closes the underlying
+// first, and the rejection waits for that close to settle.
+tests.push(scenarioTest({
+  id: "flatmap-test-067",
+  helper: "flatMap",
+  label: "flatMap: a done below an already-delivered value is surfaced as a TypeError",
+  ticks: [
+    { note: "two concurrent calls, one underlying pull", steps: [ { events: [
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "pull", pull: "u0" },
+    ] } ] },
+    { note: "the mapper is invoked once", steps: [ { events: [
+      { type: "settle", pull: "u0", value: 1 },
+      { type: "fn", call: "p0", arg: 1, from: "u0" },
+    ] } ] },
+    { note: "demand 2 fans out across A", steps: [ { events: [
+      { type: "fn-settle", call: "p0", iterator: "A" },
+      { type: "inner-pull", pull: "a0", iterator: "A" },
+      { type: "inner-pull", pull: "a1", iterator: "A" },
+    ] } ] },
+    { note: "the later value is delivered eagerly", steps: [ { events: [
+      { type: "settle", pull: "a1", value: "a1" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
+    ] } ] },
+    // The done at #0 contradicts the delivered value at #1. The iterator claimed
+    // to be done, so it is not closed — only the underlying is.
+    { note: "the ill-behaved done closes the underlying", steps: [ { events: [
+      { type: "settle", pull: "a0", done: true },
+      { type: "close", target: "source" },
+    ] } ] },
+    { note: "the TypeError reaches the done's position once the close settles", steps: [ { events: [
+      { type: "close-settled", target: "source" },
+      { type: "result", result: "r0", error: "inner iterator reported done at a position which already yielded a value" },
+    ] } ] },
+    { note: "the helper is finished", steps: [ { events: [
+      { type: "next", result: "r2" },
+      { type: "result", result: "r2", done: true },
+    ] } ] },
+  ],
+}, { helper: flatMap, utils }));
+
+// An ill-behaved done on a PARKED iterator while a different iterator is live:
+// like any inner error from a parked iterator, it closes the active iterator
+// first, then the underlying, and the TypeError surfaces only after both closes
+// settle. The active iterator's already-issued pull still delivers.
+tests.push(scenarioTest({
+  id: "flatmap-test-068",
+  helper: "flatMap",
+  label: "flatMap: an ill-behaved done on a parked iterator closes the active iterator then the underlying",
+  ticks: [
+    { note: "three concurrent calls, one underlying pull", steps: [ { events: [
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "next", result: "r2" },
+      { type: "pull", pull: "u0" },
+    ] } ] },
+    { note: "the mapper is invoked once", steps: [ { events: [
+      { type: "settle", pull: "u0", value: 1 },
+      { type: "fn", call: "p0", arg: 1, from: "u0" },
+    ] } ] },
+    { note: "demand 3 fans out across A", steps: [ { events: [
+      { type: "fn-settle", call: "p0", iterator: "A" },
+      { type: "inner-pull", pull: "a0", iterator: "A" },
+      { type: "inner-pull", pull: "a1", iterator: "A" },
+      { type: "inner-pull", pull: "a2", iterator: "A" },
+    ] } ] },
+    { note: "the mid-iterator value is delivered eagerly", steps: [ { events: [
+      { type: "settle", pull: "a1", value: "a1" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
+    ] } ] },
+    { note: "A parks with a known exact length; the freed demand reads the underlying", steps: [ { events: [
+      { type: "settle", pull: "a2", done: true },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    { note: "the mapper is invoked again", steps: [ { events: [
+      { type: "settle", pull: "u1", value: 2 },
+      { type: "fn", call: "p1", arg: 2, from: "u1" },
+    ] } ] },
+    { note: "the redirected demand pulls the live inner B", steps: [ { events: [
+      { type: "fn-settle", call: "p1", iterator: "B" },
+      { type: "inner-pull", pull: "b0", iterator: "B" },
+    ] } ] },
+    // A's parked pull #0 reports done — below the value we saw (and delivered)
+    // at #1. The live iterator B is closed first.
+    { note: "the ill-behaved done closes the active iterator first", steps: [ { events: [
+      { type: "settle", pull: "a0", done: true },
+      { type: "close", target: "B" },
+    ] } ] },
+    { note: "then the underlying", steps: [ { events: [
+      { type: "close-settled", target: "B" },
+      { type: "close", target: "source" },
+    ] } ] },
+    { note: "the TypeError surfaces after both closes settle", steps: [ { events: [
+      { type: "close-settled", target: "source" },
+      { type: "result", result: "r0", error: "inner iterator reported done at a position which already yielded a value" },
+    ] } ] },
+    { note: "the already-issued pull on B still delivers", steps: [ { events: [
+      { type: "settle", pull: "b0", value: "b0" },
+      { type: "result", result: "r2", value: "b0", from: "b0" },
+    ] } ] },
+  ],
+}, { helper: flatMap, utils }));
+
+// An error from the UNDERLYING iterator is also delivered eagerly when every
+// parked iterator's exact length is known: the error's position — right after
+// the last value of the last parked iterator — is fixed, so it needn't wait for
+// the parked pulls to settle. (Contrast test 034, where the parked iterator's
+// length is unknown and the error buffers behind it.) An underlying error does
+// not close the source, so nothing gates the rejection.
+tests.push(scenarioTest({
+  id: "flatmap-test-069",
+  helper: "flatMap",
+  label: "flatMap: an underlying error behind a known-length parked iterator surfaces eagerly",
+  ticks: [
+    { note: "three concurrent calls, one underlying pull", steps: [ { events: [
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "next", result: "r2" },
+      { type: "pull", pull: "u0" },
+    ] } ] },
+    { note: "the mapper is invoked once", steps: [ { events: [
+      { type: "settle", pull: "u0", value: 1 },
+      { type: "fn", call: "p0", arg: 1, from: "u0" },
+    ] } ] },
+    { note: "demand 3 fans out across A", steps: [ { events: [
+      { type: "fn-settle", call: "p0", iterator: "A" },
+      { type: "inner-pull", pull: "a0", iterator: "A" },
+      { type: "inner-pull", pull: "a1", iterator: "A" },
+      { type: "inner-pull", pull: "a2", iterator: "A" },
+    ] } ] },
+    { note: "the mid-iterator value is delivered eagerly", steps: [ { events: [
+      { type: "settle", pull: "a1", value: "a1" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
+    ] } ] },
+    { note: "A parks with a known exact length; the freed demand reads the underlying", steps: [ { events: [
+      { type: "settle", pull: "a2", done: true },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    // The underlying errors. A's length is known (2), so the error's position is
+    // known too: it goes to r2 immediately, with A's pull #0 still in flight.
+    { note: "the underlying error surfaces eagerly past the parked pull", steps: [ { events: [
+      { type: "settle", pull: "u1", error: "boom" },
+      { type: "result", result: "r2", error: "boom" },
+    ] } ] },
+    { note: "the parked value still reaches its own call", steps: [ { events: [
+      { type: "settle", pull: "a0", value: "a0" },
+      { type: "result", result: "r0", value: "a0", from: "a0" },
+    ] } ] },
+  ],
+}, { helper: flatMap, utils }));
+
+// Same for an error from the MAPPER: its position is fixed once every parked
+// iterator's length is known, so it is committed to its call eagerly — though,
+// as always for a mapper error, it closes the underlying and the rejection
+// waits for that close to settle.
+tests.push(scenarioTest({
+  id: "flatmap-test-070",
+  helper: "flatMap",
+  label: "flatMap: a mapper error behind a known-length parked iterator is committed eagerly",
+  ticks: [
+    { note: "three concurrent calls, one underlying pull", steps: [ { events: [
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "next", result: "r2" },
+      { type: "pull", pull: "u0" },
+    ] } ] },
+    { note: "the mapper is invoked once", steps: [ { events: [
+      { type: "settle", pull: "u0", value: 1 },
+      { type: "fn", call: "p0", arg: 1, from: "u0" },
+    ] } ] },
+    { note: "demand 3 fans out across A", steps: [ { events: [
+      { type: "fn-settle", call: "p0", iterator: "A" },
+      { type: "inner-pull", pull: "a0", iterator: "A" },
+      { type: "inner-pull", pull: "a1", iterator: "A" },
+      { type: "inner-pull", pull: "a2", iterator: "A" },
+    ] } ] },
+    { note: "the mid-iterator value is delivered eagerly", steps: [ { events: [
+      { type: "settle", pull: "a1", value: "a1" },
+      { type: "result", result: "r1", value: "a1", from: "a1" },
+    ] } ] },
+    { note: "A parks with a known exact length; the freed demand reads the underlying", steps: [ { events: [
+      { type: "settle", pull: "a2", done: true },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    { note: "the mapper is invoked again", steps: [ { events: [
+      { type: "settle", pull: "u1", value: 2 },
+      { type: "fn", call: "p1", arg: 2, from: "u1" },
+    ] } ] },
+    { note: "the mapper error closes the underlying", steps: [ { events: [
+      { type: "fn-settle", call: "p1", error: "boomM" },
+      { type: "close", target: "source" },
+    ] } ] },
+    // The error reaches r2 as soon as the close settles — with a0 still pending.
+    { note: "the error surfaces past the parked pull once the close settles", steps: [ { events: [
+      { type: "close-settled", target: "source" },
+      { type: "result", result: "r2", error: "boomM" },
+    ] } ] },
+    { note: "the parked value still reaches its own call", steps: [ { events: [
+      { type: "settle", pull: "a0", value: "a0" },
+      { type: "result", result: "r0", value: "a0", from: "a0" },
+    ] } ] },
   ],
 }, { helper: flatMap, utils }));
 

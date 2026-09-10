@@ -22,7 +22,7 @@
 //
 // Usage: `node test/map-bounded-exhaustive.js [N]`   (default N = 2)
 
-import { map } from '../map.js';
+import { map } from '../map.ts';
 
 // Flush to microtask quiescence between driving actions. A single driving
 // action's consequences propagate through a promise chain of bounded depth (the

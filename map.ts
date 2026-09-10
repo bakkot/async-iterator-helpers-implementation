@@ -1,25 +1,31 @@
-export function map(it, fn) {
+export function map(it: unknown, fn: unknown) {
   return new MapHelper(it, fn);
 }
 
+type Iterator = {
+  next: () => unknown,
+  return?: () => unknown,
+};
+
 class MapHelper {
   #done = false;
-  #it;
-  #fn;
-  constructor(it, fn) {
-    this.#it = it;
-    this.#fn = fn;
+  #it: Iterator;
+  #fn: (v: unknown) => unknown;
+  constructor(it: unknown, fn: unknown) {
+    this.#it = it as Iterator;
+    this.#fn = fn as (v: unknown) => unknown;
   }
 
   next() {
     if (this.#done) {
       return Promise.resolve({ done: true, value: undefined });
     }
-    return (new Promise(resolve => resolve(this.#it.next()))).then(({ value, done }) => {
-      if (done) {
+    return (new Promise(resolve => resolve(this.#it.next()))).then(result => {
+      if ((result as { done: unknown }).done) {
         this.#done = true;
         return { value: undefined, done: true };
       }
+      const value = (result as { value: unknown }).value;
       return (new Promise(res => res(this.#fn(value)))).then(mapped => {
         return { value: mapped, done: false,  };
       }, (err) => {

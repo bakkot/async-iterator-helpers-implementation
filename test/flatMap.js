@@ -2,8 +2,7 @@
 // hand-written test/flatMap.js (async-iterator-implementation), since deleted
 // along with the converter: this file is the source of truth — edit it by
 // hand. Run directly, or via test/scenario-tests.js in the implementation
-// repo. tools/unconvert-tests.js there renders these files back into the
-// old hand-written style for review.
+// repo.
 //
 // Most tests are scenario objects (see ./FORMAT.md) turned into runnable
 // [name, fn] tests by scenarioTest; tests the scenario format cannot

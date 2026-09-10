@@ -216,7 +216,3 @@ files directly.
   scenario objects wrapped in `scenarioTest(...)`; tests outside the format
   were copied in verbatim from the originals, marked `[copied verbatim]`
   with the reason.
-
-For review, the implementation repo's `tools/unconvert-tests.js` renders the
-test-scenario files back into the old hand-written style
-(`test/roundtrip-*.js`, runnable, lossy in names/whitespace only).

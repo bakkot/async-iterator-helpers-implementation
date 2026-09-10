@@ -2,15 +2,14 @@
 // hand-written test/map.js (async-iterator-implementation), since deleted
 // along with the converter: this file is the source of truth — edit it by
 // hand. Run directly, or via test/scenario-tests.js in the implementation
-// repo. tools/unconvert-tests.js there renders these files back into the
-// old hand-written style for review.
+// repo.
 //
 // Most tests are scenario objects (see ./FORMAT.md) turned into runnable
 // [name, fn] tests by scenarioTest; tests the scenario format cannot
 // express were copied verbatim from the original file, each marked with a
 // [copied verbatim] comment giving the reason.
 
-import { map } from '../map.js';
+import { map } from '../map.ts';
 import {
   runTests,
   track,

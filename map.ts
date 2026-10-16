@@ -11,6 +11,9 @@ type Iterator = {
 
 class MapHelper {
   #done = false;
+  #pullsIssued = 0;
+  // the index of the latest pull which settled with something other than { done: true }
+  #latestNonDonePull = -1;
   #it: Iterator;
   #fn: (v: unknown) => unknown;
   constructor(it: unknown, fn: unknown) {
@@ -23,17 +26,25 @@ class MapHelper {
       return Promise.resolve({ done: true, value: undefined });
     }
     const { promise, resolve, reject } = Promise.withResolvers();
+    const index = this.#pullsIssued++;
     fastPromiseTry(() => this.#it.next()).then(result => {
       let value;
       try {
         if ((result as { done: unknown }).done) {
           this.#done = true;
-          resolve({ value: undefined, done: true });
+          if (this.#latestNonDonePull > index) {
+            // the later result has already been given a position (and possibly delivered), so the iterator is incoherent
+            reject(new TypeError('underlying iterator returned { done: true } after a later pull already settled'));
+          } else {
+            resolve({ value: undefined, done: true });
+          }
           return;
         }
+        this.#latestNonDonePull = Math.max(this.#latestNonDonePull, index);
         value = (result as { value: unknown }).value;
       } catch (error) {
         // errors from reading .done or .value
+        this.#latestNonDonePull = Math.max(this.#latestNonDonePull, index);
         this.#done = true;
         reject(error);
         return;
@@ -68,6 +79,7 @@ class MapHelper {
       zalgo(mapped, mapped => resolve({ value: mapped, done: false }), onError);
     }, (error) => {
       // errors from `.next()`
+      this.#latestNonDonePull = Math.max(this.#latestNonDonePull, index);
       this.#done = true;
       reject(error);
     });

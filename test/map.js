@@ -719,6 +719,114 @@ tests.push(['map: rejection from an arbitrary thenable closes the source', async
   t.check('source is closed once', returnCalls, 1);
 }]);
 
+// --- incoherent underlying ---------------------------------------------------
+//
+// A `done` from a pull which settles after a LATER pull has already settled with
+// a value or error can't be passed through: the later result already has its
+// position (and may already have been delivered). Instead that pull's call
+// rejects with a TypeError. As with any `done`, the helper is finished, and the
+// source is not closed, since it is the iterator which reported done.
+
+tests.push(scenarioTest({
+  id: "map-test-021",
+  helper: "map",
+  label: "map: a done after a later pull settled with a value is a TypeError",
+  ticks: [
+    { steps: [ { events: [
+      { type: "fn-sync", arg: 2, value: 20 },
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "pull", pull: "u0" },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    { note: "the later value is delivered", steps: [ { events: [
+      { type: "settle", pull: "u1", value: 2 },
+      { type: "result", result: "r1", value: 20 },
+    ] } ] },
+    { note: "the earlier done is a TypeError; the source is not closed", steps: [ { events: [
+      { type: "settle", pull: "u0", done: true },
+      { type: "result", result: "r0", error: "underlying iterator returned { done: true } after a later pull already settled" },
+    ] } ] },
+    { note: "the helper is finished", steps: [ { events: [
+      { type: "next", result: "r2" },
+      { type: "result", result: "r2", done: true },
+    ] } ] },
+  ],
+}, { helper: map, utils }));
+
+tests.push(scenarioTest({
+  id: "map-test-022",
+  helper: "map",
+  label: "map: a done after a later pull settled with an error is a TypeError",
+  ticks: [
+    { steps: [ { events: [
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "pull", pull: "u0" },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    { steps: [ { events: [
+      { type: "settle", pull: "u1", error: "boom" },
+      { type: "result", result: "r1", error: "boom" },
+    ] } ] },
+    { steps: [ { events: [
+      { type: "settle", pull: "u0", done: true },
+      { type: "result", result: "r0", error: "underlying iterator returned { done: true } after a later pull already settled" },
+    ] } ] },
+  ],
+}, { helper: map, utils }));
+
+// Only an earlier pull's done counts: a done from a LATER pull than one which
+// already settled is just the normal end of the iterator.
+tests.push(scenarioTest({
+  id: "map-test-023",
+  helper: "map",
+  label: "map: a done after an earlier pull settled is not a TypeError",
+  ticks: [
+    { steps: [ { events: [
+      { type: "fn-sync", arg: 1, value: 10 },
+      { type: "next", result: "r0" },
+      { type: "next", result: "r1" },
+      { type: "pull", pull: "u0" },
+      { type: "pull", pull: "u1" },
+    ] } ] },
+    { steps: [ { events: [
+      { type: "settle", pull: "u0", value: 1 },
+      { type: "result", result: "r0", value: 10 },
+    ] } ] },
+    { steps: [ { events: [
+      { type: "settle", pull: "u1", done: true },
+      { type: "result", result: "r1", done: true },
+    ] } ] },
+  ],
+}, { helper: map, utils }));
+
+// A result whose `done` getter throws has also settled (with an error), so a
+// done from an earlier pull afterwards is just as incoherent.
+tests.push(['map: a done after a later pull\'s done getter threw is a TypeError', async function (t) {
+  const resolvers = [];
+  const source = {
+    next() {
+      const { promise, resolve } = Promise.withResolvers();
+      resolvers.push(resolve);
+      return promise;
+    },
+  };
+  const m = map(source, x => x);
+  const settle = p => p.then(v => ({ value: v }), e => ({ error: e }));
+  const r0 = settle(m.next());
+  const r1 = settle(m.next());
+
+  resolvers[1]({ get done() { throw new Error('getter boom'); } });
+  const r1Result = await r1;
+  t.check('the later pull rejects with the getter error', r1Result.error?.message, 'getter boom');
+
+  resolvers[0]({ value: undefined, done: true });
+  const r0Result = await r0;
+  t.check('the earlier done is a TypeError', r0Result.error instanceof TypeError, true);
+  t.check('with the incoherence message', r0Result.error?.message, 'underlying iterator returned { done: true } after a later pull already settled');
+}]);
+
 tests.push(['map: a throwing then getter closes the source', async function (t) {
   let returnCalls = 0;
   const expected = new Error('boom');

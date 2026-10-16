@@ -68,6 +68,22 @@ const innerError = (k, j) => `Ei${k}.${j}`;
 const underlyingReturnError = 'EretU';
 const innerReturnError = (k) => `EretI${k}`;
 
+// The message of the TypeError flatMap fabricates for an out-of-order inner done.
+const OUT_OF_ORDER_DONE = 'inner iterator returned { done: true } after a later pull already settled';
+
+// Whether flatMap observes pull `p`'s outcome: a done from the same inner at a
+// LOWER index that settled EARLIER truncates p, so p's outcome is discarded.
+const pullObserved = (inner, p) =>
+  !inner.pulls.some((q) => q.status === 'done' && q.idx < p.idx && q.seq < p.seq);
+
+// Dones that flatMap turns into a TypeError: by the time the done settled, a
+// later pull of the same inner had already settled with an observed value or
+// error, which therefore already has a position in the output and can't be
+// truncated away.
+const outOfOrderDones = (inner) =>
+  inner.pulls.filter((q) => q.status === 'done' && inner.pulls.some((p) =>
+    (p.status === 'value' || p.status === 'error') && p.idx > q.idx && p.seq < q.seq && pullObserved(inner, p)));
+
 function fmtSettle(s) {
   if (s.type === 'value') return `{value:${s.value},done:false}`;
   if (s.type === 'done') return `{done:true}`;
@@ -157,10 +173,13 @@ async function runSchedule(maxEvents, chooser) {
   // done at a HIGHER index does not truncate earlier pulls, and a done settling
   // AFTER the error arrives too late), so we compare pull index and settlement
   // order (`seq`, a global counter recording when each outcome became known).
-  const innerErrorObserved = (inner, p) =>
-    !inner.pulls.some((q) => q.status === 'done' && q.idx < p.idx && q.seq < p.seq);
+  //
+  // Conversely, a done that settles AFTER a later pull of the same inner already
+  // produced a (observed) value or error is not a truncation but an
+  // out-of-order done, which flatMap surfaces as its own TypeError -- that is a
+  // terminal stream error too (see outOfOrderDones).
   const streamErrored = () =>
-    rec.inners.some((inner) => inner.pulls.some((p) => p.status === 'error' && innerErrorObserved(inner, p))) ||
+    rec.inners.some((inner) => inner.pulls.some((p) => p.status === 'error' && pullObserved(inner, p)) || outOfOrderDones(inner).length > 0) ||
     rec.mappers.some((m) => m.outcome === 'error');
   const isFinished = () => consumerReturned || rec.underlying.finished != null || rec.underlying.returnCalls > 0 || streamErrored();
 
@@ -225,16 +244,6 @@ async function runSchedule(maxEvents, chooser) {
   // awaits the closes it triggers, and an error that triggers a close surfaces
   // only after that close settles, so a pending close with every consumer call
   // settled means flatMap fired a close nothing can ever observe.
-  //
-  // DELIBERATE WEAKENING: there is one legitimate "orphaned close" -- an error
-  // triggers a close, and before that close settles an inner done at a lower
-  // pull index truncates the still-undelivered error; the calls then resolve
-  // done immediately and the close's outcome is swallowed (pinned by unit test
-  // flatmap-test-062). We exempt any run containing such a discarded
-  // (produced-but-never-delivered) error, which also exempts any OTHER pending
-  // close in that run -- a real loss of strength, accepted for now. If the
-  // implementation ever gates those dones on the close instead, remove the
-  // exemption (and flip the unit test).
   const reportedSettlementViolations = new Set();
   const reportSettlementViolation = (msg) => {
     if (reportedSettlementViolations.has(msg)) return;
@@ -247,13 +256,7 @@ async function runSchedule(maxEvents, chooser) {
       for (const c of unsettled) reportSettlementViolation(`liveness: ${c.kind}#${c.id} is unsettled at quiescence with nothing pending`);
     }
     if (pendingReturns.length > 0 && unsettled.length === 0) {
-      // Every call has settled, so any error that has not been delivered by now
-      // never will be: it was discarded, and may have orphaned a close.
-      const delivered = new Set(rec.calls.filter((c) => c.settle.type === 'reject').map((c) => c.settle.error));
-      const discardedErrorExists = [...realErrors(rec)].some((e) => !delivered.has(e));
-      if (!discardedErrorExists) {
-        reportSettlementViolation(`close-gating: ${pendingReturns.map((r) => r.id).join(', ')} pending but every consumer call has settled`);
-      }
+      reportSettlementViolation(`close-gating: ${pendingReturns.map((r) => r.id).join(', ')} pending but every consumer call has settled`);
     }
   };
 
@@ -511,6 +514,7 @@ function realErrors(rec) {
   rec.underlying.pulls.forEach((p) => { if (p.status === 'error') s.add(underlyingError(p.idx)); });
   rec.mappers.forEach((m) => { if (m.outcome === 'error') s.add(mapperError(m.id)); });
   rec.inners.forEach((inner) => inner.pulls.forEach((p) => { if (p.status === 'error') s.add(innerError(inner.id, p.idx)); }));
+  if (rec.inners.some((inner) => outOfOrderDones(inner).length > 0)) s.add(OUT_OF_ORDER_DONE);
   return s;
 }
 
@@ -575,23 +579,41 @@ function checkInvariants(rec) {
   // order, be strictly increasing in (innerIterCreationOrder, pullIndex), and each
   // value must be one genuinely produced. Underlying/mapper errors are terminal
   // stream errors with no inner coordinate; they are covered by I4/I5, not here.
+  //
+  // An out-of-order-done TypeError also stands in for an inner item: the one at
+  // the position of the done that caused it. It carries no coordinate itself, but
+  // it is always followed (in call order) by the later item of the same inner
+  // that made the done out of order, so it sits just before the next item.
   const produced = producedValues(rec);
-  const deliveredByIter = new Map(); // k -> [j, ...] in delivery order
-  let prevK = -1, prevJ = -1;
+  const items = []; // { c, k, j } | { c, outOfOrderDone: true }, in call order
   for (const c of nextCalls) {
     if (!c.settle) continue;
-    let k, j;
     if (c.settle.type === 'value') {
       const v = c.settle.value;
       const m = /^(\d+):(\d+)$/.exec(v);
       if (!m) { add(`next#${c.id} delivered a non-inner value ${v}`); continue; }
       if (!produced.has(v)) { add(`next#${c.id} delivered ${v}, which no inner pull produced`); continue; }
-      k = Number(m[1]); j = Number(m[2]);
+      items.push({ c, k: Number(m[1]), j: Number(m[2]) });
     } else if (c.settle.type === 'reject') {
+      if (c.settle.error === OUT_OF_ORDER_DONE) { items.push({ c, outOfOrderDone: true }); continue; }
       const m = /^Ei(\d+)\.(\d+)$/.exec(c.settle.error);
       if (!m) continue; // underlying/mapper error: not an inner item
-      k = Number(m[1]); j = Number(m[2]);
-    } else continue; // done
+      items.push({ c, k: Number(m[1]), j: Number(m[2]) });
+    } // else done
+  }
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (!it.outOfOrderDone) continue;
+    const next = items[i + 1];
+    if (!next) { add(`next#${it.c.id} got an out-of-order-done TypeError with no later item from the same inner`); items.splice(i, 1); continue; }
+    it.k = next.k; it.j = next.j - 1;
+    const inner = rec.inners[it.k];
+    const pull = inner && inner.pulls.find((p) => p.idx === it.j);
+    if (!pull || !outOfOrderDones(inner).includes(pull)) add(`next#${it.c.id} got an out-of-order-done TypeError, but pull ${it.k}:${it.j} is not an out-of-order done`);
+  }
+  const deliveredByIter = new Map(); // k -> [j, ...] in delivery order
+  let prevK = -1, prevJ = -1;
+  for (const { c, k, j } of items) {
     if (k < prevK || (k === prevK && j <= prevJ)) {
       add(`out-of-order/duplicate inner delivery: next#${c.id} got (${k}:${j}) after (${prevK}:${prevJ})`);
     }

@@ -343,8 +343,8 @@ export const mapScenarios = [
   {
     id: "map-exhaustion-3",
     helper: "map",
-    label: "Exhaustion 3*",
-    description: "As in <a href=\"#map-exhaustion-2\">Exhaustion 2</a>, but now the 3rd value has already settled when we get the <code>done: true</code> from the second.<br><br><strong>Open question</strong>: What should we do in this case? In this case we could reject the outstanding pull with an error, rather than needing an <code>unhandledrejection</code> event.",
+    label: "Exhaustion 3",
+    description: "As in <a href=\"#map-exhaustion-2\">Exhaustion 2</a>, but now the 3rd value has already settled when we get the <code>done: true</code> from the second. This is incoherent; we settle the corresponding pull with a <code>TypeError</code>.",
     ticks: [
       { steps: [
         {
@@ -409,7 +409,7 @@ export const mapScenarios = [
         },
         {
           events: [
-            { type: "result", result: "r1", done: true },
+            { type: "result", result: "r1", error: "underlying iterator returned { done: true } after a later pull already settled" },
             { type: "tombstone", target: "underlying" },
             { type: "tombstone", target: "result" },
           ],

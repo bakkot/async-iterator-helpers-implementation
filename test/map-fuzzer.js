@@ -51,6 +51,10 @@ const pullValue = (id) => `P${id}`;
 const mapped = (arg) => `m(${arg})`;
 const pullError = (id) => `Epull${id}`;
 const mapperError = (arg) => `Emap(${arg})`;
+// the TypeError for a done that settles after a later pull already settled with
+// a value or error (an incoherent underlying: that later result has already been
+// given its position, and possibly delivered)
+const incoherentDoneError = 'underlying iterator returned { done: true } after a later pull already settled';
 
 // canonical text for a settled consumer result, shared by oracle and real run
 function fmtResult({ value, done }) {
@@ -98,6 +102,7 @@ class Chooser {
 
 function runModel(N, chooser) {
   let done = false;
+  let latestNonDonePull = -1;
   let budget = N;
   let callCount = 0;
   let nextPullId = 0, nextMapperId = 0, nextReturnId = 0;
@@ -154,8 +159,14 @@ function runModel(N, chooser) {
 
   // a pull (from consumer call `callId`) yields `outcome`
   const resolvePull = (callId, pullId, outcome) => {
+    if (outcome === 'done') {
+      done = true;
+      if (latestNonDonePull > pullId) rejectNext(callId, incoherentDoneError); // no close: the underlying reported done
+      else settleNext(callId, { value: undefined, done: true });
+      return;
+    }
+    latestNonDonePull = Math.max(latestNonDonePull, pullId);
     if (outcome === 'value') invokeMapper(callId, pullValue(pullId));
-    else if (outcome === 'done') { done = true; settleNext(callId, { value: undefined, done: true }); }
     else { done = true; rejectNext(callId, pullError(pullId)); } // underlying error: no close
   };
 

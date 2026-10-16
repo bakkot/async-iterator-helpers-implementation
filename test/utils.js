@@ -15,6 +15,22 @@ export async function flushMicrotasks(rounds = 100) {
   }
 }
 
+// Start collecting promise rejections that Node reports as unhandled. The
+// returned function waits a macrotask (Node reports them only after the
+// microtask queue drains), stops collecting, and returns the reasons. This is
+// the one time-based helper here, used only to observe rejections nothing can
+// otherwise see.
+export function trackUnhandledRejections() {
+  const reasons = [];
+  const onRejection = reason => { reasons.push(reason); };
+  process.on('unhandledRejection', onRejection);
+  return async function stop() {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    process.off('unhandledRejection', onRejection);
+    return reasons;
+  };
+}
+
 // An ordered, shared event log. Concurrency/ordering claims are checked
 // against the order entries land in `entries`. Silent by design: nothing is
 // printed, so a passing run produces no output and the log is a pure trace

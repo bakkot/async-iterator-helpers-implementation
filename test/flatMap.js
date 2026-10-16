@@ -14,6 +14,7 @@ import {
   runTests,
   track,
   flushMicrotasks,
+  trackUnhandledRejections,
   controlledSource,
   controlledFn,
 } from './utils.js';
@@ -3213,5 +3214,98 @@ tests.push(scenarioTest({
     ] },
   ],
 }, { helper: flatMap, utils }));
+
+tests.push(['flatMap: throwing getters on underlying results', async function (t) {
+  for (const property of ['done', 'value']) {
+    const expected = new Error(`${property} boom`);
+    let mapperCalls = 0;
+    let returnCalls = 0;
+    let valueReads = 0;
+    const result = property === 'done'
+      ? {
+          get done() { throw expected; },
+          get value() { valueReads++; return 1; },
+        }
+      : {
+          done: false,
+          get value() { valueReads++; throw expected; },
+        };
+    const source = {
+      next() { return Promise.resolve(result); },
+      return() {
+        returnCalls++;
+        return Promise.resolve({ value: undefined, done: true });
+      },
+    };
+    const inner = {
+      next() { return Promise.resolve({ value: 'unused', done: false }); },
+      [Symbol.asyncIterator]() { return this; },
+    };
+
+    const stopTrackingUnhandled = trackUnhandledRejections();
+    let actual;
+    flatMap(source, () => { mapperCalls++; return inner; }).next().catch(error => { actual = error; });
+    t.check(`${property}: error is not surfaced synchronously`, actual, undefined);
+    await flushMicrotasks();
+    const unhandled = await stopTrackingUnhandled();
+    if (property === 'done') {
+      t.check('done: consumer is never notified', actual, undefined);
+      t.check('done: original error is unhandled', unhandled.length === 1 && unhandled[0] === expected, true);
+      t.check('done: underlying iterator is not closed', returnCalls, 0);
+    } else {
+      // `value` is read while calling the mapper, so this is treated as a mapper error
+      t.check('value: original error is propagated', actual === expected, true);
+      t.check('value: no unhandled rejections', unhandled.length, 0);
+      t.check('value: underlying iterator is closed', returnCalls, 1);
+    }
+    t.check(`${property}: mapper is not called`, mapperCalls, 0);
+    t.check(`${property}: value read count`, valueReads, property === 'value' ? 1 : 0);
+  }
+}]);
+
+tests.push(['flatMap: throwing getters on inner results are unhandled rejections', async function (t) {
+  for (const property of ['done', 'value']) {
+    const expected = new Error(`${property} boom`);
+    let underlyingReturnCalls = 0;
+    let innerReturnCalls = 0;
+    let valueReads = 0;
+    const result = property === 'done'
+      ? {
+          get done() { throw expected; },
+          get value() { valueReads++; return 'unused'; },
+        }
+      : {
+          done: false,
+          get value() { valueReads++; throw expected; },
+        };
+    const inner = {
+      next() { return Promise.resolve(result); },
+      return() {
+        innerReturnCalls++;
+        return Promise.resolve({ value: undefined, done: true });
+      },
+      [Symbol.asyncIterator]() { return this; },
+    };
+    const source = {
+      next() { return Promise.resolve({ value: 1, done: false }); },
+      return() {
+        underlyingReturnCalls++;
+        return Promise.resolve({ value: undefined, done: true });
+      },
+    };
+
+    const stopTrackingUnhandled = trackUnhandledRejections();
+    let actual;
+    const flattened = flatMap(source, () => inner).next();
+    flattened.catch(error => { actual = error; });
+    await flushMicrotasks();
+    t.check(`${property}: consumer is never notified`, actual, undefined);
+    const unhandled = await stopTrackingUnhandled();
+    t.check(`${property}: original error is unhandled`, unhandled.length === 1 && unhandled[0] === expected, true);
+    t.check(`${property}: underlying iterator is not closed`, underlyingReturnCalls, 0);
+    t.check(`${property}: erroring inner iterator is not closed`, innerReturnCalls, 0);
+    t.check(`${property}: value read count`, valueReads, property === 'value' ? 1 : 0);
+  }
+}]);
 
 await runTests(tests, xfailed);

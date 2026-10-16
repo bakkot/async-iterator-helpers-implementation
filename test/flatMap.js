@@ -14,7 +14,6 @@ import {
   runTests,
   track,
   flushMicrotasks,
-  trackUnhandledRejections,
   controlledSource,
   controlledFn,
 } from './utils.js';
@@ -3215,7 +3214,7 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
-tests.push(['flatMap: throwing getters on underlying results', async function (t) {
+tests.push(['flatMap: throwing getters on underlying results are underlying errors', async function (t) {
   for (const property of ['done', 'value']) {
     const expected = new Error(`${property} boom`);
     let mapperCalls = 0;
@@ -3242,28 +3241,20 @@ tests.push(['flatMap: throwing getters on underlying results', async function (t
       [Symbol.asyncIterator]() { return this; },
     };
 
-    const stopTrackingUnhandled = trackUnhandledRejections();
     let actual;
     flatMap(source, () => { mapperCalls++; return inner; }).next().catch(error => { actual = error; });
     t.check(`${property}: error is not surfaced synchronously`, actual, undefined);
-    await flushMicrotasks();
-    const unhandled = await stopTrackingUnhandled();
-    if (property === 'done') {
-      t.check('done: consumer is never notified', actual, undefined);
-      t.check('done: original error is unhandled', unhandled.length === 1 && unhandled[0] === expected, true);
-      t.check('done: underlying iterator is not closed', returnCalls, 0);
-    } else {
-      // `value` is read while calling the mapper, so this is treated as a mapper error
-      t.check('value: original error is propagated', actual === expected, true);
-      t.check('value: no unhandled rejections', unhandled.length, 0);
-      t.check('value: underlying iterator is closed', returnCalls, 1);
-    }
+    await Promise.resolve();
+    t.check(`${property}: getter error is handled in the source-result reaction`, actual, undefined);
+    await Promise.resolve();
+    t.check(`${property}: original error is propagated`, actual === expected, true);
     t.check(`${property}: mapper is not called`, mapperCalls, 0);
+    t.check(`${property}: underlying iterator is not closed`, returnCalls, 0);
     t.check(`${property}: value read count`, valueReads, property === 'value' ? 1 : 0);
   }
 }]);
 
-tests.push(['flatMap: throwing getters on inner results are unhandled rejections', async function (t) {
+tests.push(['flatMap: throwing getters on inner results are inner-iterator errors', async function (t) {
   for (const property of ['done', 'value']) {
     const expected = new Error(`${property} boom`);
     let underlyingReturnCalls = 0;
@@ -3294,15 +3285,19 @@ tests.push(['flatMap: throwing getters on inner results are unhandled rejections
       },
     };
 
-    const stopTrackingUnhandled = trackUnhandledRejections();
     let actual;
     const flattened = flatMap(source, () => inner).next();
     flattened.catch(error => { actual = error; });
-    await flushMicrotasks();
-    t.check(`${property}: consumer is never notified`, actual, undefined);
-    const unhandled = await stopTrackingUnhandled();
-    t.check(`${property}: original error is unhandled`, unhandled.length === 1 && unhandled[0] === expected, true);
-    t.check(`${property}: underlying iterator is not closed`, underlyingReturnCalls, 0);
+    await Promise.resolve();
+    await Promise.resolve();
+    t.check(`${property}: inner has not settled yet`, underlyingReturnCalls, 0);
+    await Promise.resolve();
+    t.check(`${property}: close starts in the inner-result reaction`, underlyingReturnCalls, 1);
+    try {
+      await flattened;
+    } catch {}
+    t.check(`${property}: original error is propagated`, actual === expected, true);
+    t.check(`${property}: underlying iterator is closed`, underlyingReturnCalls, 1);
     t.check(`${property}: erroring inner iterator is not closed`, innerReturnCalls, 0);
     t.check(`${property}: value read count`, valueReads, property === 'value' ? 1 : 0);
   }

@@ -668,12 +668,12 @@ tests.push(['map: microtask turns to settle with thenable mapper results and clo
     }
     return at;
   }
-  t.check('non-thenable mapper result', await settleTurn(() => 10), 5);
-  t.check('already-settled promise mapper result', await settleTurn(() => Promise.resolve(10)), 7);
-  t.check('sync mapper throw with no return method', await settleTurn(() => { throw new Error('boom'); }), 9);
-  t.check('sync mapper throw; return() gives a settled promise', await settleTurn(() => { throw new Error('boom'); }, () => Promise.resolve({})), 9);
-  t.check('sync mapper throw; return() gives a non-thenable', await settleTurn(() => { throw new Error('boom'); }, () => ({})), 9);
-  t.check('rejected promise mapper result; return() gives a settled promise', await settleTurn(() => Promise.reject(new Error('boom')), () => Promise.resolve({})), 11);
+  t.check('non-thenable mapper result', await settleTurn(() => 10), 3);
+  t.check('already-settled promise mapper result', await settleTurn(() => Promise.resolve(10)), 3);
+  t.check('sync mapper throw with no return method', await settleTurn(() => { throw new Error('boom'); }), 3);
+  t.check('sync mapper throw; return() gives a settled promise', await settleTurn(() => { throw new Error('boom'); }, () => Promise.resolve({})), 4);
+  t.check('sync mapper throw; return() gives a non-thenable', await settleTurn(() => { throw new Error('boom'); }, () => ({})), 4);
+  t.check('rejected promise mapper result; return() gives a settled promise', await settleTurn(() => Promise.reject(new Error('boom')), () => Promise.resolve({})), 4);
 }]);
 
 // The microtask turn on which the consumer's reaction to return() runs, for a
@@ -691,7 +691,7 @@ tests.push(['map: microtask turns to settle return()', async function (t) {
     }
     return at;
   }
-  t.check('no return method', await settleTurn(), 2);
+  t.check('no return method', await settleTurn(), 1);
   t.check('return() gives a non-thenable', await settleTurn(() => ({})), 2);
   t.check('return() gives a settled promise', await settleTurn(() => Promise.resolve({})), 2);
   t.check('return() throws', await settleTurn(() => { throw new Error('boom'); }), 1);

@@ -1,3 +1,5 @@
+import { fastPromiseTry } from './util.ts';
+
 export function filter(it: unknown, pred: unknown) {
   return new FilterHelper(it, pred);
 }
@@ -45,30 +47,32 @@ class FilterHelper {
   #issuePull() {
     const pos = { status: 'awaiting' } as Slot;
     this.#slots.add(pos);
-    let result: unknown;
-    try {
-      result = (this.#it as Nextable).next();
-    } catch (e) {
-      // TODO reconsider whether this really needs to happen same-tick
-      // we could instead fold it into the rejection case
+    const onError = (error: unknown) => {
+      if (this.#isIgnored(pos)) return;
       pos.status = 'error';
       const errPos = pos as Extract<Slot, { status: 'error' }>;
-      errPos.error = e;
+      errPos.error = error;
       errPos.closeState = 'ready';
       this.#finished = true;
-      // source faulted so we do not call it.return().
-      if (this.#calls.length === 1) {
-        // i.e. this is the only thing in the queue
+      if (this.#head() === pos) {
         this.#processQueue();
       }
-      return;
-    }
-
-    Promise.resolve(result).then(
+    };
+    fastPromiseTry(() => (this.#it as Nextable).next()).then(
       (r) => {
         if (this.#isIgnored(pos)) return;
-        // TODO handle errors from reading `done`/`value` properties
-        if ((r as { done: unknown }).done) {
+        let done;
+        let value;
+        try {
+          done = (r as { done: unknown }).done;
+          if (!done) {
+            value = (r as { value: unknown }).value;
+          }
+        } catch (error) {
+          onError(error);
+          return;
+        }
+        if (done) {
           // This is theoretically quadratic in the degree of concurrency: if we issue
           // N pulls and they all settle with { done: true } back-to-front, then
           // we will do N steps in this loop the first time, N-1 the second, etc.
@@ -88,82 +92,69 @@ class FilterHelper {
             call.resolve({ value: undefined, done: true });
           }
         } else {
-          this.#invokePred(pos, (r as { value: unknown }).value);
+          this.#invokePred(pos, value);
         }
       },
-      (e) => {
-        if (this.#isIgnored(pos)) return;
-        pos.status = 'error';
-        const errPos = pos as Extract<Slot, { status: 'error' }>;
-        errPos.error = e;
-        errPos.closeState = 'ready';
-        this.#finished = true;
-        if (this.#head() === pos) {
-          this.#processQueue();
-        }
-      }
+      onError,
     );
   }
 
   #invokePred(pos: Slot, value: unknown) {
     (pos as Extract<Slot, { status: 'value' }>).value = value;
-    // TODO reconsider: maybe we shouldn't have to pay a microtask tick if the
-    // predicate synchronously returns true or false.
-    let res: unknown;
-    try {
-      res = (this.#pred as (v: unknown) => unknown)(value);
-    } catch (e) {
-      res = Promise.reject(e);
-    }
-    Promise.resolve(res).then(
-      (keep) => {
-        if (this.#isIgnored(pos)) return;
-        const isHead = this.#head() === pos;
-        if (keep) {
-          pos.status = 'value';
+    const onResult = (keep: unknown) => {
+      if (this.#isIgnored(pos)) return;
+      const isHead = this.#head() === pos;
+      let needsReplacement = false;
+      if (keep) {
+        pos.status = 'value';
+      } else {
+        this.#slots.delete(pos);
+        if (!this.#finished) {
+          needsReplacement = true;
         } else {
-          this.#slots.delete(pos);
-          if (!this.#finished) {
-            this.#issuePull();
+          this.#calls.pop()!.resolve({ value: undefined, done: true });
+        }
+      }
+      if (isHead) {
+        this.#processQueue();
+      }
+      // we sequence this after draining queue to ensure the result Promises settle in a reasonable order even if the pull synchronously throws
+      if (needsReplacement) {
+        this.#issuePull();
+      }
+    };
+    const onError = (err: unknown) => {
+      if (this.#isIgnored(pos)) return;
+      pos.status = 'error';
+      const errPos = pos as Extract<Slot, { status: 'error' }>;
+      errPos.error = err;
+      const wasLive = !this.#finished;
+      this.#finished = true;
+      if (wasLive) {
+        try {
+          const returnMethod = (this.#it as MaybeReturnable).return;
+          if (returnMethod == null) {
+            errPos.closeState = 'ready';
           } else {
-            this.#calls.pop()!.resolve({ value: undefined, done: true });
-          }
-        }
-        if (isHead) {
-          this.#processQueue();
-        }
-      },
-      (err) => {
-        if (this.#isIgnored(pos)) return;
-        pos.status = 'error';
-        const errPos = pos as Extract<Slot, { status: 'error' }>;
-        errPos.error = err;
-        const wasLive = !this.#finished;
-        this.#finished = true;
-        if (wasLive) {
-          let r: unknown;
-          try {
-            r = (this.#it as MaybeReturnable).return?.();
-          } catch {
-            // synchronous throw from it.return() gets swallowed
-          }
-          // TODO Promise.resolve? if not, handle errors from .then
-          if (r && typeof (r as { then?: unknown }).then === 'function') {
+            const returnResult = returnMethod.call(this.#it);
             errPos.closeState = 'awaiting-return';
             const onClosed = () => {
               if (typeof errPos.closeState === 'function') errPos.closeState(err);
               else errPos.closeState = 'ready';
             };
-            (r as PromiseLike<unknown>).then(onClosed, onClosed);
-          } else {
-            errPos.closeState = 'ready';
+            Promise.resolve(returnResult).then(onClosed, onClosed);
           }
-        }
-        if (this.#head() === pos) {
-          this.#processQueue();
+        } catch {
+          // synchronous throw from it.return() gets swallowed
+          errPos.closeState = 'ready';
         }
       }
-    );
+      if (this.#head() === pos) {
+        this.#processQueue();
+      }
+    };
+
+    fastPromiseTry(() => (this.#pred as (v: unknown) => unknown)(value)).then(onResult, onError);
   }
 
   #processQueue() {
@@ -220,13 +211,14 @@ class FilterHelper {
     }
     this.#finished = true;
 
-    let r: unknown;
     try {
-      r = (this.#it as MaybeReturnable).return?.();
+      const ret = (this.#it as MaybeReturnable).return;
+      if (ret == null) {
+        return Promise.resolve({ value: undefined, done: true });
+      }
+      return Promise.resolve(ret.call(this.#it)).then(() => ({ value: undefined, done: true }));
     } catch (e) {
       return Promise.reject(e);
     }
-
-    return Promise.resolve(r).then(() => ({ value: undefined, done: true }));
   }
 }

@@ -3,7 +3,7 @@
   "scripts": {
     "build-demo": "esbuild demo/index.js --bundle --outfile=demo/index-built.js",
     "test-animations": "node test/animations.js",
-    "test-implementations": "node test/map.js && node test/filter.js && node test/flatMap.js",
+    "test-implementations": "node test/util.js && node test/map.js && node test/filter.js && node test/flatMap.js",
     "test-fuzzing": "node test/map-fuzzer.js && node test/filter-fuzzer.js --fuzz 10000 --seed 12 && node test/flatMap-fuzzer.js --fuzz 10000 --seed 12",
     "test": "npm run test-animations && npm run test-implementations && npm run test-fuzzing"
   },

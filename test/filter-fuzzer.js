@@ -225,12 +225,12 @@ function runModel(maxEvents, chooser) {
   };
 
   // One-shot delivery interleaving. When a false predicate frees the head slot
-  // it both issues a replacement pull *and* unblocks a buffered value. The real
-  // implementation observes that unblocked delivery one hop after resolving it,
-  // which lands *after* the replacement pull's first predicate call but *before*
-  // that predicate's result is processed (a close, a nested pull, or its own
-  // delivery). invokePred fires this at exactly that point; the false path fires
-  // it afterward if the replacement never reached a synchronous predicate call.
+  // it both unblocks a buffered value *and* issues a replacement pull. The real
+  // implementation resolves the unblocked value before issuing the pull, so the
+  // delivery is observed after the replacement's synchronous it.next() call but
+  // before anything that pull's result causes (a predicate call, a done, or an
+  // error). resolvePull fires this at exactly that point; the false path fires
+  // it afterward if the replacement pull is still pending.
   let pendingDelivery = false;
   const firePendingDelivery = () => {
     if (!pendingDelivery) return;
@@ -247,14 +247,26 @@ function runModel(maxEvents, chooser) {
     const shape = RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
     schedule.returnShapes[id] = shape;
     emitSync(evUReturn(id));
-    // The error must not be surfaced until this it.return() settles. A sync
-    // close is already settled, so the error delivers immediately; a pending
-    // close holds the erroring node until a settleReturn releases it.
+    // The error must not be surfaced until this it.return() promise settles. A
+    // "sync" close is an already-fulfilled promise, whose reaction still runs
+    // after values which pump() can deliver now. A pending close remains held
+    // until a settleReturn action releases it.
     if (shape === 'pending') {
       pendingReturns.push({ id, heldNode: node });
-      return true;
+      return 'pending';
     }
-    return false;
+    return 'fulfilled';
+  };
+
+  const settlePredicateClose = (node) => {
+    node.heldForClose = false;
+    if (deferredError) {
+      const { callId, error } = deferredError;
+      deferredError = null;
+      rejectNext(callId, error);
+    }
+    pump();
+    if (done && consumers.length > valueLimit) settleDoneFrom(valueLimit);
   };
 
   const failNode = (node, msg) => {
@@ -292,7 +304,6 @@ function runModel(maxEvents, chooser) {
     schedule.predShapes[id] = shape;
     schedule.predByPull[node.pullId] = id;
     emitSync(evPred(arg));
-    firePendingDelivery();
     if (shape === 'syncTrue') resolvePred(node, arg, 'true');
     else if (shape === 'syncFalse') resolvePred(node, arg, 'false');
     else if (shape === 'syncThrow') resolvePred(node, arg, 'reject');
@@ -300,6 +311,7 @@ function runModel(maxEvents, chooser) {
   }
 
   function resolvePull(node, outcome) {
+    firePendingDelivery();
     if (node.index > terminalIndex) return;
     if (outcome === 'value') {
       invokePred(node, pullValue(node.pullId));
@@ -351,9 +363,10 @@ function runModel(maxEvents, chooser) {
       // A predicate error is the terminal event while the source is still live,
       // so it closes the source. The rejection must not be surfaced until that
       // it.return() settles, so a pending close holds this node (see pump).
-      const held = !done && closeForPredicateError(node);
-      node.heldForClose = held;
+      const closeState = !done && closeForPredicateError(node);
+      node.heldForClose = closeState !== false;
       failNode(node, predError(arg));
+      if (closeState === 'fulfilled') settlePredicateClose(node);
     }
   }
 
@@ -424,14 +437,7 @@ function runModel(maxEvents, chooser) {
         // reached the head and was committed to a call, reject it now; otherwise
         // it is still behind a pending position and will be delivered in order
         // once it reaches the head (heldForClose is now clear).
-        r.heldNode.heldForClose = false;
-        if (deferredError) {
-          const { callId, error } = deferredError;
-          deferredError = null;
-          rejectNext(callId, error);
-        }
-        pump();
-        if (done && consumers.length > valueLimit) settleDoneFrom(valueLimit);
+        settlePredicateClose(r.heldNode);
       } else {
         settleReturn(r.callId);
       }
@@ -485,7 +491,7 @@ function runReal(schedule) {
       }
       const shape = schedule.returnShapes[id];
       if (shape === undefined) { log(`!! unexpected ${evUReturn(id)}`); return Promise.resolve({ value: undefined, done: true }); }
-      if (shape === 'sync') return { value: undefined, done: true };
+      if (shape === 'sync') return Promise.resolve({ value: undefined, done: true });
       const d = Promise.withResolvers();
       pendingReturns.set(id, d);
       return d.promise;

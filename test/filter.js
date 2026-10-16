@@ -14,7 +14,6 @@ import {
   runTests,
   track,
   flushMicrotasks,
-  trackUnhandledRejections,
   controlledSource,
   controlledFn,
 } from './utils.js';
@@ -97,9 +96,11 @@ tests.push(scenarioTest({
   ],
 }, { helper: filter, utils }));
 
-// A synchronous source throw finishes the helper immediately, so another
-// same-turn call does not pull from the source and resolves as done.
-tests.push(['filter: synchronous source throw finishes the helper synchronously', async function (t) {
+// A synchronous source throw is normalized to a rejected promise. Until that
+// rejection reaction runs, the helper is not observably finished, so another
+// same-turn call can issue its own pull just as it can after an asynchronous
+// source rejection.
+tests.push(['filter: synchronous source throw is processed through the promise path', async function (t) {
   let pulls = 0;
   const source = {
     next() {
@@ -115,18 +116,19 @@ tests.push(['filter: synchronous source throw finishes the helper synchronously'
   const r1 = f.next();
   track(t.log, 'r0', r0);
   track(t.log, 'r1', r1);
-  t.expectLog('only the first call reaches the source', [
+  t.expectLog('both same-turn calls reach the source', [
     'src.next() #0',
+    'src.next() #1',
   ]);
 
   await flushMicrotasks();
-  t.expectLog('the first call rejects and the second is done', [
+  t.expectLog('the first call rejects while the in-flight second call still delivers', [
     'r0 rejected boom',
-    'r1 resolved {"done":true}',
+    'r1 resolved {"value":2,"done":false}',
   ]);
 }]);
 
-tests.push(['filter: a throwing value getter is an unhandled rejection', async function (t) {
+tests.push(['filter: a throwing value getter is an underlying-iterator error', async function (t) {
   const expected = new Error('boom');
   let predicateCalls = 0;
   let returnCalls = 0;
@@ -147,7 +149,6 @@ tests.push(['filter: a throwing value getter is an unhandled rejection', async f
     return true;
   });
 
-  const stopTrackingUnhandled = trackUnhandledRejections();
   let settled = false;
   let actual;
   f.next().catch(error => {
@@ -155,15 +156,17 @@ tests.push(['filter: a throwing value getter is an unhandled rejection', async f
     actual = error;
   });
   t.check('error is not surfaced synchronously', settled, false);
-  await flushMicrotasks();
-  t.check('consumer is never notified', settled, false);
-  const unhandled = await stopTrackingUnhandled();
-  t.check('original error is unhandled', unhandled.length === 1 && unhandled[0] === expected, true);
+  await Promise.resolve();
+  t.check('value error is handled in the source-result reaction', settled, false);
+  await Promise.resolve();
+  t.check('consumer is notified on the following turn', settled, true);
+  t.check('original error is propagated', actual === expected, true);
   t.check('predicate is not called', predicateCalls, 0);
   t.check('underlying iterator is not closed', returnCalls, 0);
+  t.check('helper is finished', await f.next(), { value: undefined, done: true });
 }]);
 
-tests.push(['filter: a throwing done getter is an unhandled rejection', async function (t) {
+tests.push(['filter: a throwing done getter is an underlying-iterator error', async function (t) {
   const expected = new Error('boom');
   let doneReads = 0;
   let valueReads = 0;
@@ -188,7 +191,6 @@ tests.push(['filter: a throwing done getter is an unhandled rejection', async fu
   };
   const f = filter(source, () => true);
 
-  const stopTrackingUnhandled = trackUnhandledRejections();
   let settled = false;
   let actual;
   f.next().catch(error => {
@@ -196,13 +198,15 @@ tests.push(['filter: a throwing done getter is an unhandled rejection', async fu
     actual = error;
   });
   t.check('error is not surfaced synchronously', settled, false);
-  await flushMicrotasks();
-  t.check('consumer is never notified', settled, false);
-  const unhandled = await stopTrackingUnhandled();
-  t.check('original error is unhandled', unhandled.length === 1 && unhandled[0] === expected, true);
+  await Promise.resolve();
+  t.check('done error is handled in the source-result reaction', settled, false);
+  await Promise.resolve();
+  t.check('consumer is notified on the following turn', settled, true);
+  t.check('original error is propagated', actual === expected, true);
   t.check('done is read once', doneReads, 1);
   t.check('value is not read', valueReads, 0);
   t.check('underlying iterator is not closed', returnCalls, 0);
+  t.check('helper is finished', await f.next(), { value: undefined, done: true });
 }]);
 
 // Clean exhaustion: a done from the underlying propagates as done and does NOT
@@ -1239,17 +1243,19 @@ tests.push(scenarioTest({
 //   reason: threw during recording: Cannot read properties of undefined (reading 'resolve')
 // Regression for the microtask ordering of a *synchronous* predicate throw.
 // When a drop both unblocks a buffered value and issues a replacement pull, and
-// that replacement's value makes the predicate throw synchronously, the throw
-// must be handled one hop later — exactly like an async rejection — not inline.
-// Otherwise the source close (and the rejection it leads to) jumps ahead of the
-// value the same step unblocked. This needs a synchronous source cascade, so it
+// that replacement's value makes the predicate throw synchronously, the source
+// close (and the rejection it leads to) must not jump ahead of the value the
+// same step unblocked. This holds without deferring the throw because the drop
+// resolves the unblocked value *before* issuing the replacement pull, so the
+// consumer observes it before the replacement's predicate even runs. This needs
+// a synchronous source cascade, so it
 // uses a hand-rolled sync source/predicate rather than the controlled helpers:
 // pull #0 is async (so a later value can buffer behind it) while pulls #1/#2
 // return synchronously, and the predicate throws synchronously on 'B'.
 // A predicate result whose `then` getter throws is handled exactly like a
 // synchronous throw, so this runs in both modes with identical expectations.
 for (const mode of ['sync throw', 'throwing then getter']) {
-tests.push([`filter: a ${mode} from the predicate on a replacement defers its close behind an unblocked value`, async function (t) {
+tests.push([`filter: a ${mode} from the predicate on a replacement closes after an unblocked value`, async function (t) {
   let nextId = 0, retId = 0;
   const pending = [];
   const source = {
@@ -1288,15 +1294,15 @@ tests.push([`filter: a ${mode} from the predicate on a replacement defers its cl
   ]);
 
   // Pull #0 resolves with a value the predicate drops. That frees the buffered
-  // 'A' for r0 and issues replacement pull #2, whose 'B' throws synchronously.
-  // The throw is deferred, so 'A' reaches r0 before the close and the rejection.
+  // 'A' for r0 and then issues replacement pull #2, whose 'B' throws
+  // synchronously. 'A' reaches r0 before the predicate call and the close.
   pending[0].resolve({ value: 'drop', done: false });
   await flushMicrotasks();
-  t.expectLog('unblocked value delivered before the deferred predicate-error close', [
+  t.expectLog('unblocked value delivered before the predicate-error close', [
     'pred(drop)',
     'src.next() #2',
-    'pred(B)',
     'r0 resolved {"value":"A","done":false}',
+    'pred(B)',
     'src.return() #0',
     'r1 rejected boom',
   ]);

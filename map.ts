@@ -1,4 +1,4 @@
-import { fastPromiseTry } from './util.ts';
+import { fastPromiseTry, zalgo } from './util.ts';
 
 export function map(it: unknown, fn: unknown) {
   return new MapHelper(it, fn);
@@ -57,7 +57,15 @@ class MapHelper {
           reject(error);
         }
       };
-      fastPromiseTry(() => this.#fn(value)).then(mapped => resolve({ value: mapped, done: false }), onError);
+      let mapped;
+      try {
+        mapped = this.#fn(value);
+      } catch (error) {
+        onError(error);
+        return;
+      }
+      // TODO SafePromiseResolve, here and possibly elsewhere
+      zalgo(mapped, mapped => resolve({ value: mapped, done: false }), onError);
     }, (error) => {
       // errors from `.next()`
       this.#done = true;

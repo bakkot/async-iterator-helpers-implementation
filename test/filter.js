@@ -2067,4 +2067,74 @@ tests.push(scenarioTest({
   ],
 }, { helper: filter, utils }));
 
+// A synchronous source result still crosses its contractual promise boundary,
+// but a non-thenable predicate result adds no boundary of its own.
+tests.push(['filter: a passing non-thenable predicate result adds no promise turn', async function (t) {
+  let predicateCalled = false;
+  let settled = false;
+  const source = {
+    next() { return { value: 1, done: false }; },
+  };
+  const result = filter(source, () => {
+    predicateCalled = true;
+    return true;
+  }).next();
+  result.then(() => { settled = true; });
+
+  t.check('predicate is not called synchronously', predicateCalled, false);
+  t.check('result is not settled synchronously', settled, false);
+  await Promise.resolve();
+  t.check('predicate runs in the source-result reaction', predicateCalled, true);
+  t.check('consumer has not run in the same reaction', settled, false);
+  await Promise.resolve();
+  t.check('consumer runs on the next turn', settled, true);
+  t.check('filtered result', await result, { value: 1, done: false });
+}]);
+
+// A false non-thenable result issues its replacement pull immediately. Each
+// source result costs a turn; the predicate results themselves cost none.
+tests.push(['filter: a failing non-thenable predicate immediately issues the replacement pull', async function (t) {
+  let pulls = 0;
+  const predicateCalls = [];
+  let settled = false;
+  const source = {
+    next() { return { value: ++pulls, done: false }; },
+  };
+  const result = filter(source, value => {
+    predicateCalls.push(value);
+    return value === 2;
+  }).next();
+  result.then(() => { settled = true; });
+
+  t.check('first pull is issued synchronously', pulls, 1);
+  await Promise.resolve();
+  t.check('first predicate has run', predicateCalls, [1]);
+  t.check('replacement pull is issued in the same reaction', pulls, 2);
+  t.check('result remains pending', settled, false);
+  await Promise.resolve();
+  t.check('replacement predicate has run', predicateCalls, [1, 2]);
+  t.check('consumer has not run in the same reaction', settled, false);
+  await Promise.resolve();
+  t.check('consumer runs on the next turn', settled, true);
+  t.check('replacement value is delivered', await result, { value: 2, done: false });
+}]);
+
+tests.push(['filter: an arbitrary thenable predicate result is assimilated', async function (t) {
+  let thenReads = 0;
+  const verdict = {};
+  Object.defineProperty(verdict, 'then', {
+    get() {
+      thenReads++;
+      return resolve => resolve(true);
+    },
+  });
+  const source = {
+    next() { return { value: 1, done: false }; },
+  };
+
+  const result = await filter(source, () => verdict).next();
+  t.check('thenable verdict keeps the value', result, { value: 1, done: false });
+  t.check('then is read once', thenReads, 1);
+}]);
+
 await runTests(tests, xfailed);

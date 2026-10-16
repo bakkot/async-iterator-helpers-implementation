@@ -3214,6 +3214,64 @@ tests.push(scenarioTest({
   ],
 }, { helper: flatMap, utils }));
 
+// A synchronous source result still crosses its contractual promise boundary,
+// but a non-thenable mapper result is activated in that same reaction. The
+// inner pull must not wait for an intermediate mapper-result promise turn.
+tests.push(['flatMap: a non-thenable mapper result adds no promise turn', async function (t) {
+  let mapperCalled = false;
+  let innerPulls = 0;
+  let settled = false;
+  const inner = {
+    next() {
+      innerPulls++;
+      return Promise.resolve({ value: 'inner', done: false });
+    },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  const source = {
+    next() { return { value: 1, done: false }; },
+  };
+  const result = flatMap(source, () => {
+    mapperCalled = true;
+    return inner;
+  }).next();
+  result.then(() => { settled = true; });
+
+  t.check('mapper is not called synchronously', mapperCalled, false);
+  t.check('inner is not pulled synchronously', innerPulls, 0);
+  await Promise.resolve();
+  t.check('mapper runs in the source-result reaction', mapperCalled, true);
+  t.check('inner is pulled in the same reaction', innerPulls, 1);
+  t.check('consumer remains pending', settled, false);
+  await Promise.resolve();
+  t.check('inner result is processed on its promise turn', settled, false);
+  await Promise.resolve();
+  t.check('consumer runs on the following turn', settled, true);
+  t.check('flattened result', await result, { value: 'inner', done: false });
+}]);
+
+tests.push(['flatMap: an arbitrary thenable mapper result is assimilated', async function (t) {
+  let thenReads = 0;
+  const inner = {
+    next() { return Promise.resolve({ value: 'inner', done: false }); },
+    [Symbol.asyncIterator]() { return this; },
+  };
+  const mapped = {};
+  Object.defineProperty(mapped, 'then', {
+    get() {
+      thenReads++;
+      return resolve => resolve(inner);
+    },
+  });
+  const source = {
+    next() { return { value: 1, done: false }; },
+  };
+
+  const result = await flatMap(source, () => mapped).next();
+  t.check('thenable mapper result supplies the inner iterator', result, { value: 'inner', done: false });
+  t.check('then is read once', thenReads, 1);
+}]);
+
 tests.push(['flatMap: throwing getters on underlying results are underlying errors', async function (t) {
   for (const property of ['done', 'value']) {
     const expected = new Error(`${property} boom`);
@@ -3289,7 +3347,6 @@ tests.push(['flatMap: throwing getters on inner results are inner-iterator error
     const flattened = flatMap(source, () => inner).next();
     flattened.catch(error => { actual = error; });
     await Promise.resolve();
-    await Promise.resolve();
     t.check(`${property}: inner has not settled yet`, underlyingReturnCalls, 0);
     await Promise.resolve();
     t.check(`${property}: close starts in the inner-result reaction`, underlyingReturnCalls, 1);
@@ -3301,6 +3358,42 @@ tests.push(['flatMap: throwing getters on inner results are inner-iterator error
     t.check(`${property}: erroring inner iterator is not closed`, innerReturnCalls, 0);
     t.check(`${property}: value read count`, valueReads, property === 'value' ? 1 : 0);
   }
+}]);
+
+// Logs `tick i` once per microtask turn, to timestamp the surrounding events.
+async function ticker(log, n) {
+  for (let i = 0; i < n; i++) {
+    log.push(`tick ${i}`);
+    await Promise.resolve();
+  }
+}
+
+// A mapper result whose `then` getter throws is handled exactly like a
+// synchronous throw from the mapper, down to the microtask turn.
+tests.push(['flatMap: a throwing then getter is handled like a synchronous mapper throw', async function (t) {
+  const logs = {};
+  for (const mode of ['sync throw', 'throwing then getter']) {
+    const log = logs[mode] = [];
+    const source = {
+      next() { return { value: 1, done: false }; },
+      return() {
+        log.push('src.return()');
+        return Promise.resolve({ value: undefined, done: true });
+      },
+    };
+    const fm = flatMap(source, () => {
+      if (mode === 'sync throw') throw new Error('boom');
+      return { get then() { throw new Error('boom'); } };
+    });
+    const done = fm.next().then(
+      v => log.push(`resolved ${JSON.stringify(v)}`),
+      e => log.push(`rejected ${e.message}`),
+    );
+    await ticker(log, 8);
+    await done;
+  }
+  t.check('source is closed and the call rejects', logs['sync throw'].filter(e => !e.startsWith('tick')), ['src.return()', 'rejected boom']);
+  t.check('both modes produce the same trace', logs['throwing then getter'], logs['sync throw']);
 }]);
 
 await runTests(tests, xfailed);

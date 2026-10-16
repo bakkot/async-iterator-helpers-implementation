@@ -1,4 +1,4 @@
-import { fastPromiseTry } from './util.ts';
+import { fastPromiseTry, zalgo } from './util.ts';
 
 export function flatMap(it: unknown, fn: unknown) {
   return new FlatMapHelper(it, fn);
@@ -185,7 +185,14 @@ class FlatMapHelper {
           this.#gotErrorFromMapper(error);
         };
 
-        fastPromiseTry(() => (this.#fn as (r: unknown) => AsyncIterable<unknown>)(value)).then(onMapperResult, onMapperError);
+        let mapped;
+        try {
+          mapped = (this.#fn as (r: unknown) => AsyncIterable<unknown>)(value);
+        } catch (error) {
+          onMapperError(error);
+          return;
+        }
+        zalgo(mapped, onMapperResult, onMapperError);
       },
       onError,
     );

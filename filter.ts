@@ -1,4 +1,4 @@
-import { fastPromiseTry } from './util.ts';
+import { fastPromiseTry, zalgo } from './util.ts';
 
 export function filter(it: unknown, pred: unknown) {
   return new FilterHelper(it, pred);
@@ -154,7 +154,14 @@ class FilterHelper {
       }
     };
 
-    fastPromiseTry(() => (this.#pred as (v: unknown) => unknown)(value)).then(onResult, onError);
+    let result;
+    try {
+      result = (this.#pred as (v: unknown) => unknown)(value);
+    } catch (error) {
+      onError(error);
+      return;
+    }
+    zalgo(result, onResult, onError);
   }
 
   #processQueue() {

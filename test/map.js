@@ -653,6 +653,150 @@ tests.push(['map: the value from the underlying .return() is ignored', async fun
   ]);
 }]);
 
+// A non-thenable object takes the synchronous mapper-result fast path. Its
+// `then` property is inspected exactly once and the object itself is preserved.
+tests.push(['map: a non-thenable object is mapped without rereading then', async function (t) {
+  let thenReads = 0;
+  const mappedValue = {};
+  Object.defineProperty(mappedValue, 'then', {
+    get() {
+      thenReads++;
+      return undefined;
+    },
+  });
+  const source = {
+    next() { return { value: 1, done: false }; },
+  };
+
+  const result = await map(source, () => mappedValue).next();
+  t.check('mapped object is preserved', result, { value: mappedValue, done: false });
+  t.check('then is read once', thenReads, 1);
+}]);
+
+// A synchronous source and mapper need one turn to run the mapping reaction and
+// one more to notify the consumer. An extra promise around the mapper result
+// would push settlement to a later turn.
+tests.push(['map: a non-thenable mapper result takes no extra promise turns', async function (t) {
+  let mapperCalled = false;
+  let settled = false;
+  const source = {
+    next() { return { value: 1, done: false }; },
+  };
+  const result = map(source, value => {
+    mapperCalled = true;
+    return value * 10;
+  }).next();
+  result.then(() => { settled = true; });
+
+  t.check('mapper is not called synchronously', mapperCalled, false);
+  t.check('result is not settled synchronously', settled, false);
+  await Promise.resolve();
+  t.check('mapper runs in the source-result reaction', mapperCalled, true);
+  t.check('consumer has not run in the same reaction', settled, false);
+  await Promise.resolve();
+  t.check('consumer runs on the next turn', settled, true);
+  t.check('mapped result', await result, { value: 10, done: false });
+}]);
+
+tests.push(['map: rejection from an arbitrary thenable closes the source', async function (t) {
+  let returnCalls = 0;
+  const thenable = { then(_resolve, reject) { reject(new Error('boom')); } };
+  const source = {
+    next() { return { value: 1, done: false }; },
+    return() {
+      returnCalls++;
+      return { done: true };
+    },
+  };
+
+  let message;
+  try {
+    await map(source, () => thenable).next();
+  } catch (error) {
+    message = error.message;
+  }
+  t.check('original error is propagated', message, 'boom');
+  t.check('source is closed once', returnCalls, 1);
+}]);
+
+tests.push(['map: a throwing then getter closes the source', async function (t) {
+  let returnCalls = 0;
+  const expected = new Error('boom');
+  const mappedValue = { get then() { throw expected; } };
+  const source = {
+    next() { return { value: 1, done: false }; },
+    return() {
+      returnCalls++;
+      return { done: true };
+    },
+  };
+
+  let actual;
+  try {
+    await map(source, () => mappedValue).next();
+  } catch (error) {
+    actual = error;
+  }
+  t.check('original error is propagated', actual === expected, true);
+  t.check('source is closed once', returnCalls, 1);
+}]);
+
+// Logs `tick i` once per microtask turn, to timestamp the surrounding events.
+async function ticker(log, n) {
+  for (let i = 0; i < n; i++) {
+    log.push(`tick ${i}`);
+    await Promise.resolve();
+  }
+}
+
+// A mapper result whose `then` getter throws is handled exactly like a
+// synchronous throw from the mapper, down to the microtask turn.
+tests.push(['map: a throwing then getter is handled like a synchronous mapper throw', async function (t) {
+  const logs = {};
+  for (const mode of ['sync throw', 'throwing then getter']) {
+    const log = logs[mode] = [];
+    const source = {
+      next() { return { value: 1, done: false }; },
+      return() {
+        log.push('src.return()');
+        return Promise.resolve({ value: undefined, done: true });
+      },
+    };
+    const m = map(source, () => {
+      if (mode === 'sync throw') throw new Error('boom');
+      return { get then() { throw new Error('boom'); } };
+    });
+    const done = m.next().then(
+      v => log.push(`resolved ${JSON.stringify(v)}`),
+      e => log.push(`rejected ${e.message}`),
+    );
+    await ticker(log, 8);
+    await done;
+  }
+  t.check('source is closed and the call rejects', logs['sync throw'].filter(e => !e.startsWith('tick')), ['src.return()', 'rejected boom']);
+  t.check('both modes produce the same trace', logs['throwing then getter'], logs['sync throw']);
+}]);
+
+// For a native promise, `then` is read once (to recognize it), not again to
+// subscribe to it.
+tests.push(['map: a native promise mapper result has its then read once', async function (t) {
+  let thenReads = 0;
+  const p = Promise.resolve(42);
+  Object.defineProperty(p, 'then', {
+    get() {
+      thenReads++;
+      return Promise.prototype.then;
+    },
+  });
+  const source = {
+    next() { return { value: 1, done: false }; },
+  };
+
+  const result = await map(source, () => p).next();
+  t.check('promise is adopted', result, { value: 42, done: false });
+  t.check('then is read once', thenReads, 1);
+}]);
+
 // The microtask turn on which the consumer's reaction to a single next() runs,
 // for a synchronous source, across mapper outcomes and source closes.
 tests.push(['map: microtask turns to settle with thenable mapper results and closes', async function (t) {
@@ -668,11 +812,11 @@ tests.push(['map: microtask turns to settle with thenable mapper results and clo
     }
     return at;
   }
-  t.check('non-thenable mapper result', await settleTurn(() => 10), 3);
+  t.check('non-thenable mapper result', await settleTurn(() => 10), 2);
   t.check('already-settled promise mapper result', await settleTurn(() => Promise.resolve(10)), 3);
-  t.check('sync mapper throw with no return method', await settleTurn(() => { throw new Error('boom'); }), 3);
-  t.check('sync mapper throw; return() gives a settled promise', await settleTurn(() => { throw new Error('boom'); }, () => Promise.resolve({})), 4);
-  t.check('sync mapper throw; return() gives a non-thenable', await settleTurn(() => { throw new Error('boom'); }, () => ({})), 4);
+  t.check('sync mapper throw with no return method', await settleTurn(() => { throw new Error('boom'); }), 2);
+  t.check('sync mapper throw; return() gives a settled promise', await settleTurn(() => { throw new Error('boom'); }, () => Promise.resolve({})), 3);
+  t.check('sync mapper throw; return() gives a non-thenable', await settleTurn(() => { throw new Error('boom'); }, () => ({})), 3);
   t.check('rejected promise mapper result; return() gives a settled promise', await settleTurn(() => Promise.reject(new Error('boom')), () => Promise.resolve({})), 4);
 }]);
 

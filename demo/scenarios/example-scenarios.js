@@ -276,23 +276,25 @@ export const exampleFlatMapScenario = {
       ],
     },
     {
-      note: 'a later inner value cannot settle ahead of an earlier one',
+      note: 'a later inner value is delivered as soon as it settles',
       steps: [
         {
-          caption: 'The <i>second</i> inner pull settles first — <code>a1</code> is buffered.',
-          events: [{ type: 'settle', pull: 'a1', value: 'a1' }],
+          caption: 'The <i>second</i> inner pull settles first — <code>a1</code> is delivered right away.',
+          events: [
+            { type: 'settle', pull: 'a1', value: 'a1' },
+            { type: 'result', result: 'r1', value: 'a1', from: 'a1' },
+          ],
         },
       ],
     },
     {
-      note: 'once the earlier value arrives, both settle in call order',
+      note: 'the earlier value is delivered when it arrives',
       steps: [
         {
-          caption: '<code>a0</code> arrives; both results deliver in order.',
+          caption: '<code>a0</code> arrives and is delivered.',
           events: [
             { type: 'settle', pull: 'a0', value: 'a0' },
             { type: 'result', result: 'r0', value: 'a0', from: 'a0' },
-            { type: 'result', result: 'r1', value: 'a1', from: 'a1' },
           ],
         },
       ],

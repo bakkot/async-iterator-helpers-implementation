@@ -2,15 +2,14 @@
 // hand-written test/map.js (async-iterator-implementation), since deleted
 // along with the converter: this file is the source of truth — edit it by
 // hand. Run directly, or via test/scenario-tests.js in the implementation
-// repo. tools/unconvert-tests.js there renders these files back into the
-// old hand-written style for review.
+// repo.
 //
 // Most tests are scenario objects (see ./FORMAT.md) turned into runnable
 // [name, fn] tests by scenarioTest; tests the scenario format cannot
 // express were copied verbatim from the original file, each marked with a
 // [copied verbatim] comment giving the reason.
 
-import { map } from '../map.js';
+import { map } from '../map.ts';
 import {
   runTests,
   track,
@@ -652,6 +651,50 @@ tests.push(['map: the value from the underlying .return() is ignored', async fun
     'src.return() #0',
     'ret resolved {"done":true}',
   ]);
+}]);
+
+// The microtask turn on which the consumer's reaction to a single next() runs,
+// for a synchronous source, across mapper outcomes and source closes.
+tests.push(['map: microtask turns to settle with thenable mapper results and closes', async function (t) {
+  async function settleTurn(fn, ret) {
+    let turn = 0;
+    let at = null;
+    const source = { next() { return { value: 1, done: false }; } };
+    if (ret) source.return = ret;
+    map(source, fn).next().then(() => { at = turn; }, () => { at = turn; });
+    while (at === null && turn < 20) {
+      turn++;
+      await Promise.resolve();
+    }
+    return at;
+  }
+  t.check('non-thenable mapper result', await settleTurn(() => 10), 3);
+  t.check('already-settled promise mapper result', await settleTurn(() => Promise.resolve(10)), 3);
+  t.check('sync mapper throw with no return method', await settleTurn(() => { throw new Error('boom'); }), 3);
+  t.check('sync mapper throw; return() gives a settled promise', await settleTurn(() => { throw new Error('boom'); }, () => Promise.resolve({})), 4);
+  t.check('sync mapper throw; return() gives a non-thenable', await settleTurn(() => { throw new Error('boom'); }, () => ({})), 4);
+  t.check('rejected promise mapper result; return() gives a settled promise', await settleTurn(() => Promise.reject(new Error('boom')), () => Promise.resolve({})), 4);
+}]);
+
+// The microtask turn on which the consumer's reaction to return() runs, for a
+// helper which has not yet been pulled from.
+tests.push(['map: microtask turns to settle return()', async function (t) {
+  async function settleTurn(ret) {
+    let turn = 0;
+    let at = null;
+    const source = { next() { return { value: 1, done: false }; } };
+    if (ret) source.return = ret;
+    map(source, x => x).return().then(() => { at = turn; }, () => { at = turn; });
+    while (at === null && turn < 20) {
+      turn++;
+      await Promise.resolve();
+    }
+    return at;
+  }
+  t.check('no return method', await settleTurn(), 1);
+  t.check('return() gives a non-thenable', await settleTurn(() => ({})), 2);
+  t.check('return() gives a settled promise', await settleTurn(() => Promise.resolve({})), 2);
+  t.check('return() throws', await settleTurn(() => { throw new Error('boom'); }), 1);
 }]);
 
 await runTests(tests, xfailed);

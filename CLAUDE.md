@@ -1,6 +1,6 @@
 This project explores async iterator helpers for JavaScript, with support for concurrency (taking the form of multiple calls to `.next()` or `.return()` without waiting for previous calls to settle).
 
-Implementations are in `./map.js`, `./filter.js`, and `.flatMap.ts` (yes, it's intentional that `flatMap` is `.ts`; my version of node can handle it fine with no extra flags).
+Implementations are in `./map.ts`, `./filter.ts`, and `.flatMap.ts` (my version of node can handle running and importing `.ts` files with no extra flags).
 
 Unit tests are in `test/{map,filter,flatMap}.js`, run with `npm run test-implementations`. There's also fuzzers you can run with `npm run test-fuzzing`. Do not run the `filter` or `flatMap` fuzzers without the `--fuzz` flag; `--fuzz 100000` is a reasonable amount.
 

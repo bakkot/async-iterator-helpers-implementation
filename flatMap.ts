@@ -1,3 +1,5 @@
+import { fastPromiseTry } from './util.ts';
+
 export function flatMap(it: unknown, fn: unknown) {
   return new FlatMapHelper(it, fn);
 }
@@ -8,15 +10,6 @@ function ASSERT(condition: boolean, message: string) {
     setTimeout(() => {
       throw new Error('an assertion failed, see stderr');
     }, 0); // do in a timeout so nothing can swallow it
-  }
-}
-
-// https://github.com/tc39/ecma262/pull/3883
-function fastPromiseTry<T>(cb: () => T): Promise<Awaited<T>> {
-  try {
-    return Promise.resolve(cb());
-  } catch (e) {
-    return Promise.reject(e);
   }
 }
 
@@ -92,12 +85,52 @@ class FlatMapHelper {
   #issuePullFromUnderlying() {
     ASSERT(this.#active.type === 'reading underlying', 'pull from underlying only after setting state appropriately');
 
+    const onError = (error: unknown) => {
+      // error from underlying
+      const active = this.#active;
+      ASSERT(active.type == 'reading underlying' || active.type == 'draining', 'reading underlying can only transition to draining');
+      if (active.type === 'draining' && active.errorSlot) {
+        // TODO should this be AggregateError?
+        this.#active = { type: 'finished' };
+        this.#commitError(active.errorSlot);
+        return;
+      }
+
+      if (active.type === 'reading underlying') {
+        this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#valuesWeCouldDeliverFromClosedInnerIterators() - 1); // -1 for the slot we hold open in case of errors from the pull/mapper
+      }
+
+      if (this.#closedButStillHaveValuesInFlight.length === 0) {
+        this.#calls.shift()!.reject(error);
+        this.#active = { type: 'finished' };
+      } else {
+        this.#active = { type: 'error', error, closeState: 'ready' };
+      }
+
+      // TODO maybe move this above; it's just here for tick ordering reasons we probably don't care about
+      if (active.type === 'draining') {
+        active.resolveReturn({ value: undefined, done: true });
+      }
+    };
+
     fastPromiseTry(() => (this.#underlying as Nextable).next()).then(
       r => {
         // successfully pulled underlying
         const active = this.#active;
         ASSERT(active.type == 'reading underlying' || active.type == 'draining', 'reading underlying can only transition to draining');
-        if ((r as { done: boolean }).done) {
+        let done: unknown;
+        let value: unknown;
+        try {
+          done = (r as { done: unknown }).done;
+          if (!done) {
+            // NB we don't await value; contract is non-promise here
+            value = (r as { value: unknown }).value;
+          }
+        } catch (error) {
+          onError(error);
+          return;
+        }
+        if (done) {
           if (active.type === 'draining') {
             // if underlying was exhausted while we were waiting for it to close, the things that were waiting for it can just proceed
             if (active.errorSlot) {
@@ -113,75 +146,48 @@ class FlatMapHelper {
           return;
         }
 
-        // NB we don't await value; contract is non-promise here
-        fastPromiseTry(() => (this.#fn as (r: unknown) => AsyncIterable<unknown>)((r as { value: unknown }).value)).then(
-          iter => {
-            const active = this.#active;
-            ASSERT(active.type == 'reading underlying' || active.type == 'draining', 'reading underlying can only transition to draining');
+        const onMapperResult = (iter: unknown) => {
+          const active = this.#active;
+          ASSERT(active.type == 'reading underlying' || active.type == 'draining', 'reading underlying can only transition to draining');
 
-            // TODO handle sync iterators / iterables
-            // TODO consider how to deal with distinguishing sync iterator from async iterator
-            let actualIter: unknown;
-            try {
-              actualIter = iter[Symbol.asyncIterator]();
-            } catch (error) {
-              this.#gotErrorFromMapper(error);
-              return;
-            }
-
-            if (active.type === 'draining') {
-              // we just close, not pull
-              this.#active = { type: 'finished' };
-              if (active.errorSlot) {
-                this.#closeInnerThenUnderlying(actualIter as MaybeReturnable, () => this.#commitError(active.errorSlot));
-              } else {
-                this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
-                this.#closeInnerThenUnderlying(actualIter as MaybeReturnable, (gotError, error) => gotError ? active.rejectReturn(error) : active.resolveReturn({ done: true, value: undefined }));
-              }
-              return;
-            }
-
-            const { requested } = active as Extract<ActiveState, { type: 'reading underlying '}>;
-            this.#active = { type: 'iter', iter: actualIter, values: [] };
-
-            // ok, time to actually pull
-            for (let i = 0; i < requested; ++i) {
-              // TODO worry about re-entrancy from calling .next()/.return() - probably is OK, just gotta make sure state is set appropriately before invoking user code
-              this.#issuePullFromCurrentActive();
-            }
-          },
-          error => {
+          // TODO handle sync iterators / iterables
+          // TODO consider how to deal with distinguishing sync iterator from async iterator
+          let actualIter: unknown;
+          try {
+            actualIter = (iter as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+          } catch (error) {
             this.#gotErrorFromMapper(error);
+            return;
           }
-        );
+
+          if (active.type === 'draining') {
+            // we just close, not pull
+            this.#active = { type: 'finished' };
+            if (active.errorSlot) {
+              this.#closeInnerThenUnderlying(actualIter as MaybeReturnable, () => this.#commitError(active.errorSlot));
+            } else {
+              this.#markSomeCallsAsNoLongerGettingValues(1); // the held call
+              this.#closeInnerThenUnderlying(actualIter as MaybeReturnable, (gotError, error) => gotError ? active.rejectReturn(error) : active.resolveReturn({ done: true, value: undefined }));
+            }
+            return;
+          }
+
+          const { requested } = active as Extract<ActiveState, { type: 'reading underlying '}>;
+          this.#active = { type: 'iter', iter: actualIter, values: [] };
+
+          // ok, time to actually pull
+          for (let i = 0; i < requested; ++i) {
+            // TODO worry about re-entrancy from calling .next()/.return() - probably is OK, just gotta make sure state is set appropriately before invoking user code
+            this.#issuePullFromCurrentActive();
+          }
+        };
+        const onMapperError = (error: unknown) => {
+          this.#gotErrorFromMapper(error);
+        };
+
+        fastPromiseTry(() => (this.#fn as (r: unknown) => AsyncIterable<unknown>)(value)).then(onMapperResult, onMapperError);
       },
-      error => {
-        // error from pulling underlying
-        const active = this.#active;
-        ASSERT(active.type == 'reading underlying' || active.type == 'draining', 'reading underlying can only transition to draining');
-        if (active.type === 'draining' && active.errorSlot) {
-          // TODO should this be AggregateError?
-          this.#active = { type: 'finished' };
-          this.#commitError(active.errorSlot);
-          return;
-        }
-
-        if (active.type === 'reading underlying') {
-          this.#markSomeCallsAsNoLongerGettingValues(this.#calls.length - this.#valuesWeCouldDeliverFromClosedInnerIterators() - 1); // -1 for the slot we hold open in case of errors from the pull/mapper
-        }
-
-        if (this.#closedButStillHaveValuesInFlight.length === 0) {
-          this.#calls.shift()!.reject(error);
-          this.#active = { type: 'finished' };
-        } else {
-          this.#active = { type: 'error', error, closeState: 'ready' };
-        }
-
-        // TODO maybe move this above; it's just here for tick ordering reasons we probably don't care about
-        if (active.type === 'draining') {
-          active.resolveReturn({ value: undefined, done: true });
-        }
-      }
+      onError,
     );
   }
 
@@ -193,6 +199,45 @@ class FlatMapHelper {
     const thisIterValues = inFlight.values;
     thisIterValues.push(slot);
 
+    const onError = (error: unknown) => {
+      // error from inner iterator
+
+      if (slot.type === 'removed') return;
+      ASSERT(slot.type === 'awaiting', 'slot awaiting');
+      slot.type = 'error';
+      const slotButWithTypeScript = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
+      slotButWithTypeScript.error = error;
+
+      if (this.#active.type === 'iter') {
+        slotButWithTypeScript.closeState = 'awaiting-return';
+        const active = this.#active;
+        ASSERT(active.values.length > 0, 'active has at least one outstanding');
+        this.#closedButStillHaveValuesInFlight.push(active.values);
+        this.#active = { type: 'finished' };
+
+        if (active === inFlight) {
+          // just gotta close underlying
+          this.#closeIterThen(this.#underlying as MaybeReturnable, () => this.#commitError(slotButWithTypeScript));
+        } else {
+          // gotta close both underlying and active
+          const activeIter = active.iter;
+
+          this.#closeInnerThenUnderlying(activeIter as MaybeReturnable, () => this.#commitError(slotButWithTypeScript));
+        }
+      } else if (this.#active.type === 'reading underlying') {
+        slotButWithTypeScript.closeState = 'awaiting-return';
+        this.#markSomeCallsAsNoLongerGettingValues(this.#active.requested);
+        this.#active = { type: 'draining', resolveReturn: null, errorSlot: slotButWithTypeScript };
+      } else {
+        ASSERT(this.#closed(), 'no longer issuing pulls');
+        // nothing to close in this case
+        (slot as ErrorState).closeState = 'ready';
+      }
+      if (this.#isHeadOfQueue(slot)) {
+        this.#processQueue();
+      }
+    };
+
     fastPromiseTry(() => (inFlight.iter as Nextable).next()).then(
       iterResult => {
         // got iterator result from inner iterator
@@ -200,7 +245,19 @@ class FlatMapHelper {
         if (slot.type === 'removed') return;
         ASSERT(slot.type === 'awaiting', 'slot awaiting');
 
-        if ((iterResult as { done: boolean }).done) {
+        let done;
+        let value;
+        try {
+          done = (iterResult as { done: unknown }).done;
+          if (!done) {
+            value = (iterResult as { value: unknown }).value;
+          }
+        } catch (error) {
+          onError(error);
+          return;
+        }
+
+        if (done) {
           ASSERT(this.#closedButStillHaveValuesInFlight.includes(thisIterValues) || this.#active === inFlight, 'inFlight is still tracked');
 
           // I am assuming this can be done cheaply, possibly with a slightly different data structure
@@ -268,7 +325,6 @@ class FlatMapHelper {
           }
         } else {
           // we got a value! amazing!
-          const { value } = (iterResult as { value: unknown });
           slot.type = 'value';
           (slot as Extract<Slot, { type: 'value' }>).value = value;
 
@@ -277,44 +333,7 @@ class FlatMapHelper {
           }
         }
       },
-      error => {
-        // got error from inner iterator
-
-        if (slot.type === 'removed') return;
-        ASSERT(slot.type === 'awaiting', 'slot awaiting');
-        slot.type = 'error';
-        const slotButWithTypeScript = slot as Extract<ErrorState, { closeState: 'awaiting-return' }>;
-        slotButWithTypeScript.error = error;
-
-        if (this.#active.type === 'iter') {
-          slotButWithTypeScript.closeState = 'awaiting-return';
-          const active = this.#active;
-          ASSERT(active.values.length > 0, 'active has at least one outstanding');
-          this.#closedButStillHaveValuesInFlight.push(active.values);
-          this.#active = { type: 'finished' };
-
-          if (active === inFlight) {
-            // just gotta close underlying
-            this.#closeIterThen(this.#underlying as MaybeReturnable, () => this.#commitError(slotButWithTypeScript));
-          } else {
-            // gotta close both underlying and active
-            const activeIter = active.iter;
-
-            this.#closeInnerThenUnderlying(activeIter as MaybeReturnable, () => this.#commitError(slotButWithTypeScript));
-          }
-        } else if (this.#active.type === 'reading underlying') {
-          slotButWithTypeScript.closeState = 'awaiting-return';
-          this.#markSomeCallsAsNoLongerGettingValues(this.#active.requested);
-          this.#active = { type: 'draining', resolveReturn: null, errorSlot: slotButWithTypeScript };
-        } else {
-          ASSERT(this.#closed(), 'no longer issuing pulls');
-          // nothing to close in this case
-          (slot as ErrorState).closeState = 'ready';
-        }
-        if (this.#isHeadOfQueue(slot)) {
-          this.#processQueue();
-        }
-      },
+      onError,
     );
   }
 
@@ -375,18 +394,15 @@ class FlatMapHelper {
 
   // this is very zalgo but whatever
   #closeIterThen(iter: MaybeReturnable, next: (gotError: boolean, error?: unknown) => void): void {
-    let returnPromise;
     try {
-      returnPromise = iter.return?.();
+      const ret = iter.return;
+      if (ret == null) {
+        next(false);
+        return;
+      }
+      Promise.resolve(ret.call(iter)).then(() => next(false), e => next(true, e));
     } catch (error) {
       next(true, error);
-      return;
-    }
-    // TODO fast path for non-promise in general?
-    if (!returnPromise) {
-      next(false);
-    } else {
-      Promise.resolve(returnPromise).then(() => next(false), e => next(true, e));
     }
   }
 

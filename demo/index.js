@@ -6,7 +6,7 @@ import { indexScenario, narrateEvents } from '../scenario-core.js';
 import { mapScenarios } from './scenarios/map-scenarios.js';
 import { filterScenarios } from './scenarios/filter-scenarios.js';
 import { flatMapScenarios } from './scenarios/flatmap-scenarios.js';
-import { map } from '../map.js';
+import { map } from '../map.ts';
 import { filter } from '../filter.ts';
 import { flatMap } from '../flatMap.ts';
 const root = document.getElementById('viz');

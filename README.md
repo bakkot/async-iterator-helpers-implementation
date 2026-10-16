@@ -2,7 +2,7 @@
 
 This repo is for me to mess around with possible behaviors for [async iterator helpers for JavaScript](https://github.com/tc39/proposal-async-iterator-helpers).
 
-The implementations ([map.js](./map.js), [filter.ts](./filter.ts), [flatmap.ts](./flatMap.ts)) are written by me and are intended as the actual source of truth for how I think these should behave prior to writing spec text. I've made an effort to make them readable, and more-or-less succeeded for `map` and `filter`, but `flatMap` is still way more complicated than I'd like.
+The implementations ([map.ts](./map.ts), [filter.ts](./filter.ts), [flatmap.ts](./flatMap.ts)) are written by me and are intended as the actual source of truth for how I think these should behave prior to writing spec text. I've made an effort to make them readable, and more-or-less succeeded for `map` and `filter`, but `flatMap` is still way more complicated than I'd like.
 
 There is a [demo](http://bakkot.github.io/async-iterator-helpers-implementation) which has a bunch of hand-written scenarios which demonstrate various behaviors, and also lets you play around with it yourself by clicking boxes which represent various Promises. This is hooked up to the actual implementation. Visualizer was mostly written by Claude.
 

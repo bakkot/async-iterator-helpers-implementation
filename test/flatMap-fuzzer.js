@@ -273,7 +273,7 @@ async function runSchedule(maxEvents, chooser) {
     entity.returnCalls++;
     entity.returnStep = stepNo;
     const shape = finalizing ? 'sync' : RETURN_SHAPES[chooser.choose(RETURN_SHAPES.length)];
-    if (shape === 'sync') return { value: undefined, done: true };
+    if (shape === 'sync') return Promise.resolve({ value: undefined, done: true });
     if (shape === 'syncThrow') { rec.returnErrors.add(errTag); throw new Error(errTag); }
     const d = Promise.withResolvers();
     pendingReturns.push({ id: `${label}ret#${n}`, errTag, d });

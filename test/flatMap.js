@@ -2,8 +2,7 @@
 // hand-written test/flatMap.js (async-iterator-implementation), since deleted
 // along with the converter: this file is the source of truth — edit it by
 // hand. Run directly, or via test/scenario-tests.js in the implementation
-// repo. tools/unconvert-tests.js there renders these files back into the
-// old hand-written style for review.
+// repo.
 //
 // Most tests are scenario objects (see ./FORMAT.md) turned into runnable
 // [name, fn] tests by scenarioTest; tests the scenario format cannot
@@ -3214,5 +3213,94 @@ tests.push(scenarioTest({
     ] },
   ],
 }, { helper: flatMap, utils }));
+
+tests.push(['flatMap: throwing getters on underlying results are underlying errors', async function (t) {
+  for (const property of ['done', 'value']) {
+    const expected = new Error(`${property} boom`);
+    let mapperCalls = 0;
+    let returnCalls = 0;
+    let valueReads = 0;
+    const result = property === 'done'
+      ? {
+          get done() { throw expected; },
+          get value() { valueReads++; return 1; },
+        }
+      : {
+          done: false,
+          get value() { valueReads++; throw expected; },
+        };
+    const source = {
+      next() { return Promise.resolve(result); },
+      return() {
+        returnCalls++;
+        return Promise.resolve({ value: undefined, done: true });
+      },
+    };
+    const inner = {
+      next() { return Promise.resolve({ value: 'unused', done: false }); },
+      [Symbol.asyncIterator]() { return this; },
+    };
+
+    let actual;
+    flatMap(source, () => { mapperCalls++; return inner; }).next().catch(error => { actual = error; });
+    t.check(`${property}: error is not surfaced synchronously`, actual, undefined);
+    await Promise.resolve();
+    t.check(`${property}: getter error is handled in the source-result reaction`, actual, undefined);
+    await Promise.resolve();
+    t.check(`${property}: original error is propagated`, actual === expected, true);
+    t.check(`${property}: mapper is not called`, mapperCalls, 0);
+    t.check(`${property}: underlying iterator is not closed`, returnCalls, 0);
+    t.check(`${property}: value read count`, valueReads, property === 'value' ? 1 : 0);
+  }
+}]);
+
+tests.push(['flatMap: throwing getters on inner results are inner-iterator errors', async function (t) {
+  for (const property of ['done', 'value']) {
+    const expected = new Error(`${property} boom`);
+    let underlyingReturnCalls = 0;
+    let innerReturnCalls = 0;
+    let valueReads = 0;
+    const result = property === 'done'
+      ? {
+          get done() { throw expected; },
+          get value() { valueReads++; return 'unused'; },
+        }
+      : {
+          done: false,
+          get value() { valueReads++; throw expected; },
+        };
+    const inner = {
+      next() { return Promise.resolve(result); },
+      return() {
+        innerReturnCalls++;
+        return Promise.resolve({ value: undefined, done: true });
+      },
+      [Symbol.asyncIterator]() { return this; },
+    };
+    const source = {
+      next() { return Promise.resolve({ value: 1, done: false }); },
+      return() {
+        underlyingReturnCalls++;
+        return Promise.resolve({ value: undefined, done: true });
+      },
+    };
+
+    let actual;
+    const flattened = flatMap(source, () => inner).next();
+    flattened.catch(error => { actual = error; });
+    await Promise.resolve();
+    await Promise.resolve();
+    t.check(`${property}: inner has not settled yet`, underlyingReturnCalls, 0);
+    await Promise.resolve();
+    t.check(`${property}: close starts in the inner-result reaction`, underlyingReturnCalls, 1);
+    try {
+      await flattened;
+    } catch {}
+    t.check(`${property}: original error is propagated`, actual === expected, true);
+    t.check(`${property}: underlying iterator is closed`, underlyingReturnCalls, 1);
+    t.check(`${property}: erroring inner iterator is not closed`, innerReturnCalls, 0);
+    t.check(`${property}: value read count`, valueReads, property === 'value' ? 1 : 0);
+  }
+}]);
 
 await runTests(tests, xfailed);
